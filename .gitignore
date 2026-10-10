@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.python-version
+
+# Empacotamento e cache de ferramenta
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch: checkpoints e tensores
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+checkpoints/
+lightning_logs/
+wandb/
+runs/
+outputs/
+logs/
+*.log
+
+# Datasets baixados (WikiText-2, TinyStories, cache do Hugging Face)
+data/
+datasets/
+.cache/
+**/*.arrow
+**/*.parquet
+
+# Artefatos grandes de resultado. O README da pasta continua versionado.
+results/**
+!results/README.md
+*.npy
+*.npz
+*.bin
+*.h5
+*.hdf5
+
+# Sistema e editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
