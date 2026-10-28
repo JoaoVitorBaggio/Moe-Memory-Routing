@@ -67,7 +67,7 @@ Documentação nova em português do Brasil. Não versionar checkpoint, dataset 
 ## Integrantes
 
 - João Vítor Baggio — cartão: **a definir**
-- Nome: **a definir** — cartão: **a definir**
+- Nome: Taylor Souza Frutuoso da Costa  — cartão: 00213957
 - Nome: **a definir** — cartão: **a definir**
 - Nome: **a definir** — cartão: **a definir**
 
