@@ -88,6 +88,8 @@ class MixtureOfExperts(nn.Module):
         self.k = k
         self.n_experts = n_experts
         self.use_level = use_level
+        self.layer_index = 0
+        self.residency = None
         self.router = MemoryAwareRouter(d_model, n_experts)
         self.experts = nn.ModuleList(ExpertFFN(d_model, d_ff) for _ in range(n_experts))
 
@@ -119,6 +121,8 @@ class MixtureOfExperts(nn.Module):
             selected = flat_index == expert_id
             if not bool(selected.any()):
                 continue
+            if self.residency is not None:
+                self.residency.stage_for_compute(self.layer_index, expert_id)
             token_sel = selected.any(dim=1)
             weight = (flat_gates * selected.to(dtype=flat_gates.dtype)).sum(dim=1)
             token_index = token_sel.nonzero(as_tuple=False).flatten()
@@ -182,6 +186,8 @@ class MemoryMoEModel(nn.Module):
             TransformerBlock(d_model, n_heads, d_ff, n_experts, k, use_level)
             for _ in range(n_layers)
         )
+        for index, block in enumerate(self.blocks):
+            block.ffn.layer_index = index
         self.ln_f = nn.LayerNorm(d_model)
         self.lm_head = None if tie_embeddings else nn.Linear(d_model, vocab_size, bias=False)
         self._init_parameters()
@@ -205,6 +211,10 @@ class MemoryMoEModel(nn.Module):
             use_level=use_level,
             tie_embeddings=model.tie_embeddings,
         )
+
+    def bind_residency(self, residency) -> None:
+        for block in self.blocks:
+            block.ffn.residency = residency
 
     def forward(self, input_ids: torch.Tensor, levels: torch.Tensor) -> ModelOutput:
         if input_ids.ndim != 2:

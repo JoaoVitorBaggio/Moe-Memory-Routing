@@ -1,24 +1,22 @@
 """Emulador de residência VRAM / RAM / SSD, um passo por batch.
 
-Política do esqueleto: LRU com desempate pela contagem de despachos do
-batch. Quem foi tocado neste batch fica mais recente; entre esses, quem
-recebeu mais tokens no top-k fica mais quente. As ``B`` primeiras vagas
-são o nível quente, as ``warm_slots`` seguintes o morno, o resto o frio.
+Política: LRU com desempate pela contagem de despachos do batch. Quem
+foi tocado neste batch fica mais recente; entre esses, quem recebeu mais
+tokens no top-k fica mais quente. As ``B`` primeiras vagas são o nível
+quente, as ``warm_slots`` seguintes o morno, o resto o frio.
 
 O adversário LRU do protocolo reutiliza esta política com ``λ = 0``.
-Não há segunda política neste esqueleto.
+Não há segunda política.
 
 Contadores: uma troca por expert que mudou de nível; bytes =
 ``|Δℓ| × tamanho do expert`` (um salto frio→quente conta a cópia nos
 dois degraus). ``w(a,b)`` não entra aqui — a loss cobra o surrogate;
 o emulador conta o que a política fez, para a correlação do protocolo.
 
-TODO(1060): na latência de parede, experts fora de ``B`` precisam estar
-fisicamente fora da VRAM. ``PhysicalExpertStore`` já grava morno como
-tensor de CPU (pinned se houver CUDA) e frio como memmap. O que falta é
-trocar o storage do ``nn.Parameter`` por esse home *depois* do
-``optimizer.step()``. No smoke de CPU os parâmetros continuam no device
-de compute para o autograd não quebrar.
+O storage físico do ``nn.Parameter`` (morno em CPU pinned, frio em
+memmap, fora da VRAM no CUDA) fica em ``moe_memory.residency``. Este
+arquivo continua dono de ``ℓ(e)`` e dos contadores. No smoke de CPU os
+parâmetros não trocam de storage: o autograd usa o device de compute.
 """
 
 from __future__ import annotations
@@ -48,15 +46,20 @@ class PhysicalExpertStore:
     def __init__(self, directory: Path) -> None:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
+        # Store novo é a foto desta corrida. Arquivo de um processo
+        # anterior não volta como home e não entra em ``n_cold_files``.
+        for stale in self.directory.glob("layer*_expert*.f32"):
+            stale.unlink()
         self._warm: dict[tuple[int, int], torch.Tensor] = {}
         self._cold: dict[tuple[int, int], Path] = {}
+        self._maps: dict[tuple[int, int], np.memmap] = {}
 
     def place(self, layer: int, expert: int, level: int, weight: torch.Tensor) -> None:
         key = (layer, expert)
         self._discard(key)
         if level == HOT:
-            # Quente: o parâmetro no device de compute é o home.
-            # TODO(1060): este ramo deve ser o storage CUDA do nn.Parameter.
+            # Quente: o ``nn.Parameter`` no device de compute é o home.
+            # ``ExpertResidency`` deixa esse storage na VRAM; aqui não há cópia.
             return
         flat = weight.detach().to(dtype=torch.float32, device="cpu").contiguous().reshape(-1)
         if level == WARM:
@@ -92,6 +95,27 @@ class PhysicalExpertStore:
             return torch.from_numpy(copied)
         raise ValueError("o nível quente não tem cópia no store; use o nn.Parameter")
 
+    def cold_view(self, layer: int, expert: int) -> torch.Tensor:
+        """Tensor 1-D que aponta para o memmap, sem cópia para a RAM."""
+
+        key = (layer, expert)
+        try:
+            path = self._cold[key]
+        except KeyError as exc:
+            raise KeyError(f"expert {(layer, expert)} não está no home frio") from exc
+        mapping = np.memmap(path, dtype=np.float32, mode="r+")
+        self._maps[key] = mapping
+        return torch.from_numpy(mapping)
+
+    def adopt_warm(self, layer: int, expert: int, pinned: torch.Tensor) -> None:
+        """Guarda o tensor pinned que já é o storage do parâmetro."""
+
+        if pinned.device.type != "cpu":
+            raise ValueError("home morno tem de estar na CPU")
+        key = (layer, expert)
+        self._discard(key)
+        self._warm[key] = pinned
+
     @property
     def n_cold_files(self) -> int:
         return len(self._cold)
@@ -102,6 +126,7 @@ class PhysicalExpertStore:
 
     def _discard(self, key: tuple[int, int]) -> None:
         self._warm.pop(key, None)
+        self._maps.pop(key, None)
         path = self._cold.pop(key, None)
         if path is not None and path.exists():
             path.unlink()
@@ -198,6 +223,9 @@ class ResidencyEmulator:
     @property
     def physical_store(self) -> PhysicalExpertStore | None:
         return self._store
+
+    def bind_store(self, store: PhysicalExpertStore) -> None:
+        self._store = store
 
     def _counts(self, dispatched: torch.Tensor) -> torch.Tensor:
         if dispatched.shape != (self.n_layers, self.n_experts):

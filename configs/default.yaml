@@ -57,6 +57,12 @@ hardware_ref:
 corpus:
   dev: TinyStories
   report: WikiText-2
+  active: dev               # dev | report — papel usado quando o script não passa o nome
+  cache_dir: data/cache     # Hugging Face; data/ está no .gitignore
+  # Vazio = baixar. Diretório local: train.txt, valid.txt e (WikiText-2) test.txt.
+  paths:
+    TinyStories: ""
+    WikiText-2: ""
 
 # Um passo sintético. Não é a corrida de entrega e não varre a grade.
 smoke:

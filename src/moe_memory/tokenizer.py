@@ -1,7 +1,8 @@
 """Tokenizer GPT-2 via tiktoken (o mesmo BPE do ``gpt2`` da HuggingFace).
 
-O smoke não tokeniza texto: o batch é de ids aleatórios. Este módulo é
-a porta para TinyStories / WikiText-2 quando o loader de corpus entrar.
+O smoke sintético não tokeniza texto. TinyStories e WikiText-2 entram
+por ``moe_memory.corpus``, que usa este encoding e o ``eot_token`` como
+fronteira de documento.
 """
 
 from __future__ import annotations

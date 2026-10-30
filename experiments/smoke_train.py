@@ -53,6 +53,12 @@ def main() -> None:
         f"quente/morno/frio={result['hot']}/{result['warm']}/{result['cold']}  "
         f"arquivos frios={result['cold_files']}"
     )
+    if result["physical_offload"]:
+        print(
+            f"residência física: subidas={result['staged_loads']}  "
+            f"bytes_staged={result['staged_bytes']}  "
+            "(cópia de compute; não entra no contador do LRU)"
+        )
 
 
 if __name__ == "__main__":
