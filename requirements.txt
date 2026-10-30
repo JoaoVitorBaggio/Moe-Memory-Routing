@@ -1,0 +1,7 @@
+# Dependências diretas do esqueleto.
+# Na GTX 1060 instale o wheel CUDA correspondente do PyTorch.
+# O código fica em fp32 e não usa torch.compile (docs/plano-de-hardware.md).
+torch>=2.2
+pyyaml>=6
+tiktoken>=0.7
+pytest>=8

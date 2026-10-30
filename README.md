@@ -2,7 +2,7 @@
 
 Mixture of Experts (MoE) pequeno com hierarquia **emulada** VRAM / RAM / SSD e roteador treinado com custo explícito de memória e de troca. Trabalho final de **Aprendizado Profundo (AGL11157)**, UFRGS, 2026/2.
 
-**Status:** blueprint revisado (out/2026) após feedback do prof. Joel Luís Carbonera. Código, treino, experimentos e resultados estão **em construção**. Pastas `src/`, `configs/`, `experiments/`, `notebooks/` e `results/` existem só como esqueleto. Não há número de desempenho neste repositório.
+**Status:** blueprint revisado (out/2026) após feedback do prof. Joel Luís Carbonera. O esqueleto PyTorch está em `src/moe_memory/` (um passo sintético de treino e um forward de avaliação, hiperparâmetros em `configs/default.yaml`). Não há número de desempenho neste repositório: a loss do smoke é init aleatória, não resultado. `notebooks/` e `results/` seguem vazios.
 
 ## Resumo
 
@@ -34,6 +34,7 @@ Extensões (não bloqueiam a entrega mínima):
 | --- | --- |
 | Corpus | TinyStories só no dev; WikiText-2 no treino/avaliação de entrega (overnight) |
 | Experts / `k` | **`E = 32`**; **`k = 2`**. Preferir **aumentar o tamanho do expert** a encolher o modelo se faltar capacidade |
+| Arquitetura fina | `d_model=256`, 4 camadas (todo FFN é MoE), 4 cabeças (`d_head=64`), `d_ff=512` (768 se faltar capacidade), contexto 256 (até 512), tokenizer GPT-2, fp32, `lm_head` amarrado (~48 M; sem o laço o vocab estoura 50 M) |
 | Orçamento `B` | **25%** dos experts quentes (**8/32**) — teto **artificial** (o modelo inteiro cabe na 1060) |
 | Emulador / roteador | Granularidade **por batch**; roteador recebe **`ℓ(e)`** |
 | Proxy `k=2` | Treino: média ponderada top-2; inferência: soma top-2 |
@@ -84,12 +85,21 @@ O código e o protocolo devem aceitar os dois via config; a entrega numérica us
 
 ## Como contribuir e rodar
 
-**Em construção.** Ainda não há ambiente, script de treino nem de avaliação. Código previsto em PyTorch.
+Python ≥ 3.10 e PyTorch em fp32. Na GTX 1060, o wheel CUDA; o passo abaixo também roda em CPU. Detalhe dos módulos em [`src/README.md`](src/README.md).
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 experiments/smoke_train.py
+python3 experiments/smoke_eval.py
+python3 -m pytest
+```
+
+Isso monta modelo, emulador e loss a partir de `configs/default.yaml` e dá **um** passo num batch aleatório. Não é treino de WikiText-2, não varre `λ` e não mede latência de parede. A loss impressa é de peso aleatório.
 
 | Pasta | Para que serve |
 | --- | --- |
 | `src/` | Modelo, roteador, emulador de níveis e loss |
-| `experiments/` | Treino, avaliação, ablação e varredura de λ / orçamento |
+| `experiments/` | Passo de fumaça agora; treino, avaliação e dose–resposta quando existirem |
 | `configs/` | Orçamento, tabela de custos e hiperparâmetros |
 | `notebooks/` | Exploração |
 | `results/` | Tabelas e curvas, quando existirem |
