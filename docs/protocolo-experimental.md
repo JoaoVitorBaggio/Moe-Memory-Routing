@@ -55,6 +55,8 @@ Seeds: **3** no mínimo. Hold-out: no WikiText-2, **splits oficiais** valid (sel
 
 Decidido: reportar latência de parede na GTX 1060 no protocolo mínimo, porque `B` é fixo (não randomizado no treino). O emulador continua com bytes/trocas; a parede é coluna adicional.
 
+O caminho físico (quente na VRAM, morno em CPU pinned, frio em memmap) está em `src/moe_memory/residency.py`. O cronômetro está em [plano-de-hardware.md](plano-de-hardware.md). Não há número medido neste repositório.
+
 ## Ablações úteis (depois do mínimo)
 
 - `λ = 0` vs `λ > 0` no modelo 4.

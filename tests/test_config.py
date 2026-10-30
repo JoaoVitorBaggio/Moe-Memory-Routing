@@ -41,6 +41,12 @@ def test_default_yaml_locks_the_blueprint():
     assert [config.memory.scaled_hot_slots(32, mult) for mult in config.eval.B_mult] == [4, 8, 16]
     assert config.corpus.dev == "TinyStories"
     assert config.corpus.report == "WikiText-2"
+    assert config.corpus.active == "dev"
+    assert config.corpus.resolve() == "TinyStories"
+    assert config.corpus.resolve("report") == "WikiText-2"
+    assert config.corpus.resolve("WikiText-2") == "WikiText-2"
+    assert config.corpus.cache_dir == "data/cache"
+    assert config.corpus.paths == {"TinyStories": "", "WikiText-2": ""}
     assert config.hardware.gpu == "GTX 1060"
     assert config.smoke.lambda_weight == 0.5
 
@@ -57,6 +63,15 @@ def test_yaml_mentions_the_expert_upgrade_path():
     text = (ROOT / "configs" / "default.yaml").read_text(encoding="utf-8")
     assert "expert_hidden: 512" in text
     assert "768" in text
+
+
+def test_loader_rejects_an_unknown_corpus_role(tmp_path: Path):
+    source = (ROOT / "configs" / "default.yaml").read_text(encoding="utf-8")
+    broken = source.replace("active: dev", "active: both")
+    path = tmp_path / "role.yaml"
+    path.write_text(broken, encoding="utf-8")
+    with pytest.raises(ValueError, match="dev"):
+        load_config(path)
 
 
 def test_loader_rejects_a_different_aggregation(tmp_path: Path):

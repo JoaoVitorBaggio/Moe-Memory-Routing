@@ -13,13 +13,15 @@ A contagem da arquitetura fechada é 47.939.328 parâmetros (~48 M): a embedding
 | `moe_memory/model.py` | LM causal. 4 blocos, toda FFN é MoE. Mistura dos top-2 = média ponderada (pesos somam 1) no treino e na inferência, para o residual não mudar de escala. |
 | `moe_memory/router.py` | Projeção linear + chave `expert + embed(ℓ(e))`. Sem `router_sees_level`, a chave ignora o nível. |
 | `moe_memory/emulator.py` | Quente / morno / frio, um passo por batch. LRU com desempate pela contagem do batch, teto `B`. Conta trocas e bytes. |
+| `moe_memory/residency.py` | No CUDA, põe o storage do expert no home do `ℓ(e)`: quente na VRAM, morno em CPU pinned, frio em memmap. A cópia para o compute é contador à parte (`staged_loads`), não entra no LRU. |
+| `moe_memory/corpus.py` | TinyStories e WikiText-2, BPE do GPT-2, blocos para a CE do próximo token. |
 | `moe_memory/loss.py` | CE do próximo token, `C_mem` e o balanceamento do Switch. Treino: média ponderada dos top-2. Inferência: soma dos top-2. Essa diferença é do **custo**, não do hidden (“custo real de acesso”). |
 | `moe_memory/config.py` | Lê e valida o YAML. |
-| `moe_memory/smoke.py` | Um passo sintético. Não é a corrida de WikiText-2. |
+| `moe_memory/smoke.py` | Um passo de treino. O atalho sintético não lê corpus. |
 
 `w(a,b) = |c(b) − c(a)|` não aparece no YAML: a loss deriva da tabela `c`.
 
-Homes físicos: morno = tensor de CPU (pinned se houver CUDA); frio = memmap. No smoke os `nn.Parameter` continuam no device de compute para o backward caber em CPU. Trocar o storage do parâmetro na 1060, com experts fora de `B` fora da VRAM, está marcado como `TODO(1060)` em `emulator.py`.
+Homes físicos, quando o device é CUDA: morno = CPU pinned (sobe no forward se o top-2 escolheu); frio = memmap (sobe se foi escolhido ou se o LRU promoveu). No smoke de CPU os `nn.Parameter` continuam no device de compute. O procedimento da parede na 1060 está em [`docs/plano-de-hardware.md`](../docs/plano-de-hardware.md).
 
 ## Como rodar o passo de fumaça
 
@@ -29,9 +31,11 @@ Na raiz do repositório, com Python ≥ 3.10:
 python3 -m pip install -r requirements.txt
 python3 experiments/smoke_train.py
 python3 experiments/smoke_eval.py
+python3 experiments/train_tinystories.py --steps 1
+python3 experiments/smoke_wikitext.py
 python3 -m pytest
 ```
 
-`smoke_train.py` instancia modelo, emulador e loss a partir de `configs/default.yaml`, faz um forward e um backward num batch aleatório e dá um passo de AdamW. `smoke_eval.py` faz um forward com a agregação de inferência (`sum`). `--lambda 0` usa o ponto da grade sem `C_mem`. O device padrão é `cpu`.
+`smoke_train.py` instancia modelo, emulador e loss a partir de `configs/default.yaml`, faz um forward e um backward num batch aleatório e dá um passo de AdamW. `smoke_eval.py` faz um forward com a agregação de inferência (`sum`). `--lambda 0` usa o ponto da grade sem `C_mem`. O device padrão é `cpu`. `train_tinystories.py` e `smoke_wikitext.py` leem os corpora do YAML.
 
-A loss impressa é de init aleatória. Não é perplexidade de relatório, não é latência de parede e não substitui a corrida overnight de WikiText-2.
+A loss impressa é de init aleatória ou de um passo curto. Não é perplexidade de relatório, não é latência de parede e não substitui a corrida overnight de WikiText-2.

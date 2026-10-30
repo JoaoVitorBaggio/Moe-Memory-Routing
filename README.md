@@ -2,7 +2,7 @@
 
 Mixture of Experts (MoE) pequeno com hierarquia **emulada** VRAM / RAM / SSD e roteador treinado com custo explícito de memória e de troca. Trabalho final de **Aprendizado Profundo (AGL11157)**, UFRGS, 2026/2.
 
-**Status:** blueprint revisado (out/2026) após feedback do prof. Joel Luís Carbonera. O esqueleto PyTorch está em `src/moe_memory/` (um passo sintético de treino e um forward de avaliação, hiperparâmetros em `configs/default.yaml`). Não há número de desempenho neste repositório: a loss do smoke é init aleatória, não resultado. `notebooks/` e `results/` seguem vazios.
+**Status:** blueprint revisado (out/2026) após feedback do prof. Joel Luís Carbonera. O esqueleto PyTorch está em `src/moe_memory/`: passo sintético, loaders de TinyStories (dev) e WikiText-2 (entrega), e residência física fora da VRAM quando o device é CUDA. Não há número de desempenho neste repositório. `notebooks/` e `results/` seguem vazios.
 
 ## Resumo
 
@@ -91,10 +91,13 @@ Python ≥ 3.10 e PyTorch em fp32. Na GTX 1060, o wheel CUDA; o passo abaixo tam
 python3 -m pip install -r requirements.txt
 python3 experiments/smoke_train.py
 python3 experiments/smoke_eval.py
+python3 experiments/train_tinystories.py --steps 1
+python3 experiments/smoke_wikitext.py
+python3 experiments/wall_latency.py
 python3 -m pytest
 ```
 
-Isso monta modelo, emulador e loss a partir de `configs/default.yaml` e dá **um** passo num batch aleatório. Não é treino de WikiText-2, não varre `λ` e não mede latência de parede. A loss impressa é de peso aleatório.
+`smoke_train.py` dá **um** passo num batch aleatório. `train_tinystories.py` dá um passo curto no corpus de desenvolvimento. `smoke_wikitext.py` só carrega os splits oficiais. `wall_latency.py` na GTX 1060 (`--device cuda`) cronometra o forward com experts fora de `B` fora da VRAM; sem CUDA ele não inventa ms. Nenhum desses comandos varre `λ` nem grava número de relatório. A loss impressa é de peso inicial ou de um passo curto.
 
 | Pasta | Para que serve |
 | --- | --- |

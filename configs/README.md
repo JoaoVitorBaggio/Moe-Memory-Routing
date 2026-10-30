@@ -16,6 +16,8 @@ Hiperparâmetros versionados do experimento mínimo.
 - `loss.train_topk_agg` / `infer_topk_agg` — média ponderada no treino, soma na inferência. É o proxy de custo, não a mistura do hidden.
 - `nvme: 20` — escolhido entre 20 e 30; recalibrar na 1060 se a dose–resposta sair flat/invertida.
 - Granularidade do emulador e `router_sees_level` estão aqui para o código não divergir do doc.
-- `smoke` — tamanho do batch aleatório do passo de fumaça e um `λ` da grade. Não é a corrida de entrega.
+- `corpus.active` — `dev` ou `report`. O nome em si (`TinyStories`, `WikiText-2`) também vale na API.
+- `corpus.cache_dir` — cache do Hugging Face. `corpus.paths` vazio baixa TinyStories (`roneneldan/TinyStories`) e o WikiText-2 cru (`Salesforce/wikitext`, config `wikitext-2-raw-v1`). Um diretório local tem `train.txt` / `valid.txt` / `test.txt`.
+- `smoke` — tamanho do batch do passo curto e um `λ` da grade. Não é a corrida de entrega. O passo de TinyStories reusa esse tamanho.
 
 Fórmulas e contexto: [docs/funcao-de-custo.md](../docs/funcao-de-custo.md).

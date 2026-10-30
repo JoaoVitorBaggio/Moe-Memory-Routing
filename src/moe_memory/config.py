@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+from moe_memory.corpus import KNOWN_CORPORA
 from moe_memory.levels import N_LEVELS
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -104,6 +105,26 @@ class HardwareConfig:
 class CorpusConfig:
     dev: str
     report: str
+    active: str
+    cache_dir: str
+    paths: dict[str, str]
+
+    def resolve(self, which: str | None = None) -> str:
+        """``None`` usa ``active``. ``dev`` / ``report`` escolhem o papel.
+
+        O nome do corpus (``TinyStories``, ``WikiText-2``) também vale.
+        """
+
+        choice = self.active if which is None else which
+        if choice == "dev":
+            return self.dev
+        if choice == "report":
+            return self.report
+        if choice == self.dev or choice == self.report:
+            return choice
+        raise ValueError(
+            f"corpus {choice!r} não é 'dev', 'report', {self.dev!r} nem {self.report!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -193,6 +214,9 @@ def _parse(raw: dict[str, Any], path: Path) -> ExperimentConfig:
         corpus=CorpusConfig(
             dev=_as_str(corpus, "dev"),
             report=_as_str(corpus, "report"),
+            active=_as_str(corpus, "active"),
+            cache_dir=_as_str(corpus, "cache_dir"),
+            paths=_as_path_map(corpus, "paths"),
         ),
         smoke=SmokeConfig(
             batch_size=_as_int(smoke, "batch_size"),
@@ -290,6 +314,24 @@ def _validate(config: ExperimentConfig) -> None:
             f"smoke.lambda={config.smoke.lambda_weight} não está na grade "
             f"{config.loss.lambda_grid}"
         )
+    if config.corpus.active not in {"dev", "report"}:
+        raise ValueError(
+            f"corpus.active={config.corpus.active!r} precisa ser 'dev' ou 'report'"
+        )
+    names = {config.corpus.dev, config.corpus.report}
+    unknown = names - KNOWN_CORPORA
+    if unknown:
+        known = ", ".join(sorted(KNOWN_CORPORA))
+        raise ValueError(f"corpus desconhecido: {sorted(unknown)}. Implementados: {known}")
+    missing = names - set(config.corpus.paths)
+    extra = set(config.corpus.paths) - names
+    if missing or extra:
+        raise ValueError(
+            "corpus.paths precisa ter exatamente "
+            + ", ".join(sorted(names))
+        )
+    if not config.corpus.cache_dir.strip():
+        raise ValueError("corpus.cache_dir não pode ser vazio")
 
 
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
@@ -331,6 +373,23 @@ def _as_float_list(section: dict[str, Any], key: str) -> list[float]:
             raise ValueError(f"{key} tem item não numérico: {item!r}")
         numbers.append(float(item))
     return numbers
+
+
+def _as_path_map(section: dict[str, Any], key: str) -> dict[str, str]:
+    value = _require(section, key)
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{key} precisa ser um mapeamento não vazio")
+    paths: dict[str, str] = {}
+    for name, path in value.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{key} tem chave inválida: {name!r}")
+        if path is None:
+            paths[name] = ""
+        elif isinstance(path, str):
+            paths[name] = path
+        else:
+            raise ValueError(f"{key}.{name} precisa ser texto, recebido {path!r}")
+    return paths
 
 
 def _as_str(section: dict[str, Any], key: str) -> str:

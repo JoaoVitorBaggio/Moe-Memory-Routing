@@ -53,3 +53,30 @@ Não viram N backends de GPU. Calibrar em aluguel real fica como extensão opcio
 ## O que a GPU real ainda faz
 
 Treino e forward dos tensores quentes na GPU disponível (1060, Colab, etc.). O emulador decide *qual expert conta como quente* sob `B`. Bytes/trocas vêm do emulador; **latência de parede do relatório só na 1060**, com níveis morno/frio materializados fora da VRAM.
+
+## Como medir a parede na GTX 1060
+
+O código que tira o expert da VRAM está em `src/moe_memory/residency.py`. O emulador (`ℓ(e)`, LRU sob `B`, trocas e bytes) não muda. A residência só troca o storage do `nn.Parameter` depois que o nível já foi decidido.
+
+| Nível | Onde o peso mora | Quando sobe para a VRAM |
+| --- | --- | --- |
+| Quente | `nn.Parameter` em CUDA | já está |
+| Morno | CPU pinned | no forward, se o top-2 escolheu o expert (`non_blocking`) |
+| Frio | memmap em disco (`outputs/`, fora do Git) | no forward, se foi escolhido, ou quando o LRU promove |
+
+No CPU do smoke os parâmetros ficam no device de compute: o autograd não troca de storage. No CI sem GPU o mesmo critério é testado com um mock de VRAM. Na 1060 o backend é o CUDA de verdade.
+
+O cronômetro, por batch, em `eval` e `torch.no_grad()`:
+
+1. `materialize()` — storage alinhado a `ℓ(e)`. Fora do tempo.
+2. `torch.cuda.synchronize()`, forward, `synchronize()` de novo. A subida do expert entra neste intervalo.
+3. `emulator.step` — LRU, trocas e bytes. Fora do tempo. Não é latência.
+4. `materialize()` de novo — quem ficou fora de `B` volta para pinned ou memmap, senão o batch seguinte não paga a cópia.
+
+p50/p95 desses forwards. O batch do relatório é o hold-out do WikiText-2; `experiments/wall_latency.py` só exercita o caminho com o batch sintético e **não grava número**. Sem CUDA o script recusa a medição em vez de inventar ms. Rode na placa:
+
+```bash
+python3 experiments/wall_latency.py --device cuda --batches 8
+```
+
+fp32, sem `torch.compile`. Treino longo pode ser noutra GPU; a coluna de parede do relatório é desta máquina, com este caminho.
