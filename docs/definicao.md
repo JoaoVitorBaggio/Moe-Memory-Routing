@@ -26,8 +26,10 @@ Um roteador treinado com penalidade de memória e de troca melhora a fronteira q
 
 - um emulador VRAM/RAM/SSD;
 - uma tabela de custo (perfil consumer ~6 GB; proporções tipo aluguel HBM ≫ DDR ≫ NVMe, sem preços Spot exatos);
-- `E` ∈ 16–32, **`k = 2`**; se faltar capacidade, **aumentar o expert**, não encolher o modelo;
-- orçamento **`B = 25%`** dos experts (4/16 ou 8/32); teste em 0,5×`B` e 2×`B`;
+- **`E = 32`**, **`k = 2`**; se faltar capacidade, **aumentar o expert**, não encolher o modelo;
+- orçamento **`B = 25%`** dos experts (**8/32**); teste em 0,5×`B` e 2×`B`;
+- emulador **por batch**; roteador recebe **`ℓ(e)`** (ciente de memória);
+- proxy `k=2`: média ponderada no treino, soma na inferência;
 - hardware de referência: VRAM útil 5,5 GB; RAM de trabalho 10/16 GB; SSD frio 1 GB (2 GB com checkpoints);
 - `λ ∈ {0, 0,5, 1}` com treino **separado por `λ`** (não condicionado); `β` fixo pequeno;
 - comparação com top-k (`λ=0`), **LRU só** (adversário único) e denso (tronco + `k`·expert);
@@ -49,13 +51,15 @@ Não é objetivo do núcleo emular N placas distintas como backends separados.
 | Item | Escolha |
 | --- | --- |
 | Upsizing do modelo | Não: manter faixa pequena e **emular** a hierarquia; capacidade via **expert maior**, não modelo maior |
-| `k` / `E` | `k = 2`; `E` ∈ 16–32 |
-| `B` | 25% dos experts (artificial; tudo cabe na 1060) |
-| `λ` / `β` | Grade `{0, 0,5, 1}`, um treino por `λ`; `β` Switch-like fixo |
+| `k` / `E` | `k = 2`; **`E = 32`** |
+| `B` | 25% dos experts (**8/32**; artificial; tudo cabe na 1060) |
+| `λ` / `β` | Grade `{0, 0,5, 1}`, um treino por `λ`; `β` fixo pequeno na ordem do Switch (exato em aberto) |
 | Baseline-2 | LRU de experts apenas |
 | Denso | tronco + `k`·expert |
-| Roteador | Linear/MLP + estado de cache; não tool-calls |
-| Pesos de custo | Hiperparâmetros: mudar tabela/orçamento deve adaptar o roteador |
+| Roteador | Linear/MLP + **`ℓ(e)` como entrada** (ciente de memória); não tool-calls |
+| Emulador | Granularidade **por batch** |
+| Proxy `k=2` | Treino: média ponderada top-2; inferência: soma top-2 |
+| Pesos de custo | Partida `c`=(HBM=1, DDR=10, NVMe=20|30), `w=Δc` amarrado a `c`; calibrar na 1060 |
 | “Quebrar monopólio” de experts | Fora do caminho crítico do experimento mínimo |
 
 ## O que conta como sinal

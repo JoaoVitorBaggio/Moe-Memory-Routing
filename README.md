@@ -20,7 +20,7 @@ Pergunta secundária (dose–resposta): treinado sob orçamento `B` de referênc
 
 ## Experimento mínimo (entrega principal)
 
-Um único emulador de três níveis, **um** vetor de custo (perfil consumer ~6 GB, proporções tipo HBM ≫ DDR ≫ NVMe), `k=2`, orçamento `B=25%` dos experts, treino por `λ ∈ {0, 0,5, 1}` (o ponto `λ=0` é o baseline 1) e avaliação em 0,5× e 2×`B`, contra top-k e **LRU** (e denso). Sem catálogo de várias GPUs de mercado no núcleo.
+Um único emulador de três níveis (**por batch**), **um** vetor de custo (perfil consumer ~6 GB; partida `c`=(1,10,20|30), `w=Δc`), **`E=32`**, `k=2`, orçamento `B=25%` (8/32), roteador com **`ℓ(e)`**, treino por `λ ∈ {0, 0,5, 1}` (o ponto `λ=0` é o baseline 1) e avaliação em 0,5× e 2×`B`, contra top-k e **LRU** (e denso). Sem catálogo de várias GPUs de mercado no núcleo.
 
 Extensões (não bloqueiam a entrega mínima):
 
@@ -33,8 +33,10 @@ Extensões (não bloqueiam a entrega mínima):
 | Tema | Decisão |
 | --- | --- |
 | Corpus | TinyStories só no dev; WikiText-2 no treino/avaliação de entrega (overnight) |
-| Experts / `k` | `E` ∈ 16–32; **`k = 2` no mínimo**. Preferir **aumentar o tamanho do expert** a encolher o modelo se faltar capacidade |
-| Orçamento `B` | **25%** dos experts quentes (4/16 ou 8/32) — teto **artificial** (o modelo inteiro cabe na 1060) |
+| Experts / `k` | **`E = 32`**; **`k = 2`**. Preferir **aumentar o tamanho do expert** a encolher o modelo se faltar capacidade |
+| Orçamento `B` | **25%** dos experts quentes (**8/32**) — teto **artificial** (o modelo inteiro cabe na 1060) |
+| Emulador / roteador | Granularidade **por batch**; roteador recebe **`ℓ(e)`** |
+| Proxy `k=2` | Treino: média ponderada top-2; inferência: soma top-2 |
 | Hardware de referência | VRAM útil **5,5 GB** (6 GB − ~0,5 GB driver/display); RAM de trabalho **10 GB** dos 16 GB; SSD frio **1 GB** (2 GB se checkpoints) |
 | `λ` / `β` | Treino **especializado por `λ`** (não condicionado); grade **`λ ∈ {0, 0,5, 1}`**; `β` fixo pequeno (ordem Switch) |
 | Baseline-2 | **Só LRU de experts** como adversário; declarado no protocolo e não muda no meio |
@@ -45,7 +47,7 @@ Extensões (não bloqueiam a entrega mínima):
 | Orçamento variável no treino | **Adiado** (extensão) |
 | Dose–resposta | Figura 0,5× / 1× / 2× + tabela contra baselines |
 | Colocação | Política dinâmica de cache/residência (não tool-calls) |
-| Custos por nível | Partida nos configs: c=(1,10,20|30), w=Δc; HBM ≫ DDR ≫ NVMe |
+| Custos por nível | Partida: c=(1,10,20|30), w=Δc amarrado a c; calibrar na 1060 |
 
 ## Motivação (curta)
 
@@ -59,7 +61,7 @@ MoE só calcula parte dos parâmetros por token, mas o tempo real depende de *on
 | Morno | “RAM” — meio do caminho | médio |
 | Frio | “SSD” — capacidade barata, troca cara | alto `c(ℓ)` e `w` de promoção |
 
-Os pesos `c(ℓ)` e `w(a,b)` são variáveis de experimento: mudar a tabela (menos VRAM “barata”) deve forçar o roteador a adaptar. Fórmulas em [docs/funcao-de-custo.md](docs/funcao-de-custo.md). Hardware e emulação em [docs/plano-de-hardware.md](docs/plano-de-hardware.md).
+Os pesos `c(ℓ)` e `w(a,b)` são variáveis de experimento (`w` amarrado a `c`): mudar a tabela deve forçar o roteador a adaptar. Fórmulas e decisões da call 30/10/2026 em [docs/funcao-de-custo.md](docs/funcao-de-custo.md). Hardware e emulação em [docs/plano-de-hardware.md](docs/plano-de-hardware.md).
 
 ## Baselines e métricas
 

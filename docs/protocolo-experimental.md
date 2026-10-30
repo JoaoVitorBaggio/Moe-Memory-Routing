@@ -6,8 +6,8 @@ Nada disto foi executado. Onde faltar número, o texto diz **a definir**.
 
 1. Emulador único VRAM/RAM/SSD com política de colocação dinâmica.
 2. Uma tabela de custo (perfil consumer ~6 GB / 5,5 GB úteis; HBM ≫ DDR ≫ NVMe).
-3. Modelo MoE na faixa ~10–50 M; **`E` ∈ 16–32**; **`k = 2`**; se faltar capacidade, aumentar o expert.
-4. Orçamento de referência **`B = 25%` de `E`** (4/16 ou 8/32). Treino **especializado** por `λ ∈ {0, 0,5, 1}`; `β` fixo pequeno.
+3. Modelo MoE na faixa ~10–50 M; **`E = 32`**; **`k = 2`**; se faltar capacidade, aumentar o expert.
+4. Orçamento de referência **`B = 25%` de `E`** (**8/32**). Treino **especializado** por `λ ∈ {0, 0,5, 1}`; `β` fixo pequeno (ordem Switch). Emulador **por batch**; roteador com **`ℓ(e)`**.
 5. Avaliação em `0,5×B`, `B` e `2×B` no hold-out.
 6. Baselines no mesmo corpus e mesmo `B` de referência: top-k (`λ=0`), **LRU de experts (único adversário de offload — não mudar no meio)**, denso com ativos ≈ tronco + `k`·expert, e o modelo com penalidade.
 7. Relatar correlação proxy↔emulador e entropia do roteador.
