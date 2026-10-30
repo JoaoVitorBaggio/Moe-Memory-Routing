@@ -1,0 +1,44 @@
+# Hiperparâmetros de partida — MoE-Memory-Routing
+# Call 30/10/2026 + blueprint. Calibráveis na GTX 1060; não são SOTA.
+# w(a,b) = |c(b) - c(a)| (amarrado a c; não listar w à parte).
+
+model:
+  E: 32                 # experts por camada MoE
+  k: 2                  # top-k na inferência
+  # camadas / d_model / tamanho do expert: ainda finos (código)
+
+memory:
+  B_frac: 0.25          # fração de E quente → 8/32
+  emulator_granularity: batch
+  router_sees_level: true   # ℓ(e) na entrada do roteador
+
+# Custo de acesso por nível (unidades relativas)
+c:
+  hbm: 1                # VRAM / quente
+  ddr: 10               # RAM / morno
+  nvme: 20              # SSD / frio (escolheu 20; 30 era alternativa; 100 rejeitado)
+
+# Loss
+loss:
+  lambda_grid: [0.0, 0.5, 1.0]   # um treino por valor; λ=0 = baseline 1
+  beta: 0.01                      # ordem Switch; fixo na corrida
+  # treino: média ponderada dos top-2; inferência: soma dos top-2
+  train_topk_agg: weighted_mean
+  infer_topk_agg: sum
+
+# Dose–resposta (avaliação; não HPO)
+eval:
+  B_mult: [0.5, 1.0, 2.0]
+  seeds: 3
+  holdout_note: "WikiText-2 splits oficiais; TinyStories só dev"
+
+hardware_ref:
+  gpu: "GTX 1060"
+  vram_usable_gb: 5.5
+  ram_work_gb: 10
+  ssd_cold_gb: 1
+  wall_latency_on: "1060"   # experts fora de B fisicamente off-VRAM
+
+corpus:
+  dev: TinyStories
+  report: WikiText-2

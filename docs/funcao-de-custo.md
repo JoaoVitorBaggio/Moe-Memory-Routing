@@ -63,9 +63,9 @@ Proposta inicial para o perfil consumer (unidades relativas, não ms nem dólare
 | --- | --- |
 | HBM / VRAM (quente) | `1` |
 | DDR / RAM (morno) | `10` |
-| NVMe / SSD (frio) | `20` ou `30` (escolher um e fixar na corrida) |
+| NVMe / SSD (frio) | `20` (partida em `configs/default.yaml`; `30` era alternativa) |
 
-`w(a,b)` de partida: **diferença de `c` entre os níveis** (`|c(b) − c(a)|`) — a troca só compensa se o ganho de acesso pagar a multa. **`w` fica amarrado a `c`**: muda a tabela de `c`, muda `w`. Proposta `100` para NVMe foi considerada agressiva demais. São **valores de partida** para calibrar com o que a 1060 aguentar (NVMe 20 vs 30 ainda aberto); sem fechar números fixos no sentido de “não recalibrar”. Números vivem em `configs/`; ablação pode trocar a tabela sem mudar a fórmula.
+`w(a,b)` de partida: **diferença de `c` entre os níveis** (`|c(b) − c(a)|`) — a troca só compensa se o ganho de acesso pagar a multa. **`w` fica amarrado a `c`**: muda a tabela de `c`, muda `w`. Proposta `100` para NVMe foi considerada agressiva demais. São **valores de partida** em [`configs/default.yaml`](../configs/default.yaml) (`nvme: 20`, `β: 0.01`) para calibrar com o que a 1060 aguentar — ablação pode trocar a tabela sem mudar a fórmula.
 
 ## Relação com dose–resposta
 
