@@ -4,11 +4,26 @@
 
 model:
   E: 32                 # experts por camada MoE
-  k: 2                  # top-k na inferência
-  # camadas / d_model / tamanho do expert: ainda finos (código)
+  k: 2                  # top-k
+  d_model: 256
+  n_layers: 4           # cada FFN é MoE
+  n_heads: 4            # d_head = d_model / n_heads = 64
+  # d_ff. Se faltar capacidade, subir para 768 — expert maior, não modelo menor.
+  expert_hidden: 512
+  max_seq_len: 256      # knob: até 512 no WikiText-2
+  vocab_size: 50257     # tokenizer GPT-2 (tiktoken / HuggingFace gpt2)
+  tokenizer: gpt2
+  dtype: fp32           # docs/plano-de-hardware.md — sem fp16 e sem torch.compile
+  # Amarra o lm_head na embedding de tokens. Sem o laço o vocab 50257
+  # empurra o total para ~60 M, fora da faixa 10–50 M. Com o laço, ~48 M.
+  tie_embeddings: true
 
 memory:
   B_frac: 0.25          # fração de E quente → 8/32
+  # Vagas do nível morno (DDR). Não é eixo do protocolo: só garante que o
+  # terceiro nível exista (o resto dos experts começa frio). O teto que o
+  # experimento varre é B, no quente.
+  warm_slots: 8
   emulator_granularity: batch
   router_sees_level: true   # ℓ(e) na entrada do roteador
 
@@ -42,3 +57,10 @@ hardware_ref:
 corpus:
   dev: TinyStories
   report: WikiText-2
+
+# Um passo sintético. Não é a corrida de entrega e não varre a grade.
+smoke:
+  batch_size: 2
+  seq_len: 32
+  lr: 0.0003
+  lambda: 0.5

@@ -8,10 +8,14 @@ Hiperparâmetros versionados do experimento mínimo.
 
 ## Como ler
 
+- `model.*` — arquitetura fina: `d_model`, `n_layers` (todo FFN é MoE), `n_heads` (`d_head = 64`), `expert_hidden` (`d_ff`; o comentário no YAML aponta 768 se faltar capacidade), `max_seq_len` (256, knob até 512), tokenizer GPT-2, fp32. `tie_embeddings` amarra o `lm_head` para o total ficar na faixa 10–50 M.
+- `memory.warm_slots` — vagas do nível morno para os três níveis existirem. Não é eixo do protocolo; o teto que se varre é `B` no quente.
 - `c.*` — custo de **acesso** por nível. `w(a,b)` **não** aparece no YAML: é `|c(b)−c(a)|` e muda com `c`.
 - `loss.beta` — fixo pequeno (ordem Switch); valor `0.01` é partida, não busca.
 - `loss.lambda_grid` — treinos separados; **não** é Optuna/HPO no mínimo.
+- `loss.train_topk_agg` / `infer_topk_agg` — média ponderada no treino, soma na inferência. É o proxy de custo, não a mistura do hidden.
 - `nvme: 20` — escolhido entre 20 e 30; recalibrar na 1060 se a dose–resposta sair flat/invertida.
 - Granularidade do emulador e `router_sees_level` estão aqui para o código não divergir do doc.
+- `smoke` — tamanho do batch aleatório do passo de fumaça e um `λ` da grade. Não é a corrida de entrega.
 
 Fórmulas e contexto: [docs/funcao-de-custo.md](../docs/funcao-de-custo.md).
