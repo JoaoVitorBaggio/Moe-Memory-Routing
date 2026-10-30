@@ -1,78 +1,62 @@
 # Protocolo experimental
 
-Comparar quatro modelos no **mesmo corpus** e no **mesmo orçamento de VRAM**, e ver se a penalidade de memória move a fronteira entre qualidade e latência. Nada disto foi executado. Onde um número ainda não foi escolhido, o texto diz **a definir**. Não há meta numérica de perplexidade nem de latência.
+Nada disto foi executado. Onde faltar número, o texto diz **a definir**.
 
-## O que fica igual
+## Experimento mínimo
 
-- Corpus de modelagem de linguagem, pequeno e público. Candidatos: WikiText-2 ou TinyStories. Escolha final: **a definir**.
-- Split de hold-out temporal ou por domínio, no mesmo corpus. Forma exata: **a definir**.
-- Família do modelo de linguagem e faixa de tamanho (~10 a 50 milhões de parâmetros no MoE, contando todos os experts). Tamanho exato, número de experts, `k` do top-k e número de camadas MoE: **a definir**.
-- Orçamento de VRAM do experimento principal: um teto de quantos experts (ou quantos bytes de expert) podem residir na VRAM. O teto é menor que o conjunto inteiro de experts, senão ninguém usa RAM nem SSD. Valor: **a definir**.
-- Custos `c(ℓ)` e pesos de troca, medidos uma vez na máquina do grupo e reutilizados no treino. Ver a função de custo e o plano de hardware.
-- Implementação em PyTorch. Os quatro modelos compartilham o máximo possível de código, para a diferença ser a política e não um detalhe de treino.
+1. Emulador único VRAM/RAM/SSD com política de colocação dinâmica.
+2. Uma tabela de custo (perfil consumer ~6 GB / 5,5 GB úteis; HBM ≫ DDR ≫ NVMe).
+3. Modelo MoE na faixa ~10–50 M; **`E` ∈ 16–32**; **`k = 2`**; se faltar capacidade, aumentar o expert.
+4. Orçamento de referência **`B = 25%` de `E`** (4/16 ou 8/32). Treino **especializado** por `λ ∈ {0, 0,5, 1}`; `β` fixo pequeno.
+5. Avaliação em `0,5×B`, `B` e `2×B` no hold-out.
+6. Baselines no mesmo corpus e mesmo `B` de referência: top-k (`λ=0`), **LRU de experts (único adversário de offload — não mudar no meio)**, denso com ativos ≈ tronco + `k`·expert, e o modelo com penalidade.
+7. Relatar correlação proxy↔emulador e entropia do roteador.
 
-O modelo denso não tem experts para expulsar da VRAM. “Parâmetros ativos comparáveis” quer dizer: a contagem de parâmetros do denso fica na mesma ordem do que o MoE usa por token (tronco compartilhado + `k` experts), não na ordem do total de experts. A receita exata de igualar essa contagem está **a definir**. Por construção, esse denso deve caber no orçamento quente. Igualar também FLOPs é desejável como checagem, não como segundo baseline.
+## O que fica igual entre modelos
+
+- Corpus: TinyStories no desenvolvimento; **WikiText-2** nas corridas de entrega (PC à noite). Mesmo pipeline, config diferente.
+- Família e tamanho do LM; número de camadas MoE.
+- Implementação PyTorch compartilhada o máximo possível.
+- Tabela de custos da corrida mínima (salvo ablação explícita).
+
+O denso iguala parâmetros *ativos* ≈ tronco + `k`·tamanho_do_expert (`k=2`), não o total de experts.
 
 ## Os quatro modelos
 
-| # | Nome | Treino do roteador | Onde os experts ficam |
+| # | Nome | Treino | Residência |
 | --- | --- | --- | --- |
-| 1 | MoE top-k clássico | `λ = 0`. Tarefa + balanceamento | Sem política de memória. Referência de qualidade do MoE, sem cobrar nível |
-| 2 | MoE com offload heurístico | O mesmo roteador do modelo 1, sem penalidade | Heurística: LRU **ou** manter na VRAM os k experts mais usados. São regras diferentes; a escolhida fica **a definir** e deve ser declarada |
-| 3 | Denso | Não há roteador | Todos os parâmetros no caminho ativo, tamanho comparável ao caminho ativo do MoE |
-| 4 | Este projeto | `L` completa, com `λ > 0` e a variante de troca | Residência em três níveis. A política que promove e rebaixa experts está **a definir**; o gradiente da penalidade passa pelo roteador |
+| 1 | MoE top-k | `λ = 0` + balanço | residência na avaliação: **mesmo LRU sob `B`** (só não treina com `C_mem`); o `λ=0` da grade **é** este modelo |
+| 2 | MoE + **LRU de experts** | igual ao 1 | único adversário de offload |
+| 3 | Denso | sem roteador | ativos ≈ tronco + `k`·expert; cabe no orçamento quente |
+| 4 | Este projeto | `λ > 0` + balanço | emulador + colocação dinâmica |
 
-O modelo 1 existe para separar “MoE esparso” de “MoE que paga memória”. O modelo 2 existe para separar “qualquer offload” de “offload que o roteador aprendeu”. O modelo 3 existe para separar “esparsidade” de “a penalidade”.
+O modelo 2 existe para mostrar que o ganho **não** é “qualquer MoE” nem “qualquer offload”.
 
-## Métricas
+## Dose–resposta (ponto 6 do feedback)
 
-Todas no hold-out, com a escolha discreta de experts (não com o custo esperado da loss).
+- Eixo de dose na **avaliação:** orçamento `B` ∈ {0,5×, 1×, 2×}.
+- `λ` ∈ {0, 0,5, 1} são **curvas de treino** separadas (não confundir 0,5 de `λ` com 0,5×`B`).
+- Entrega: **uma figura** dose–resposta (qualidade vs latência ou vs I/O/custo medido) e **uma tabela** contra os baselines no orçamento de referência (e, se couber, nos extremos).
+- Interpretação: resposta monótona e útil ⇒ o sinal de memória está vivo; flat ou invertido ⇒ revisar proxy/política.
 
-| Métrica | Definição operacional |
+## Métricas (hold-out, escolha discreta)
+
+| Métrica | Nota |
 | --- | --- |
-| Perplexidade | Perplexidade do próximo token no hold-out. Accuracy de próximo token pode ser registrada junto, como leitura auxiliar |
-| Latência por token | Tempo de parede por token. Reportar p50 e p95, não só a média |
-| Volume de I/O | Bytes lidos da RAM e do SSD, e bytes escritos no SSD se o treino ou a promoção sujar peso frio |
-| Trocas por nível | Contagem de transições VRAM↔RAM e RAM↔SSD (e VRAM↔SSD, se existirem) |
-| Curva qualidade × latência | Perplexidade contra latência p50. No modelo 4, um ponto por `λ`. Nos outros, um ponto no orçamento principal; orçamentos extras entram na pergunta secundária |
+| Perplexidade | Principal de qualidade |
+| Bytes / trocas do emulador | Principal de recurso no mínimo |
+| Latência p50/p95 | **Sim — medir parede na 1060** (orçamento `B` fixo, não sorteado no treino mínimo) |
+| Entropia do roteador | Diagnóstico de colapso |
+| Correlação proxy × emulador | Diagnóstico de alinhamento |
 
-O número de corridas independentes e o comprimento mínimo do hold-out para o p95 não ser anedota estão **a definir**. A semente de cada corrida será registrada quando o código existir.
+Seeds: **3** no mínimo. Hold-out: no WikiText-2, **splits oficiais** valid (seleção) e test (relatório); no TinyStories, o valid do dataset. A ordem de grandeza é ~10% do treino.
 
-Latência e I/O que entram nessa tabela são medidos na máquina do grupo. Medição em Colab ou Kaggle não substitui essa coluna.
+## Latência de parede
 
-## Ablação da penalidade
+Decidido: reportar latência de parede na GTX 1060 no protocolo mínimo, porque `B` é fixo (não randomizado no treino). O emulador continua com bytes/trocas; a parede é coluna adicional.
 
-Obrigatória, no modelo 4, com a mesma arquitetura e o mesmo orçamento:
+## Ablações úteis (depois do mínimo)
 
-- `λ = 0`
-- `λ > 0` (os valores da grade, **a definir**)
-
-A diferença de perplexidade, latência, I/O e trocas entre esses treinos é o efeito atribuível à penalidade. Se `λ = 0` não chegar perto do modelo 1, há um confounder (código ou residência diferentes), e isso tem de ser explicado, não absorvido como ganho.
-
-Ablação fina opcional, não exigida para fechar o protocolo: `C_mem` só com busca, contra busca mais troca.
-
-## Generalização entre orçamentos
-
-Treinar o modelo 4 com um orçamento `B`. Avaliar em `0,5 · B` e em `2 · B`, sem retreinar. Comparar, nos três orçamentos, com o top-k clássico (modelo 1) e com a heurística (modelo 2). O denso nesse par de orçamentos é opcional.
-
-O que se quer ver é se o roteador aprendido em `B` só memorizou aquele teto. Não há previsão numérica do que vai acontecer.
-
-## Extensão opcional
-
-Sortear o orçamento a cada batch ou a cada época, informar o valor ao roteador (ele precisa enxergar o teto, senão não tem como se adaptar), e repetir o teste em `0,5 · B` e `2 · B`. Comparar com o roteador de orçamento fixo. Distribuição do sorteio: **a definir**. Esta extensão não bloqueia o experimento mínimo.
-
-## Modo da camada fria
-
-**A definir:** só simulação (tabela de custos medida, sem cópia real) ou também protótipo com arquivo no NVMe via mmap. O relatório declara qual modo produziu cada número. Se os dois existirem, não misturar a latência simulada com a latência de parede na mesma curva sem um rótulo.
-
-## Ordem prática
-
-1. Fechar corpus, arquitetura e orçamento `B`.
-2. Medir `c(VRAM)`, `c(RAM)` e `c(SSD)` na máquina do grupo, para o tamanho real de um expert.
-3. Treinar os quatro modelos nesse `B`.
-4. Avaliar perplexidade e, na mesma máquina, latência, I/O e trocas.
-5. Repetir a avaliação do modelo 4 em `λ = 0` e na grade `λ > 0`.
-6. Reavaliar modelos 1, 2 e 4 em `0,5 · B` e `2 · B`.
-7. Só então, se o grupo adotar a extensão, treinar com orçamento variável.
-
-Não pular para a curva antes de existir um modelo 1 reproduzível. Sem esse ponto, a fronteira não tem âncora.
+- `λ = 0` vs `λ > 0` no modelo 4.
+- Trocar a tabela de custo (apêndice mercado).
+- Orçamento amostrado / variável no treino: **adiado** (fora da entrega mínima; extensão).

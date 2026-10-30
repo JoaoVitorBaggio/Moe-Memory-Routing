@@ -1,58 +1,53 @@
-# Plano de hardware
+# Plano de hardware e emulação
 
-A máquina de um dos integrantes é a referência dos três níveis reais. Treino pode acontecer em outra GPU. A latência que o protocolo reporta, não.
+A máquina de referência do grupo ancora a *história* dos três níveis. O experimento mínimo **emula** a hierarquia; não depende de martelar o NVMe a cada passo de treino.
 
-Não há medição neste repositório. Tudo que seria um número de milissegundo continua **a definir**.
+Não há medição neste repositório. Valores de ms em `c(ℓ)`/`w` continuam para `configs/` (razões tipo aluguel bastam no texto).
 
 ## Máquina de referência
 
-| Peça | O que o grupo tem |
+| Peça | Valor |
 | --- | --- |
-| GPU | GTX 1060, 6 GB de VRAM, arquitetura Pascal |
-| RAM | 16 GB |
-| Disco frio | SSD NVMe |
-| Software previsto | PyTorch. Sem TensorFlow |
+| GPU | GTX 1060, 6 GB (Pascal); **VRAM útil ≈ 5,5 GB** (reserva ~0,5 GB driver/display) |
+| RAM | 16 GB físicos; **orçamento de trabalho ≈ 10 GB** para o experimento |
+| Disco frio | SSD NVMe; **reserva 1 GB** para pool frio (2 GB se houver checkpoints) |
+| Software | PyTorch, fp32 (sem depender de `torch.compile`) |
 
-Essa GPU não tem tensor cores. O cálculo fica em **fp32**. fp16 entra só se for preciso economizar memória, não como aceleração: nesta placa ele não é um caminho rápido de treino. bf16 nativo não existe aqui. `torch.compile` costuma não funcionar nesta GPU; o projeto não depende dele. Se alguém compilar numa GPU mais nova, isso não pode ser requisito do resultado.
+Faixa de modelo: ~10–50 M parâmetros. Em fp32 o modelo + Adam + ativações fica na ordem de ~2 GB — **cabe inteiro** nos 5,5 GB. Por isso o orçamento `B` é um **teto artificial** de residência de experts (**referência: 25% de `E`**, ex. 4/16 ou 8/32). Sem `B` apertado, a hierarquia não é exercitada. Preferir expert maior a modelo maior se faltar capacidade com `k=2`.
 
-A faixa de modelo é ~10 a 50 milhões de parâmetros. O tamanho exato, dentro da faixa, está **a definir**.
+## Emulação (caminho principal)
 
-## Por que o orçamento de VRAM é artificial
+O emulador mantém o estado `ℓ(e)` de cada expert, aplica a política de promoção/rebaixamento sob o teto `B`, e acumula:
 
-Em fp32, 50 milhões de parâmetros são cerca de 200 MB de pesos, mais o estado do otimizador se o treino for nesta placa (o Adam guarda dois momentos por parâmetro). Isso cabe em 6 GB, com folga para ativações, desde que o modelo fique na faixa combinada. Confiança alta nessa conta de ordem de grandeza; não é uma medição de pico de memória desta GPU.
+- custo/proxy alinhado à tabela `c(ℓ)`, `w(a,b)`;
+- bytes e contagem de trocas (métrica “de verdade” do experimento mínimo).
 
-Consequência: se todos os experts puderem morar na VRAM, a hierarquia não é exercitada e a penalidade não tem o que cobrar. O orçamento `B` do protocolo é um teto de residência, menor que o conjunto de experts, escolhido pelo grupo. Os 6 GB são o teto físico, incluindo ativações e, no treino local, o otimizador. Quanto de `B` sobra para pesos quentes versus ativações está **a definir**.
+Simulação de latência por amostra dos `c(ℓ)` serve para iterar a loss. Latência de *parede* **entra no mínimo** e mede-se **sempre na 1060** (treino pode ser Colab/outra GPU). Para a parede refletir a hierarquia, experts fora de `B` ficam **fisicamente** em CPU pinned (morno) ou mmap/NVMe (frio), não só “etiquetados” na VRAM. Emulador cobre bytes/trocas; parede é coluna adicional.
 
-## Os três níveis na prática
+## Tabela de custo (experimento mínimo)
 
-**Quente.** Tensores na VRAM. É o único nível que a GPU lê sem transferência no meio do passo.
+Uma tabela, perfil **consumer ~6 GB / 5,5 GB úteis**, com razões na ordem de aluguel de memória rápida vs lenta:
 
-**Morno.** Pesos na RAM do hospedeiro, em memória pinned (memória travada, que o DMA da GPU pode ler sem o sistema operacional paginar a página no meio da cópia). Sobe para a VRAM quando o controlador promove o expert.
+| Nível | Papel | Ordem de custo de acesso / troca | Capacidade de referência |
+| --- | --- | --- | --- |
+| VRAM (quente) | residência cara no orçamento `B` | acesso barato | `B = 25%` dos experts |
+| RAM (morno) | meio | médio | dentro dos ~10 GB de trabalho |
+| SSD (frio) | capacidade | acesso/troca caros | pool ~1 GB (2 GB c/ checkpoints) |
 
-**Frio.** Pesos num arquivo no NVMe, mapeados com `mmap` / `np.memmap`. Não ficam todos residentes na RAM. Uma promoção para o nível morno lê o arquivo.
+Valores numéricos de `c(ℓ)` e `w(a,b)`: constantes no `configs/`. Partida: `c` = (HBM=1, DDR=10, NVMe=20 ou 30); `w(a,b)` = |c(b)−c(a)|. HBM ≫ DDR ≫ NVMe em espírito; não exige preço AWS Spot no mínimo.
 
-O controlador SSD↔RAM troca menos vezes e com penalidade maior do que o RAM↔VRAM. Isso está na função de custo (`w_frio > w_quente`).
+Os pesos são **hiperparâmetros**: mudar a tabela ou `B` deve adaptar o roteador (benefício do desenho).
 
-## Simulação ou arquivo de verdade
+## Apêndice: realismo de mercado (extensão)
 
-**A definir.** As duas opções cabem no plano; o grupo ainda não fechou.
+Fora da entrega mínima, 2–3 vetores de custo no *mesmo* emulador:
 
-- Simulação: cada acesso soma o `c(ℓ)` medido (ou sorteia em torno dele) e nenhum byte precisa atravessar o NVMe durante o treino. Serve para iterar a loss. Não substitui a coluna de latência de parede.
-- Protótipo: arquivo real, mmap, cópia para RAM pinned e então para a VRAM. A latência p50/p95 e o volume de I/O saem desse caminho.
+1. consumer 6–12 GB;
+2. mid cloud;
+3. high-end.
 
-Os custos usados na loss devem ser medidos nesta máquina, com uma leitura do tamanho real de um expert em cada nível, antes da grade de `λ`. Repetir a medição se o tamanho do expert mudar.
+Não viram N backends de GPU. Calibrar em aluguel real fica como extensão opcional.
 
-## Quem treina onde
+## O que a GPU real ainda faz
 
-Quem não tiver GPU treina no Colab ou no Kaggle. Isso vale para obter pesos e perplexidade, se o grupo quiser paralelizar.
-
-Não vale para a latência, o I/O e a contagem de trocas que entram na curva. Disco de instância gratuita é virtual: a fila e a cache não são as do NVMe da máquina de referência, então p50 e p95 não se comparam. Essas métricas saem de uma máquina controlada pelo grupo, de preferência a descrita acima, com GPU, RAM e SSD no mesmo sistema.
-
-Se a perplexidade for medida numa GPU e a latência noutra, o relatório separa as colunas e diz em qual máquina cada uma foi obtida. Misturar as duas numa “latência do Colab” invalida a fronteira.
-
-## Cuidados que já dá para cravar
-
-- Não planejar o resultado em cima de bf16 nem de `torch.compile`.
-- Não encher os 6 GB com o conjunto inteiro de experts e chamar isso de orçamento apertado.
-- No treino feito na própria 1060, reservar memória para ativações e para o estado do otimizador antes de fixar quantos experts cabem quentes.
-- Checkpoint grande, dataset baixado e log de ativação ficam fora do Git (veja `.gitignore`). Disco local é o lugar deles; a pasta some se alguém depender de filesystem efêmero de nuvem.
+Treino e forward dos tensores quentes na GPU disponível (1060, Colab, etc.). O emulador decide *qual expert conta como quente* sob `B`. Bytes/trocas vêm do emulador; **latência de parede do relatório só na 1060**, com níveis morno/frio materializados fora da VRAM.

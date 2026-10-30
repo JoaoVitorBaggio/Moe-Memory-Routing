@@ -1,80 +1,77 @@
 # Problema e escopo
 
 **Disciplina:** Aprendizado Profundo (AGL11157), UFRGS, 2026/2.  
-**Grupo:** 4 pessoas. Nomes e cartões que faltam estão **a definir** (veja o README).  
-**Estado:** definição de trabalho. Nenhum experimento foi executado. Não há resultado numérico.
+**Estado:** blueprint revisado (out/2026). Nenhum experimento foi executado. Não há resultado numérico.  
+**Feedback do professor:** proposta aprovada (100/100); este documento incorpora as correções de direção (emulação, colocação dinâmica, 16–32 experts, entropia, alinhamento proxy↔emulador, dose–resposta, adversário forte).
 
 ## Problema
 
-Modelos esparsos do tipo Mixture of Experts (MoE) ativam só parte dos parâmetros por token. Em hardware real, esses experts não custam o mesmo: moram numa hierarquia de memória. VRAM é rápida e cara, RAM é o meio do caminho, SSD é lenta, barata e tem limite de escritas.
+MoEs ativam só parte dos parâmetros por token. Em hardware real, experts em VRAM, RAM e SSD não custam o mesmo. Sistemas como PowerInfer e *LLM in a flash* já fazem offload. O que este grupo ataca é **treinar o roteador com um custo explícito de acesso e troca entre níveis**, em vez de otimizar só a loss de tarefa e deixar a residência a cargo de uma heurística depois.
 
-Sistemas como PowerInfer e *LLM in a flash* já fazem offload e ativação esparsa. No recorte deste grupo, o que não está resolvido é **treinar o roteador com um custo explícito de troca entre níveis**, em vez de minimizar só a loss de tarefa e deixar a residência a cargo de uma heurística depois do treino.
-
-Cada expert (ou bloco) fica em um de três estados:
-
-| Estado | Nível | Residência |
-| --- | --- | --- |
-| Quente | VRAM | GPU |
-| Morno | RAM | Memória pinned do hospedeiro |
-| Frio | SSD | Arquivo no NVMe, lido com mmap |
-
-O controlador SSD↔RAM deve ser mais lento e mais estável que o RAM↔VRAM. A penalidade de troca é maior nesse salto justamente para não martelar o SSD.
+Como o modelo do protótipo (~10–50 M parâmetros) **cabe** na VRAM de uma GTX 1060, a hierarquia precisa ser **emulada**: um teto artificial de residência `B` e um emulador que conta bytes e trocas. Sem isso, a penalidade não tem o que cobrar.
 
 ## Pergunta de pesquisa
 
-Um roteador treinado com penalidade por acesso e por troca de nível melhora a fronteira qualidade × latência (e qualidade × I/O) em relação a:
+Um roteador treinado com penalidade de memória e de troca melhora a fronteira qualidade × latência / I/O em relação a:
 
-1. um MoE top-k clássico, sem custo de memória;
-2. a mesma rede com offload heurístico (LRU ou “k experts mais usados na VRAM”);
-3. um modelo denso com quantidade comparável de parâmetros ativos.
+1. MoE top-k clássico (`λ = 0`);
+2. o mesmo MoE com **LRU de experts** — **baseline-2 / adversário único**;
+3. modelo denso com parâmetros ativos comparáveis.
 
-Pergunta secundária, de generalização entre orçamentos: se o treino usa um orçamento de VRAM fixo, o roteador ainda se comporta bem em 0,5× e 2× desse orçamento, contra o top-k clássico e contra a heurística?
+**Dose–resposta:** sob orçamento **`B`** de referência, o comportamento em 0,5×`B` e 2×`B` na *avaliação* é monótono e útil? (`λ` não é o eixo “0,5×” — é grade de treino separada.) Se baratear memória não muda nada, o sinal não está entrando; se encarecer e o modelo não economizar, o proxy está fraco.
 
-Extensão opcional: sortear o orçamento por batch ou por época, informar esse valor ao roteador, e comparar com o treino de orçamento fixo. Entra ou não na entrega mínima: **a definir**.
+## Experimento mínimo vs extensões
+
+**Mínimo (entrega):**
+
+- um emulador VRAM/RAM/SSD;
+- uma tabela de custo (perfil consumer ~6 GB; proporções tipo aluguel HBM ≫ DDR ≫ NVMe, sem preços Spot exatos);
+- `E` ∈ 16–32, **`k = 2`**; se faltar capacidade, **aumentar o expert**, não encolher o modelo;
+- orçamento **`B = 25%`** dos experts (4/16 ou 8/32); teste em 0,5×`B` e 2×`B`;
+- hardware de referência: VRAM útil 5,5 GB; RAM de trabalho 10/16 GB; SSD frio 1 GB (2 GB com checkpoints);
+- `λ ∈ {0, 0,5, 1}` com treino **separado por `λ`** (não condicionado); `β` fixo pequeno;
+- comparação com top-k (`λ=0`), **LRU só** (adversário único) e denso (tronco + `k`·expert);
+- checagem de correlação entre custo na loss e bytes/trocas do emulador;
+- monitorar entropia do roteador (colapso por preferir VRAM).
+
+**Medição:** latência de parede na 1060 entra no mínimo (`B` fixo).
+
+**Extensões (apêndice / depois):**
+
+- 2–3 vetores de custo (“consumer 6–12 GB”, “mid cloud”, “high-end”);
+- treino com orçamento amostrado por batch/época (**adiado**);
+- calibrar `c(ℓ)` em preços de aluguel reais.
+
+Não é objetivo do núcleo emular N placas distintas como backends separados.
+
+## Decisões de desenho (fechadas na discussão)
+
+| Item | Escolha |
+| --- | --- |
+| Upsizing do modelo | Não: manter faixa pequena e **emular** a hierarquia; capacidade via **expert maior**, não modelo maior |
+| `k` / `E` | `k = 2`; `E` ∈ 16–32 |
+| `B` | 25% dos experts (artificial; tudo cabe na 1060) |
+| `λ` / `β` | Grade `{0, 0,5, 1}`, um treino por `λ`; `β` Switch-like fixo |
+| Baseline-2 | LRU de experts apenas |
+| Denso | tronco + `k`·expert |
+| Roteador | Linear/MLP + estado de cache; não tool-calls |
+| Pesos de custo | Hiperparâmetros: mudar tabela/orçamento deve adaptar o roteador |
+| “Quebrar monopólio” de experts | Fora do caminho crítico do experimento mínimo |
 
 ## O que conta como sinal
 
-Não há dataset rotulado externo. O sinal de treino é o próximo token, mais métricas de recurso (latência, bytes movidos, trocas). Um registro auxiliar de quais experts seriam pedidos por token pode calibrar o modelo de latência e as taxas de miss entre níveis. No protótipo, esse registro pode ser sintético.
+Não há dataset rotulado externo. Sinal de treino: próximo token + métricas de recurso do emulador (e latência de parede quando o protocolo exigir máquina controlada).
 
 ## Corpus
 
-Escala de estudante, corpus público e compacto, para treinar e medir perplexidade com GPU de estudante ou Colab.
+Decisão (out/2026):
 
-Candidatos: **WikiText-2** ou **TinyStories** (ou um subconjunto equivalente). A escolha final está **a definir**.
+- **TinyStories** — só desenvolvimento: iterar, achar bug, validar pipeline e ordem de grandeza de perda/throughput.
+- **WikiText-2** — treino e avaliação “de produção” do trabalho (tabelas, dose–resposta, baselines). Corrida longa; plano típico: deixar o PC ligado à noite.
+- WikiText-103 — reserva se WikiText-2 for insuficiente; fora do caminho mínimo.
 
-Hold-out: split temporal ou por domínio, no mesmo corpus, para ver se o roteador com custo generaliza ou só memoriza o padrão de acesso do treino. A forma exata do split fica **a definir** junto com o corpus.
+Os dois entram no código via config. Números do relatório vêm do WikiText-2, não do TinyStories.
 
-## Dentro do escopo
+## Fora de escopo (seminário vs trabalho)
 
-- MoE pequeno, poucos experts, top-k baixo. Contagens exatas: **a definir**.
-- Três níveis de residência.
-- Loss de tarefa + penalidade de memória/troca + balanceamento de carga.
-- Quatro sistemas comparados sob o mesmo corpus e o mesmo orçamento de VRAM.
-- Ablação do peso da penalidade (zero versus positivo).
-- Varredura que produz a curva qualidade × latência.
-- Teste em 0,5× e 2× do orçamento de treino.
-- Implementação em PyTorch. Modelos na faixa de ~10 a 50 milhões de parâmetros.
-- Simulador da hierarquia com custos medidos na máquina do grupo, e/ou protótipo com arquivo real. Qual dos dois (ou ambos) está **a definir**.
-
-## Fora do escopo
-
-- Escala de modelo de linguagem de produção, cluster e serviço online.
-- TensorFlow.
-- BitNet ou quantização como entrega. Podem aparecer só como discussão de atrito com o hardware.
-- Depender de `torch.compile` ou de bf16. A GPU de referência não oferece isso de forma confiável (veja o plano de hardware).
-- Tratar latência medida em disco de Colab ou Kaggle como resultado. Esse disco é virtual.
-
-## Relação com a disciplina
-
-O trabalho usa rede profunda, loss composta e avaliação experimental. Liga computação condicional / MoE a um problema de sistemas e exige comparação controlada. O foco é o protocolo (custo no roteador + baselines), não bater recorde de escala.
-
-## Itens em aberto
-
-- Nomes e cartões dos integrantes.
-- Corpus final (WikiText-2, TinyStories ou outro equivalente).
-- Camada fria só simulada, ou também protótipo com arquivo mmap no NVMe.
-- Regra exata da heurística do baseline 2 (LRU estrito ou k de maior uso).
-- Número de experts, valor de k, tamanho exato do modelo dentro da faixa, e o orçamento de VRAM em bytes ou em número de experts.
-- Se a extensão de orçamento variável entra na entrega ou fica de fora.
-
-Nada disso será preenchido com um número inventado. Quando o grupo fechar um item, a atualização entra neste documento e no protocolo.
+No seminário: MoE **não** é aplicação direta de STE / Gumbel / REINFORCE; esparsidade é por expert/bloco, não por neurônio; esparso ≠ barato; experts não são necessariamente “especialistas” semânticos. Este repositório é o trabalho experimental, não o slide deck.

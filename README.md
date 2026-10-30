@@ -1,80 +1,109 @@
 # Roteamento consciente de memória
 
-Mixture of Experts (MoE) pequeno em três níveis — VRAM, RAM e SSD — com o roteador treinado por um custo explícito de memória e de troca. Trabalho final de **Aprendizado Profundo (AGL11157)**, UFRGS, 2026/2, em grupo de 4 pessoas.
+Mixture of Experts (MoE) pequeno com hierarquia **emulada** VRAM / RAM / SSD e roteador treinado com custo explícito de memória e de troca. Trabalho final de **Aprendizado Profundo (AGL11157)**, UFRGS, 2026/2.
 
-**Status:** documentação inicial. Código, treino, experimentos e resultados estão **em construção**. Não há número de desempenho neste repositório.
+**Status:** blueprint revisado (out/2026) após feedback do prof. Joel Luís Carbonera. Código, treino, experimentos e resultados estão **em construção**. Pastas `src/`, `configs/`, `experiments/`, `notebooks/` e `results/` existem só como esqueleto. Não há número de desempenho neste repositório.
 
 ## Resumo
 
-Cada expert fica num nível de memória: quente (VRAM da GPU), morno (RAM) ou frio (SSD NVMe). A loss junta a entropia cruzada do próximo token, o custo esperado de buscar e de trocar de nível, e o balanceamento de carga do MoE. A hipótese é que variar esse custo melhora a fronteira entre qualidade e latência, no mesmo corpus e no mesmo orçamento de VRAM, frente aos baselines abaixo.
+Cada expert fica num nível de memória emulado: quente (VRAM), morno (RAM) ou frio (SSD). A loss junta a entropia cruzada do próximo token, um *proxy* diferenciável do custo de memória/troca, e o balanceamento de carga. A hipótese é que variar esse custo (e o orçamento) melhora a fronteira qualidade × latência / I/O frente a baselines fortes, no mesmo corpus.
 
 ## Pergunta de pesquisa
 
-Um roteador treinado com penalidade de memória e de troca melhora a fronteira qualidade × latência (e o volume de I/O) em relação a um MoE top-k sem custo de memória, ao mesmo MoE com offload heurístico, e a um modelo denso com parâmetros ativos comparáveis?
+Um roteador treinado com penalidade de memória e de troca melhora a fronteira qualidade × latência (e o volume de I/O) em relação a:
 
-Pergunta secundária: treinado com um orçamento de VRAM, o roteador se mantém quando o teste usa 0,5× e 2× desse orçamento? Extensão opcional, ainda não decidida como entrega: sortear o orçamento a cada batch ou época e informá-lo ao roteador.
+1. MoE top-k sem custo de memória;
+2. o mesmo MoE com **LRU de experts** — o adversário principal, não só “qualquer MoE”;
+3. um modelo denso com parâmetros ativos comparáveis?
 
-## Motivação e trabalhos relacionados
+Pergunta secundária (dose–resposta): treinado sob orçamento `B` de referência, o roteador reage de forma monótona em **0,5×`B`** e **2×`B`** na avaliação? (`λ` define curvas de treino separadas.)
 
-Um MoE só calcula parte dos parâmetros por token, mas o tempo real depende de onde o expert está. VRAM é rápida e escassa; RAM fica no meio; SSD é barata, lenta e tem limite de escritas. PowerInfer e *LLM in a flash* já exploram offload e ativação esparsa. No recorte deste trabalho, o que falta é **treinar o roteador com esse custo**, em vez de otimizar só a loss de tarefa.
+## Experimento mínimo (entrega principal)
 
-- Shazeer et al., 2017 — camada MoE com roteamento esparso.
-- Fedus et al., 2022 (*Switch Transformers*) — roteamento e a loss de balanceamento usada aqui.
-- Alizadeh et al., *LLM in a flash* — inferência com pouca memória e pesos em flash.
-- Song et al., *PowerInfer* — servir um modelo de linguagem numa GPU de consumidor.
+Um único emulador de três níveis, **um** vetor de custo (perfil consumer ~6 GB, proporções tipo HBM ≫ DDR ≫ NVMe), `k=2`, orçamento `B=25%` dos experts, treino por `λ ∈ {0, 0,5, 1}` (o ponto `λ=0` é o baseline 1) e avaliação em 0,5× e 2×`B`, contra top-k e **LRU** (e denso). Sem catálogo de várias GPUs de mercado no núcleo.
 
-Fichas e links estão em [docs/referencias.md](docs/referencias.md).
+Extensões (não bloqueiam a entrega mínima):
 
-## Arquitetura em três níveis
+- tabelas de custo “realismo de mercado” (consumer 6–12 GB, mid cloud, high-end);
+- treino com orçamento variável por batch/época (**adiado**);
+- calibrar pesos em preços Spot reais.
 
-| Nível | Onde vive | Papel |
+## Decisões fechadas neste blueprint
+
+| Tema | Decisão |
+| --- | --- |
+| Corpus | TinyStories só no dev; WikiText-2 no treino/avaliação de entrega (overnight) |
+| Experts / `k` | `E` ∈ 16–32; **`k = 2` no mínimo**. Preferir **aumentar o tamanho do expert** a encolher o modelo se faltar capacidade |
+| Orçamento `B` | **25%** dos experts quentes (4/16 ou 8/32) — teto **artificial** (o modelo inteiro cabe na 1060) |
+| Hardware de referência | VRAM útil **5,5 GB** (6 GB − ~0,5 GB driver/display); RAM de trabalho **10 GB** dos 16 GB; SSD frio **1 GB** (2 GB se checkpoints) |
+| `λ` / `β` | Treino **especializado por `λ`** (não condicionado); grade **`λ ∈ {0, 0,5, 1}`**; `β` fixo pequeno (ordem Switch) |
+| Baseline-2 | **Só LRU de experts** como adversário; declarado no protocolo e não muda no meio |
+| Denso | Ativos comparáveis: tronco + `k`·expert |
+| Hardware no núcleo | Emulação VRAM/RAM/SSD; proxy alinhado a bytes/trocas; monitorar entropia |
+| Hold-out / seeds | ~10% hold-out; **3 seeds** |
+| Latência de parede | **Sim**, na 1060 (`B` fixo) |
+| Orçamento variável no treino | **Adiado** (extensão) |
+| Dose–resposta | Figura 0,5× / 1× / 2× + tabela contra baselines |
+| Colocação | Política dinâmica de cache/residência (não tool-calls) |
+| Custos por nível | Partida nos configs: c=(1,10,20|30), w=Δc; HBM ≫ DDR ≫ NVMe |
+
+## Motivação (curta)
+
+MoE só calcula parte dos parâmetros por token, mas o tempo real depende de *onde* o expert está. PowerInfer e *LLM in a flash* exploram offload; o recorte daqui é **treinar o roteador com esse custo**. Detalhe e fichas em [docs/referencias.md](docs/referencias.md).
+
+## Arquitetura em três níveis (emulada)
+
+| Nível | Papel no emulador | Custo relativo (ordem) |
 | --- | --- | --- |
-| Quente | VRAM da GPU | Acesso imediato, capacidade cara |
-| Morno | RAM em memória pinned | Reserva sem ocupar a VRAM |
-| Frio | Arquivo no SSD NVMe, lido com mmap | Capacidade barata; troca mais cara |
+| Quente | “VRAM” — capacidade cara, acesso barato | baixo `c(ℓ)`, alto preço de residência no orçamento |
+| Morno | “RAM” — meio do caminho | médio |
+| Frio | “SSD” — capacidade barata, troca cara | alto `c(ℓ)` e `w` de promoção |
 
-O controlador entre SSD e RAM é mais lento e mais estável que o entre RAM e VRAM, para respeitar o SSD. A escolha do expert é discreta; no treino o custo entra como valor **esperado** sob o softmax do roteador, que é diferenciável. Fórmulas em [docs/funcao-de-custo.md](docs/funcao-de-custo.md).
+Os pesos `c(ℓ)` e `w(a,b)` são variáveis de experimento: mudar a tabela (menos VRAM “barata”) deve forçar o roteador a adaptar. Fórmulas em [docs/funcao-de-custo.md](docs/funcao-de-custo.md). Hardware e emulação em [docs/plano-de-hardware.md](docs/plano-de-hardware.md).
 
-O orçamento de VRAM do experimento é um teto artificial de residência dos experts, menor que o modelo inteiro. Na faixa de ~10 a 50 milhões de parâmetros, o modelo cabe na GTX 1060; sem esse teto a hierarquia não aparece. Detalhe em [docs/plano-de-hardware.md](docs/plano-de-hardware.md).
+## Baselines e métricas
 
-## Comparação com os baselines
-
-Os quatro modelos usam o mesmo corpus pequeno e o mesmo orçamento de VRAM. Corpus final: **a definir** (WikiText-2 ou TinyStories).
-
-| # | Modelo | O que muda |
+| # | Modelo | Papel |
 | --- | --- | --- |
-| 1 | MoE top-k clássico | Sem custo de memória |
-| 2 | O mesmo MoE | Offload heurístico (LRU ou os k mais usados na VRAM; regra exata **a definir**) |
-| 3 | Modelo denso | Parâmetros ativos comparáveis aos do MoE |
-| 4 | Este projeto | Roteador treinado com a penalidade |
+| 1 | MoE top-k (`λ = 0`) | qualidade MoE sem cobrar memória |
+| 2 | MoE + **LRU de experts** | único adversário de offload |
+| 3 | Denso (ativos comparáveis) | separar esparsidade de penalidade |
+| 4 | Este projeto (`λ > 0`) | roteador + emulador + política de colocação |
 
-Métricas: perplexidade; latência por token (p50 e p95); volume de I/O; trocas por nível; curva qualidade × latência. Ablação do modelo 4: peso da penalidade zero versus positivo. Protocolo em [docs/protocolo-experimental.md](docs/protocolo-experimental.md).
+Métricas no hold-out (~10%, 3 seeds): perplexidade; **latência p50/p95 de parede na 1060**; bytes e trocas do emulador; curva qualidade × custo/orçamento. Protocolo em [docs/protocolo-experimental.md](docs/protocolo-experimental.md).
+
+## Corpus (dev vs entrega)
+
+- **Desenvolvimento:** TinyStories — iterar rápido, achar bug, checar conversão e se o treino “anda”.
+- **Treino real / tabelas do relatório:** WikiText-2 — corrida de verdade, tipicamente **de madrugada com o PC ligado**.
+- WikiText-103 só se o 2 ficar curto demais; não é o padrão.
+
+O código e o protocolo devem aceitar os dois via config; a entrega numérica usa WikiText-2.
 
 ## Como contribuir e rodar
 
-**Em construção.** Ainda não há ambiente, script de treino nem de avaliação. O código será em PyTorch, sem TensorFlow. Quem não tiver GPU pode treinar no Colab ou no Kaggle; a latência que entra no resultado tem de ser medida numa máquina controlada pelo grupo, porque disco de nuvem gratuita é virtual.
+**Em construção.** Ainda não há ambiente, script de treino nem de avaliação. Código previsto em PyTorch.
 
 | Pasta | Para que serve |
 | --- | --- |
-| `src/` | Modelo, roteador, níveis de memória e loss |
-| `experiments/` | Treino, avaliação, ablação e varredura de λ |
-| `configs/` | Orçamento, custos medidos e hiperparâmetros |
-| `notebooks/` | Exploração; saída grande fica de fora do Git |
+| `src/` | Modelo, roteador, emulador de níveis e loss |
+| `experiments/` | Treino, avaliação, ablação e varredura de λ / orçamento |
+| `configs/` | Orçamento, tabela de custos e hiperparâmetros |
+| `notebooks/` | Exploração |
 | `results/` | Tabelas e curvas, quando existirem |
 
-Documentação nova em português do Brasil. Não versionar checkpoint, dataset baixado nem resultado grande (veja `.gitignore`).
+Documentação em português do Brasil. Não versionar checkpoint, dataset baixado nem resultado grande (veja `.gitignore`).
 
 ## Integrantes
 
-- João Vítor Baggio — cartão: **a definir**
-- Nome: Taylor Souza Frutuoso da Costa  — cartão: 00213957
-- Nome: **a definir** — cartão: **a definir**
-- Nome: **a definir** — cartão: **a definir**
+- João Vítor Baggio
+- Eric D Arriaga
+- Taylor Souza Frutuoso da Costa
 
 ## Documentação
 
 - [Problema e escopo](docs/definicao.md)
 - [Função de custo](docs/funcao-de-custo.md)
 - [Protocolo experimental](docs/protocolo-experimental.md)
-- [Plano de hardware](docs/plano-de-hardware.md)
+- [Plano de hardware e emulação](docs/plano-de-hardware.md)
 - [Referências](docs/referencias.md)
