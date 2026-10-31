@@ -95,15 +95,16 @@ python3 experiments/train_tinystories.py --steps 1
 python3 experiments/smoke_wikitext.py
 python3 experiments/wall_latency.py
 python3 experiments/run_lambda_grid.py --device cuda
+python3 experiments/run_baseline.py --device cuda
 python3 -m pytest
 ```
 
-`smoke_train.py` dá **um** passo num batch aleatório. `train_tinystories.py` dá um passo curto no corpus de desenvolvimento. `smoke_wikitext.py` só carrega os splits oficiais. `wall_latency.py` na GTX 1060 (`--device cuda`) cronometra o forward com experts fora de `B` fora da VRAM; sem CUDA ele não inventa ms. A loss impressa desses smokes é de peso inicial ou de um passo curto. A grade overnight (`run_lambda_grid.py`) treina `λ ∈ {0, 0,5, 1}` no WikiText-2, um por vez, e grava log em `outputs/` — ainda não é perplexidade de hold-out nem dose–resposta. Detalhe em [`experiments/README.md`](experiments/README.md).
+`smoke_train.py` dá **um** passo num batch aleatório. `train_tinystories.py` dá um passo curto no corpus de desenvolvimento. `smoke_wikitext.py` só carrega os splits oficiais. `wall_latency.py` na GTX 1060 (`--device cuda`) cronometra o forward com experts fora de `B` fora da VRAM; sem CUDA ele não inventa ms. A loss impressa desses smokes é de peso inicial ou de um passo curto. A grade overnight (`run_lambda_grid.py`) treina `λ ∈ {0, 0,5, 1}` no WikiText-2, um por vez, e grava log em `outputs/` — ainda não é perplexidade de hold-out nem dose–resposta. `run_baseline.py` treina o LM denso (modelo 3) no mesmo WikiText-2, sem roteador e sem residência: não é o MoE com `λ=0`. Detalhe em [`experiments/README.md`](experiments/README.md).
 
 | Pasta | Para que serve |
 | --- | --- |
 | `src/` | Modelo, roteador, emulador de níveis e loss |
-| `experiments/` | Fumaça e treino WikiText-2 por λ; avaliação e dose–resposta quando existirem |
+| `experiments/` | Fumaça, treino WikiText-2 por λ e baseline denso; avaliação e dose–resposta quando existirem |
 | `configs/` | Orçamento, tabela de custos e hiperparâmetros |
 | `notebooks/` | Exploração |
 | `results/` | Tabelas e curvas, quando existirem |

@@ -11,6 +11,7 @@ A contagem da arquitetura fechada é 47.939.328 parâmetros (~48 M): a embedding
 | Módulo | Papel |
 | --- | --- |
 | `moe_memory/model.py` | LM causal. 4 blocos, toda FFN é MoE. Mistura dos top-2 = média ponderada (pesos somam 1) no treino e na inferência, para o residual não mudar de escala. |
+| `moe_memory/dense.py` | Baseline denso (modelo 3). Mesma atenção e o mesmo FFN de um expert, com largura `k * expert_hidden`. Sem roteador, sem residência, loss só `L_tarefa`. Não é `λ=0`. |
 | `moe_memory/router.py` | Projeção linear + chave `expert + embed(ℓ(e))`. Sem `router_sees_level`, a chave ignora o nível. |
 | `moe_memory/emulator.py` | Quente / morno / frio, um passo por batch. LRU com desempate pela contagem do batch, teto `B`. Conta trocas e bytes. |
 | `moe_memory/residency.py` | No CUDA, põe o storage do expert no home do `ℓ(e)`: quente na VRAM, morno em CPU pinned, frio em memmap. A cópia para o compute é contador à parte (`staged_loads`), não entra no LRU. |
@@ -34,9 +35,10 @@ python3 experiments/smoke_eval.py
 python3 experiments/train_tinystories.py --steps 1
 python3 experiments/smoke_wikitext.py
 python3 experiments/run_lambda_grid.py --device cuda
+python3 experiments/run_baseline.py --device cuda
 python3 -m pytest
 ```
 
 `smoke_train.py` instancia modelo, emulador e loss a partir de `configs/default.yaml`, faz um forward e um backward num batch aleatório e dá um passo de AdamW. `smoke_eval.py` faz um forward com a agregação de inferência (`sum`). `--lambda 0` usa o ponto da grade sem `C_mem`. O device padrão é `cpu`. `train_tinystories.py` e `smoke_wikitext.py` leem os corpora do YAML.
 
-A loss impressa é de init aleatória ou de um passo curto. Não é perplexidade de relatório, não é latência de parede. A corrida overnight de WikiText-2, um λ por vez, está em [`experiments/README.md`](../experiments/README.md).
+A loss impressa é de init aleatória ou de um passo curto. Não é perplexidade de relatório, não é latência de parede. A corrida overnight de WikiText-2, um λ por vez, e o baseline denso (WikiText-2, sem o caminho de memória) estão em [`experiments/README.md`](../experiments/README.md).
