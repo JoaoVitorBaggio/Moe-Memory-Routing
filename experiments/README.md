@@ -51,7 +51,48 @@ outputs/wikitext/lambda-<λ>/
 
 Se os dois tiverem artefato, vale `seed-0`. Para migrar à mão, mover `lambda-<λ>/` para `seed-0/lambda-<λ>/` antes de relançar. `train_wikitext.py` sozinho continua sendo um job (`--seed`, padrão 0); o diretório padrão segue a mesma regra.
 
-O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas). Não é perplexidade de valid/test nem dose–resposta. O LM denso tem corrida própria, abaixo. O hold-out, que também varre `eval.B_mult` sem retreinar, está na seção seguinte. O modelo 2 não tem treino próprio: é o mesmo `λ=0` e o mesmo LRU, nomeado em `run_model_comparison.py`. O teto da avaliação muda por `set_hot_budget` (0,5× / 1× / 2×).
+O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas, entropia, bytes). Não é perplexidade de valid/test nem dose–resposta. A correlação desse proxy com o emulador está na seção seguinte. O LM denso tem corrida própria. O hold-out, que também varre `eval.B_mult` sem retreinar, vem depois. O modelo 2 não tem treino próprio: é o mesmo `λ=0` e o mesmo LRU, nomeado em `run_model_comparison.py`. O teto da avaliação muda por `set_hot_budget` (0,5× / 1× / 2×).
+
+## Correlação proxy × emulador
+
+Pós-processamento. Não treina, não abre checkpoint e não usa GPU. `experiments/plot_proxy_emulator.py` lê o `train.jsonl` que a grade MoE já gravou e cruza o proxy `c_mem` com `bytes_moved` e `swaps` do emulador no mesmo passo. Também desenha a entropia do roteador ao longo dos passos.
+
+O proxy e o emulador não estão na mesma unidade. `c_mem` é o custo na loss; bytes e trocas são contagens do LRU. Spearman diz se a ordem acompanha (o que o protocolo pede: correlacionar ou, no mínimo, ordenar). Pearson diz se a relação também é linear. Entropia em queda forte é diagnóstico de colapso, não de economia útil.
+
+Da raiz, com os jsonl da corrida WikiText-2:
+
+```bash
+python3 experiments/plot_proxy_emulator.py
+python3 experiments/plot_proxy_emulator.py --root outputs/wikitext
+python3 experiments/plot_proxy_emulator.py \
+  --log outputs/wikitext/seed-0/lambda-0/train.jsonl \
+  --log outputs/wikitext/seed-0/lambda-0.5/train.jsonl \
+  --log outputs/wikitext/seed-0/lambda-1/train.jsonl
+```
+
+Layout antigo da semente 0, um arquivo só:
+
+```bash
+python3 experiments/plot_proxy_emulator.py --log outputs/wikitext/lambda-0.5/train.jsonl
+```
+
+Sem `--log`, o padrão junta os dois globs sob `outputs/wikitext`:
+
+```text
+outputs/wikitext/seed-*/lambda-*/train.jsonl
+outputs/wikitext/lambda-*/train.jsonl
+```
+
+Se o mesmo λ da semente 0 existir nos dois, entra `seed-0/lambda-<λ>/train.jsonl` e o `lambda-<λ>/` antigo fica de fora (o JSON lista o caminho em `skipped_legacy`). `--log` explícito não sofre esse corte. A legenda é `seed-<n>/lambda-<λ>` ou, no antigo, `lambda-<λ>`. Um λ só: a pasta ou o arquivo. A saída é gitignored, em `outputs/proxy-emulator/`:
+
+| Arquivo | Conteúdo |
+| --- | --- |
+| `summary.json` | Por semente e λ, e no conjunto (`pooled`): n, Pearson, Spearman, entropia inicial e final |
+| `correlations.csv`, `steps.csv` | As mesmas contas e os passos usados |
+| `entropy.svg` | Entropia do roteador por passo |
+| `c_mem_vs_bytes.svg`, `c_mem_vs_swaps.svg` | Um ponto por passo; a legenda traz r e ρ |
+
+O SVG abre no navegador. Não há matplotlib. Linha que não é passo MoE fica de fora: evento `nonfinite`, JSON quebrado, e o baseline denso (`c_mem` null, sem `swaps`). Se não sobrar passo utilizável, o processo sai com código 1 e não inventa correlação. Série constante (variância zero) deixa Pearson e Spearman nulos, com o motivo no JSON. Não há número medido neste repositório: isto só lê o log da GTX 1060.
 
 ## Baseline denso (WikiText-2)
 
@@ -140,7 +181,7 @@ A saída é `holdout.json` ao lado de cada `checkpoint.pt` e, na descoberta dos 
 
 A dose–resposta usa o mesmo `score_split`, nos mesmos checkpoints (semente 0 na descoberta; o layout antigo entra só quando é o único `checkpoint.pt`). O `B` do YAML continua sendo a medição de referência (`splits` no `holdout.json`). Para cada multiplicador, `prepare_split_budget` recomeça o LRU nesse `B` e `set_hot_budget` aplica o teto sem apagar o carimbo — não há outro `reset` antes do forward, não há `--b-mult` e o script não atribui `hot_slots` à parte. A parede e os bytes desse passe são os do mesmo forward. O denso não entra na curva: `status` `n/a`. A saída extra é `dose_response.json` e `dose_response.md` (a tabela markdown é PPL por multiplicador; o JSON do split também traz a parede), ao lado do `summary.json` na descoberta, ou ao lado do `holdout.json` quando se pede um checkpoint só sem `--summary`. `dose_response: true` no resumo significa que a curva foi medida.
 
-Agregar as sementes além da 0 e a correlação proxy×emulador continuam fora deste script. O treino das sementes é a grade e o baseline (`eval.seeds`). O rótulo do modelo 2 não é uma passagem a mais: é o mesmo `λ=0` da semente 0.
+Agregar as sementes além da 0 continua fora deste script. O treino das sementes é a grade e o baseline (`eval.seeds`). O rótulo do modelo 2 não é uma passagem a mais: é o mesmo `λ=0` da semente 0. A correlação proxy×emulador é o pós-processamento acima; o número da corrida ainda não está neste repositório.
 
 ## Comparação dos quatro braços (modelo 2)
 

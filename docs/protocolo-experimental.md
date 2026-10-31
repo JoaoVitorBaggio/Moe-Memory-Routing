@@ -65,7 +65,7 @@ A dose–resposta entra no mesmo script, sem retreino: depois da perplexidade no
 
 Cada split, no `B` de referência e em cada ponto de `eval.B_mult`, grava `swaps`, `bytes_moved` e a parede do forward (`wall_p50_ms`, `wall_p95_ms`). A parede de relatório exige a **GTX 1060 com CUDA**, o batch do checkpoint e o split inteiro (`wall_report_grade`). Em CPU `wall_clock` fica `unavailable` e os milissegundos ficam null. Não há número medido neste repositório.
 
-O modelo 2 não é uma corrida a mais: é o rótulo do mesmo `λ=0` da semente 0, empacotado por `experiments/run_model_comparison.py`. Agregar as outras sementes e a correlação proxy×emulador continuam fora. `smoke_eval.py` não é este número.
+O modelo 2 não é uma corrida a mais: é o rótulo do mesmo `λ=0` da semente 0, empacotado por `experiments/run_model_comparison.py`. Agregar as outras sementes continua fora. A correlação proxy×emulador e a curva de entropia não treinam: `experiments/plot_proxy_emulator.py` lê o `train.jsonl` em `outputs/wikitext/seed-*/lambda-*/` e, no layout antigo da semente 0, em `outputs/wikitext/lambda-*/`. Não há número medido neste repositório. `smoke_eval.py` não é este número.
 
 ## Latência de parede
 
