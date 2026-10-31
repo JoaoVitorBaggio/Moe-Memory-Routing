@@ -2,7 +2,8 @@
 """Grade λ ∈ {0, 0,5, 1} no WikiText-2, um treino depois do outro.
 
 Cada valor de ``loss.lambda_grid`` é uma curva. β, E, k, B e a arquitetura
-continuam no YAML. Este runner não mede perplexidade nem dose–resposta.
+continuam no YAML. Este runner não mede perplexidade nem dose–resposta;
+o hold-out é ``experiments/run_holdout_eval.py``.
 
 Se o filho morrer por OOM, loss não finita, crash ou kill -9, a próxima
 tentativa desce o batch (4 → 2 → 1) e retoma o checkpoint. SIGTERM/SIGINT

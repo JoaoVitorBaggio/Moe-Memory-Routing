@@ -3,7 +3,8 @@
 
 λ=0 ainda usa experts, roteador, emulador e ``β L_balanço``; só zera o
 peso de ``C_mem``. Aqui a loss é só ``L_tarefa`` (CE do próximo token).
-Não há residência, troca, nem ``torch.compile``. fp32.
+Não há residência, troca, nem ``torch.compile``. fp32. A perplexidade de
+valid/test é ``experiments/run_holdout_eval.py``.
 
 O corpus padrão é o WikiText-2 (entrega). TinyStories é caminho opcional
 de desenvolvimento: o contexto padrão desse caminho é o ``smoke.seq_len``,
@@ -206,7 +207,7 @@ def train(args: argparse.Namespace) -> None:
     capacity = capacity_report(config)
 
     print(NOTE)
-    print(f"Baseline denso  corpus={corpus}  (não é perplexidade de hold-out)")
+    print(f"Baseline denso  corpus={corpus}  (hold-out: experiments/run_holdout_eval.py)")
     print(f"fonte: {source_label(config, corpus)}")
     if corpus != "WikiText-2":
         print("TinyStories é só desenvolvimento. O número de relatório deste baseline é WikiText-2.")
@@ -564,7 +565,7 @@ def _finish(state: dict[str, Any], args: argparse.Namespace, log_path: Path) -> 
         f"tokens={cursor['tokens']}  L_task={done['last_task']}  corpus={state['corpus']}"
     )
     print(f"log={log_path}")
-    print("perplexidade de valid/test e dose–resposta não entram neste script")
+    print("perplexidade de valid/test: experiments/run_holdout_eval.py. Dose–resposta não entra aqui.")
 
 
 def _last_step(log_path: Path) -> dict[str, Any] | None:

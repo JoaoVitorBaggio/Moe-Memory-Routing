@@ -51,6 +51,14 @@ O modelo 2 existe para mostrar que o ganho **não** é “qualquer MoE” nem �
 
 Seeds: **3** no mínimo. Hold-out: no WikiText-2, **splits oficiais** valid (seleção) e test (relatório); no TinyStories, o valid do dataset. A ordem de grandeza é ~10% do treino.
 
+## Script de perplexidade
+
+`experiments/run_holdout_eval.py` calcula a perplexidade de token do WikiText-2 em `valid` e `test` a partir dos checkpoints já treinados. Não há número medido neste repositório: a corrida é na GTX 1060, fora daqui.
+
+O que o script fecha: a mesma tokenização e os mesmos blocos não sobrepostos do treino (`seq_len` do checkpoint; 256 na entrega), a CE `task_cross_entropy`, a classe densa no baseline e a classe MoE nos três λ (inclusive 0). O LRU do MoE recomeça em cada split, no `B` de referência, um passo por batch do checkpoint. `--batch-size` só corta o forward.
+
+O que continua de fora: a grade `0,5×B` / `2×B` (o emulador já tem `set_hot_budget`), o LRU como modelo 2, três sementes, a latência de parede e a correlação proxy×emulador. `smoke_eval.py` não é este número.
+
 ## Latência de parede
 
 Decidido: reportar latência de parede na GTX 1060 no protocolo mínimo, porque `B` é fixo (não randomizado no treino). O emulador continua com bytes/trocas; a parede é coluna adicional.

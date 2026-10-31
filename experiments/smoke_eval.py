@@ -2,7 +2,8 @@
 """Um forward de avaliação com a soma dos top-2 no custo.
 
 A perplexidade impressa é ``exp(CE)`` de peso aleatório. Não é a
-perplexidade do hold-out e não entra no relatório.
+perplexidade do hold-out. O número de valid/test está em
+``experiments/run_holdout_eval.py``.
 
 Uso::
 
