@@ -28,16 +28,22 @@ e dá um passo de emulador por batch gravado no checkpoint. ``--batch-size``
 só parte o forward; não muda o grão do LRU nem a PPL. O cache do fim do
 treino não entra: senão valid e test compartilhariam residência com o
 train. Os pesos ficam no device do forward (fp32). Não há ``sync_physical``
-e não há medição de parede.
+no memmap do treino. No CUDA, ``materialize`` estaciona o expert fora de
+``B`` antes do cronômetro; a subida entra no forward. ``emulator.step``
+fica fora do relógio. Sem CUDA, ``wall_clock`` é ``unavailable`` e os
+milissegundos ficam null.
 
 Depois do B do YAML, cada checkpoint MoE que este script avalia (a
 semente 0 na descoberta, ou o arquivo pedido na linha de comando)
 repete valid e test em ``eval.B_mult`` (0,5× / 1× / 2× no YAML de
-partida). O LRU recomeça no B de referência e
-``ResidencyEmulator.set_hot_budget`` aplica o multiplicador, sem
-apagar o carimbo dessa reatribuição. O denso não tem esse eixo (n/a).
-Não há retreino. A tabela sai em ``dose_response.md``. As sementes
-1..N-1 não entram na descoberta e não são agregadas.
+partida). O teto é ``dose_response.prepare_split_budget`` (reset no B
+do YAML e ``set_hot_budget``). Não há outro método de dose e não há
+``--b-mult``. O mesmo ``score_split`` mede a perplexidade, ``swaps``,
+``bytes_moved`` e a parede. O denso não tem esse eixo (n/a). Não há
+retreino. A tabela sai em ``dose_response.md``. As sementes 1..N-1 não
+entram na descoberta e não são agregadas.
+
+O número de relatório da parede é na GTX 1060 (``wall_report_grade``).
 
 Fora deste script: LRU como modelo 2, agregar as sementes além da 0,
 correlação proxy×emulador. ``smoke_eval.py`` continua sendo init
@@ -66,6 +72,7 @@ import json
 import math
 import os
 import sys
+import time
 import traceback
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -90,6 +97,7 @@ from moe_memory.dense import (
 from moe_memory.levels import COLD, HOT, WARM
 from moe_memory.loss import compute_loss, task_cross_entropy
 from moe_memory.model import MemoryMoEModel
+from moe_memory.residency import ExpertResidency, attach_residency
 from moe_memory.smoke import build_emulator, level_cost_tensor
 from moe_memory.tokenizer import load_gpt2_encoding
 import dose_response
@@ -133,15 +141,138 @@ METRIC_NOTE = (
     "dos papers de WikiText. λ não multiplica a PPL. No MoE, C_mem e entropia "
     "usam a agregação de inferência (sum); o balanço é o do batch lógico do "
     "checkpoint. O LRU recomeça em cada split, no B do YAML. A curva "
-    "eval.B_mult usa set_hot_budget em cima desse LRU fresco e fica no "
-    "bloco dose_response (o denso é n/a). A descoberta é a semente 0. "
-    "Modelo 2, agregar sementes além da 0 e latência de parede ficam fora."
+    "eval.B_mult usa prepare_split_budget (reset nesse B e set_hot_budget) "
+    "e o mesmo score_split: perplexidade, swaps, bytes_moved e a parede. "
+    "O denso é n/a nesse eixo. A descoberta é a semente 0. wall_p50_ms e "
+    "wall_p95_ms são o forward; sem CUDA ficam null (wall_clock=unavailable). "
+    "Número de relatório da parede: GTX 1060, batch do checkpoint, split "
+    "inteiro (wall_report_grade). Modelo 2, agregar sementes além da 0 e a "
+    "correlação proxy×emulador ficam fora."
+)
+
+WALL_CLOCK_CUDA = "cuda"
+WALL_CLOCK_UNAVAILABLE = "unavailable"
+WALL_FIELDS = (
+    "wall_p50_ms",
+    "wall_p95_ms",
+    "wall_clock",
+    "wall_samples",
+    "wall_report_grade",
+    "wall_gpu",
+    "wall_forward_batch",
+)
+
+WALL_NOTE = (
+    "Parede do forward, em ms, com torch.cuda.synchronize antes e depois. "
+    "No MoE em CUDA, materialize() alinha o storage a ℓ(e) fora do "
+    "cronômetro; a subida do expert entra no forward; emulator.step fica "
+    "fora. p50/p95 usam o mesmo nearest-rank de experiments/wall_latency.py. "
+    "wall_report_grade só é verdadeiro na GTX 1060 (o nome do device contém "
+    "1060), com o batch do checkpoint e o split sem --max-batches. Outra "
+    "CUDA ainda pode gravar os ms, com a flag falsa. Em CPU, ou sem CUDA, "
+    "wall_clock='unavailable', wall_samples=0 e os ms ficam null. O script "
+    "não inventa tempo. swaps e bytes_moved são do emulador nesse passe, "
+    "não a latência nem a reatribuição de set_hot_budget (essa fica em "
+    "budget_reassign). A curva de B não tem outro cronômetro: "
+    "prepare_split_budget ajusta o teto e score_split mede o forward. "
+    "Não há --b-mult nem atribuição direta de hot_slots."
 )
 
 MOE_NOTE = (
     "MoE com roteador e emulador. λ=0 ainda calcula C_mem (peso zero na loss "
     "de treino) e soma β L_balanço. Não é o LM denso."
 )
+
+
+def percentile(ordered: list[float], percent: float) -> float:
+    """Nearest-rank. A mesma conta de ``experiments/wall_latency.py``."""
+
+    if not ordered:
+        die(EXIT_CRASH, "percentil sem amostra")
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = max(0, math.ceil(percent / 100 * len(ordered)) - 1)
+    return ordered[min(rank, len(ordered) - 1)]
+
+
+def cuda_gpu_name(device: torch.device) -> str | None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    index = 0 if device.index is None else int(device.index)
+    return str(torch.cuda.get_device_name(index))
+
+
+def _is_gtx_1060(gpu: str | None) -> bool:
+    return gpu is not None and "1060" in gpu
+
+
+def _unavailable_wall(forward_batch: int) -> dict[str, Any]:
+    return {
+        "wall_p50_ms": None,
+        "wall_p95_ms": None,
+        "wall_clock": WALL_CLOCK_UNAVAILABLE,
+        "wall_samples": 0,
+        "wall_report_grade": False,
+        "wall_gpu": None,
+        "wall_forward_batch": int(forward_batch),
+    }
+
+
+def wall_from_samples(
+    samples_s: list[float],
+    *,
+    gpu: str | None,
+    forward_batch: int,
+    logical_batch: int,
+    truncated: bool,
+) -> dict[str, Any]:
+    """Monta o bloco de parede. Não mede e não chama CUDA."""
+
+    if not samples_s:
+        return _unavailable_wall(forward_batch)
+    ordered = sorted(float(sample) for sample in samples_s)
+    if not all(math.isfinite(sample) and sample >= 0 for sample in ordered):
+        die(EXIT_CRASH, "amostra de parede não é finita e não-negativa")
+    return {
+        "wall_p50_ms": percentile(ordered, 50) * 1e3,
+        "wall_p95_ms": percentile(ordered, 95) * 1e3,
+        "wall_clock": WALL_CLOCK_CUDA,
+        "wall_samples": len(ordered),
+        "wall_report_grade": bool(
+            _is_gtx_1060(gpu) and forward_batch == logical_batch and not truncated
+        ),
+        "wall_gpu": gpu,
+        "wall_forward_batch": int(forward_batch),
+    }
+
+
+def assemble_wall(
+    samples_s: list[float],
+    *,
+    device: torch.device,
+    forward_batch: int,
+    logical_batch: int,
+    truncated: bool,
+) -> dict[str, Any]:
+    """p50/p95 se o forward rodou em CUDA. CPU descarta qualquer amostra."""
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return _unavailable_wall(forward_batch)
+    return wall_from_samples(
+        samples_s,
+        gpu=cuda_gpu_name(device),
+        forward_batch=forward_batch,
+        logical_batch=logical_batch,
+        truncated=truncated,
+    )
+
+
+def _park(residency: ExpertResidency | None) -> None:
+    """Alinha o storage ao ℓ(e). Fora do cronômetro. CPU não grava memmap."""
+
+    if residency is None or residency.backend is None:
+        return
+    residency.materialize()
 
 
 @dataclass(frozen=True)
@@ -547,12 +678,16 @@ def score_split(
     config: ExperimentConfig | None = None,
     lambda_weight: float | None = None,
     reset_lru: bool = True,
+    residency: ExpertResidency | None = None,
 ) -> dict[str, Any]:
     """Uma passagem. ``truncated`` é corte de ``--max-batches``, não o resto < seq_len.
 
-    ``reset_lru=False`` é a curva de dose–resposta: o chamador já deu
-    ``reset`` no B do YAML e ``set_hot_budget`` no multiplicador. Um
-    ``reset`` aqui apagaria o carimbo que a troca de teto preserva.
+    ``reset_lru=False`` é a curva de dose–resposta: o chamador já rodou
+    ``prepare_split_budget`` (reset no B do YAML e ``set_hot_budget``).
+    Um ``reset`` aqui apagaria o carimbo que a troca de teto preserva.
+    Esta função não atribui ``hot_slots``. No CUDA o relógio cobre cada
+    forward; ``materialize`` e ``emulator.step`` ficam fora. No CPU os
+    campos de parede existem e ficam indisponíveis.
     """
 
     if forward_batch > logical_batch:
@@ -591,14 +726,22 @@ def score_split(
     promotions = 0
     demotions = 0
     logical_done = 0
+    wall_times: list[float] = []
+    time_wall = device.type == "cuda" and torch.cuda.is_available()
     with torch.no_grad():
         for start, take in iter_logical(n_seq, logical_batch, max_logical):
             logical_done += 1
             tally = RouterTally() if kind == KIND_MOE else None
             dispatched: torch.Tensor | None = None
+            if kind == KIND_MOE:
+                _park(residency)
             for micro_start, micro in iter_forward(start, take, forward_batch):
                 batch = packed.sequences[micro_start : micro_start + micro].to(device)
+                started = 0.0
                 try:
+                    if time_wall:
+                        torch.cuda.synchronize(device)
+                        started = time.perf_counter()
                     if kind == KIND_DENSE:
                         logits = model(batch)
                         output = None
@@ -606,6 +749,9 @@ def score_split(
                         assert emulator is not None
                         output = model(batch, emulator.levels)
                         logits = output.logits
+                    if time_wall:
+                        torch.cuda.synchronize(device)
+                        wall_times.append(time.perf_counter() - started)
                 except RuntimeError as exc:
                     if is_oom(exc):
                         _release_cuda()
@@ -719,6 +865,15 @@ def score_split(
                 "lru_tick_end": int(emulator.tick),
             }
         )
+    row.update(
+        assemble_wall(
+            wall_times,
+            device=device,
+            forward_batch=forward_batch,
+            logical_batch=logical_batch,
+            truncated=bool(row["truncated"]),
+        )
+    )
     return row
 
 
@@ -900,14 +1055,20 @@ def evaluate_family(
     model = load_model(blob, config, kind, device)
     record["parameters"] = int(model.num_parameters())
     emulator = None
+    residency = None
     if kind == KIND_MOE:
-        # work_dir só fica no objeto. sync_physical não é chamado: o memmap
-        # frio do treino permanece intocado.
+        # work_dir só fica no objeto até o materialize. sync_physical não é
+        # chamado: o memmap frio do treino permanece intocado. No CUDA,
+        # materialize grava o home deste hold-out em holdout_lru. No CPU o
+        # backend é None e esse diretório não nasce. O teto da curva continua
+        # em prepare_split_budget; a residência só estaciona o storage.
         emulator = build_emulator(
             config,
             model.expert_nbytes(),
             family.path.parent / "holdout_lru",
         )
+        if device.type == "cuda":
+            residency = attach_residency(model, emulator, device)
     print(
         f"avaliando {family.name}  {kind}  "
         f"λ={record['lambda'] if record['lambda'] is not None else '—'}  "
@@ -936,6 +1097,7 @@ def evaluate_family(
             emulator=emulator,
             config=config,
             lambda_weight=lambda_weight,
+            residency=residency,
         )
     record["dose_response"] = measure_dose_response(
         kind=kind,
@@ -949,6 +1111,7 @@ def evaluate_family(
         lambda_weight=lambda_weight,
         packed_cache=packed_cache,
         seq_len=seq_len,
+        residency=residency,
     )
     del model
     gc.collect()
@@ -997,13 +1160,14 @@ def measure_dose_response(
     lambda_weight: float | None,
     packed_cache: dict[tuple[str, int], PackedSplit],
     seq_len: int,
+    residency: ExpertResidency | None = None,
 ) -> dict[str, Any]:
     """Curva ``eval.B_mult`` no checkpoint já carregado. Não retreina.
 
     O denso não tem emulador: o registro é ``n/a`` e ``set_hot_budget``
-    não é chamado. No MoE, cada par (multiplicador, split) recomeça o
-    LRU no B do YAML e aplica o teto com ``set_hot_budget`` antes do
-    forward. ``score_split`` entra com ``reset_lru=False``.
+    não é chamado. No MoE, cada par (multiplicador, split) passa por
+    ``prepare_split_budget`` e o mesmo ``score_split`` da referência,
+    com ``reset_lru=False``. A parede e os bytes desse passe saem dali.
     """
 
     if kind == KIND_DENSE:
@@ -1043,6 +1207,7 @@ def measure_dose_response(
                 config=config,
                 lambda_weight=lambda_weight,
                 reset_lru=False,
+                residency=residency,
             )
             row["budget_reassign"] = {
                 "swaps": int(stats.swaps),
@@ -1143,6 +1308,7 @@ def build_payload(
         "retrained": False,
         "B_mult": [float(multiplier) for multiplier in config.eval.B_mult],
         "B_reference_slots": config.memory.hot_slots(config.model.E),
+        "wall_note": WALL_NOTE,
         "splits": list(args.splits),
         "max_logical_batches": args.max_batches,
         "device": args.device,
@@ -1231,18 +1397,35 @@ def print_table(payload: dict[str, Any]) -> None:
             ppl = "overflow" if row["perplexity"] is None else f"{row['perplexity']:.3f}"
             pieces.append(
                 f"{split} ppl={ppl} nll={row['nll_nats']:.4f} "
-                f"bpb={_fmt(row['bits_per_byte'])} tokens={row['tokens_scored']}"
+                f"bpb={_fmt(row['bits_per_byte'])} tokens={row['tokens_scored']} "
+                f"{_wall_fmt(row)}"
             )
         lam = "λ=—" if run["lambda"] is None else f"λ={run['lambda']}"
         print(f"{run['name']}  {run['model_kind']}  {lam}  " + "  ".join(pieces), flush=True)
     if not payload["protocol_complete"]:
         print("protocolo incompleto: não use este JSON como número de relatório", flush=True)
+    print(
+        "parede de relatório: só com wall_report_grade=true (GTX 1060, CUDA, "
+        "batch do checkpoint, split inteiro). CPU deixa os ms null. "
+        "A curva de B reusa prepare_split_budget e o mesmo forward.",
+        flush=True,
+    )
 
 
 def _fmt(value: float | None) -> str:
     if value is None:
         return "—"
     return f"{value:.4f}"
+
+
+def _wall_fmt(row: dict[str, Any]) -> str:
+    if row.get("wall_clock") != WALL_CLOCK_CUDA or row.get("wall_p50_ms") is None:
+        return "wall=indisponível"
+    mark = "1060" if row.get("wall_report_grade") else "não-relatório"
+    return (
+        f"wall_p50={row['wall_p50_ms']:.3f}ms "
+        f"wall_p95={row['wall_p95_ms']:.3f}ms ({mark})"
+    )
 
 
 def _brief(value: Any) -> str:
@@ -1315,6 +1498,7 @@ def _write_outputs(
             "retrained",
             "B_mult",
             "B_reference_slots",
+            "wall_note",
             "splits",
             "max_logical_batches",
             "device",
@@ -1394,6 +1578,16 @@ def _main(argv: list[str] | None = None) -> None:
         f"dtype=fp32  torch.compile=não  device={device}  splits={','.join(args.splits)}",
         flush=True,
     )
+    if device.type == "cuda":
+        gpu = cuda_gpu_name(device)
+        grade = "relatório" if _is_gtx_1060(gpu) else "não é a GTX 1060 — não é coluna de relatório"
+        print(f"parede=cuda  gpu={gpu}  {grade}", flush=True)
+    else:
+        print(
+            "parede=indisponível (CPU). wall_p50_ms e wall_p95_ms ficam null. "
+            "A coluna de relatório exige a GTX 1060 com CUDA.",
+            flush=True,
+        )
     runs: list[dict[str, Any]] = []
     packed_cache: dict[tuple[str, int], PackedSplit] = {}
     try:

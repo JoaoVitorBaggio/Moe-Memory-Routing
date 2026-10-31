@@ -112,6 +112,28 @@ def _save_moe(path: Path, config, model, *, levels_poison: torch.Tensor) -> None
     torch.save(blob, path)
 
 
+def _assert_cpu_wall(row: dict) -> None:
+    """CPU grava o schema e deixa os ms null. Não inventa amostra."""
+
+    assert row["wall_clock"] == "unavailable"
+    assert row["wall_p50_ms"] is None
+    assert row["wall_p95_ms"] is None
+    assert row["wall_samples"] == 0
+    assert row["wall_report_grade"] is False
+    assert row["wall_gpu"] is None
+    for key in holdout.WALL_FIELDS:
+        assert key in row
+    assert "swaps" in row and "bytes_moved" in row
+
+
+def _assert_wall_note(payload: dict) -> None:
+    note = payload["wall_note"]
+    assert "1060" in note
+    assert "unavailable" in note
+    assert "prepare_split_budget" in note
+    assert "swaps" in note and "bytes_moved" in note
+
+
 def _ok_run() -> dict:
     row = {"truncated": False, "nll_nats": 2.0}
     return {
@@ -528,6 +550,11 @@ def test_dense_checkpoint_roundtrip_matches_token_cross_entropy(tmp_path: Path):
         (row["nll_nats_sum"] / math.log(2)) / row["utf8_bytes"], rel=1e-6
     )
     assert row["tokens_scored"] == row["sequences_scored"] * 7
+    _assert_cpu_wall(row)
+    _assert_cpu_wall(run["splits"]["test"])
+    assert row["swaps"] is None
+    assert row["bytes_moved"] is None
+    _assert_wall_note(payload)
     assert "test" in run["splits"]
     per_run = json.loads((work / "holdout.json").read_text(encoding="utf-8"))
     assert per_run["scope"] == "run"
@@ -696,6 +723,18 @@ def test_moe_lambda_zero_resets_lru_per_split_and_ignores_saved_levels(tmp_path:
     assert one["splits"]["valid"]["budget_reassign"]["swaps"] == 0
     assert curve["budgets"][0]["splits"]["valid"]["budget_reassign"]["swaps"] > 0
     assert curve["budgets"][2]["splits"]["valid"]["budget_reassign"]["swaps"] > 0
+    _assert_cpu_wall(valid)
+    _assert_cpu_wall(test)
+    assert isinstance(valid["swaps"], int)
+    assert isinstance(valid["bytes_moved"], int)
+    _assert_wall_note(payload)
+    for point in curve["budgets"]:
+        for split_name in ("valid", "test"):
+            dose_row = point["splits"][split_name]
+            _assert_cpu_wall(dose_row)
+            assert isinstance(dose_row["swaps"], int)
+            assert isinstance(dose_row["bytes_moved"], int)
+            assert "budget_reassign" in dose_row
     dose = json.loads((summary.parent / "dose_response.json").read_text(encoding="utf-8"))
     assert dose["retrained"] is False
     assert dose["B_mult"] == [0.5, 1.0, 2.0]
@@ -706,3 +745,62 @@ def test_moe_lambda_zero_resets_lru_per_split_and_ignores_saved_levels(tmp_path:
     assert "lambda-0" in table
     assert not (work / "holdout_lru").exists()
     assert list(work.glob("**/*.f32")) == []
+
+
+def test_cpu_discards_wall_samples_and_cuda_schema_stays_explicit():
+    """O eval de CPU não promove amostra a ms. O bloco CUDA é só montagem."""
+
+    discarded = holdout.assemble_wall(
+        [0.002, 0.004, 0.003],
+        device=torch.device("cpu"),
+        forward_batch=2,
+        logical_batch=2,
+        truncated=False,
+    )
+    assert discarded["wall_p50_ms"] is None
+    assert discarded["wall_p95_ms"] is None
+    assert discarded["wall_clock"] == "unavailable"
+    assert discarded["wall_samples"] == 0
+    assert discarded["wall_report_grade"] is False
+
+    ordered = sorted([0.004, 0.001, 0.003, 0.002])
+    assert holdout.percentile(ordered, 50) == 0.002
+    assert holdout.percentile(ordered, 95) == 0.004
+
+    report = holdout.wall_from_samples(
+        [0.002, 0.004, 0.003],
+        gpu="NVIDIA GeForce GTX 1060 6GB",
+        forward_batch=4,
+        logical_batch=4,
+        truncated=False,
+    )
+    assert report["wall_clock"] == "cuda"
+    assert report["wall_report_grade"] is True
+    assert report["wall_p50_ms"] == pytest.approx(3.0)
+    assert report["wall_p95_ms"] == pytest.approx(4.0)
+
+    other = holdout.wall_from_samples(
+        [0.002, 0.004],
+        gpu="NVIDIA A100",
+        forward_batch=4,
+        logical_batch=4,
+        truncated=False,
+    )
+    assert other["wall_report_grade"] is False
+    assert other["wall_p50_ms"] == pytest.approx(2.0)
+
+
+def test_dose_budget_is_only_prepare_split_budget():
+    text = (ROOT / "experiments" / "run_holdout_eval.py").read_text(encoding="utf-8")
+    assert "prepare_split_budget" in text
+    assert "emulator.hot_slots =" not in text
+    with pytest.raises(SystemExit) as caught:
+        holdout.parse_args(["--b-mult", "0.5,1,2"])
+    assert caught.value.code == 2
+
+
+def test_smoke_timer_uses_the_holdout_percentile():
+    wall = _load("wall_latency_for_holdout_dose", "wall_latency.py")
+    ordered = sorted([0.004, 0.001, 0.003, 0.002])
+    for percent in (50, 95):
+        assert wall._percentile(ordered, percent) == holdout.percentile(ordered, percent)

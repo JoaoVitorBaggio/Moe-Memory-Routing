@@ -25,7 +25,11 @@ DOSE_NOTE = (
     "e o forward. O bloco splits do hold-out continua sendo a medição de "
     "referência, nesse mesmo B, feita antes da curva. 1×B, quando está em "
     "eval.B_mult, repete esse B por set_hot_budget. O LM denso não tem teto "
-    "quente: n/a. Não é latência de parede."
+    "quente: n/a. Cada split da curva é o score_split do hold-out, então "
+    "traz swaps, bytes_moved e a parede desse forward. Número de relatório "
+    "da parede: GTX 1060 (wall_report_grade). Em CPU os ms ficam null. "
+    "A tabela markdown continua sendo só perplexidade. O teto não tem "
+    "outro caminho: prepare_split_budget, sem atribuir hot_slots à parte."
 )
 
 
