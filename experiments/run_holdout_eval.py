@@ -30,9 +30,18 @@ treino não entra: senão valid e test compartilhariam residência com o
 train. Os pesos ficam no device do forward (fp32). Não há ``sync_physical``
 e não há medição de parede.
 
-Fora deste script: dose–resposta (0,5×B / 2×B), LRU como modelo 2,
-agregar as sementes além da 0, correlação proxy×emulador.
-``smoke_eval.py`` continua sendo init aleatória.
+Depois do B do YAML, cada checkpoint MoE que este script avalia (a
+semente 0 na descoberta, ou o arquivo pedido na linha de comando)
+repete valid e test em ``eval.B_mult`` (0,5× / 1× / 2× no YAML de
+partida). O LRU recomeça no B de referência e
+``ResidencyEmulator.set_hot_budget`` aplica o multiplicador, sem
+apagar o carimbo dessa reatribuição. O denso não tem esse eixo (n/a).
+Não há retreino. A tabela sai em ``dose_response.md``. As sementes
+1..N-1 não entram na descoberta e não são agregadas.
+
+Fora deste script: LRU como modelo 2, agregar as sementes além da 0,
+correlação proxy×emulador. ``smoke_eval.py`` continua sendo init
+aleatória.
 
 Uso, a partir da raiz, na GTX 1060::
 
@@ -83,6 +92,7 @@ from moe_memory.loss import compute_loss, task_cross_entropy
 from moe_memory.model import MemoryMoEModel
 from moe_memory.smoke import build_emulator, level_cost_tensor
 from moe_memory.tokenizer import load_gpt2_encoding
+import dose_response
 from train_baseline import CHECKPOINT_VERSION as DENSE_CHECKPOINT_VERSION
 from train_baseline import NOTE as DENSE_NOTE
 from train_baseline import _architecture as dense_architecture
@@ -122,8 +132,10 @@ METRIC_NOTE = (
     "entraram na conta, sem <|endoftext|>. Não é a perplexidade por palavra "
     "dos papers de WikiText. λ não multiplica a PPL. No MoE, C_mem e entropia "
     "usam a agregação de inferência (sum); o balanço é o do batch lógico do "
-    "checkpoint. O LRU recomeça em cada split. Dose–resposta, modelo 2, "
-    "agregar sementes além da 0 e latência de parede ficam fora."
+    "checkpoint. O LRU recomeça em cada split, no B do YAML. A curva "
+    "eval.B_mult usa set_hot_budget em cima desse LRU fresco e fica no "
+    "bloco dose_response (o denso é n/a). A descoberta é a semente 0. "
+    "Modelo 2, agregar sementes além da 0 e latência de parede ficam fora."
 )
 
 MOE_NOTE = (
@@ -534,8 +546,14 @@ def score_split(
     emulator=None,
     config: ExperimentConfig | None = None,
     lambda_weight: float | None = None,
+    reset_lru: bool = True,
 ) -> dict[str, Any]:
-    """Uma passagem. ``truncated`` é corte de ``--max-batches``, não o resto < seq_len."""
+    """Uma passagem. ``truncated`` é corte de ``--max-batches``, não o resto < seq_len.
+
+    ``reset_lru=False`` é a curva de dose–resposta: o chamador já deu
+    ``reset`` no B do YAML e ``set_hot_budget`` no multiplicador. Um
+    ``reset`` aqui apagaria o carimbo que a troca de teto preserva.
+    """
 
     if forward_batch > logical_batch:
         forward_batch = logical_batch
@@ -548,7 +566,10 @@ def score_split(
     if kind == KIND_MOE:
         if emulator is None or config is None or lambda_weight is None:
             die(EXIT_CRASH, "MoE sem emulador na avaliação")
-        emulator.reset()
+        if reset_lru:
+            emulator.reset()
+        elif int(emulator.hot_slots) < 1:
+            die(EXIT_CRASH, "dose–resposta MoE sem teto quente")
         costs = level_cost_tensor(config)
         aggregation = config.loss.aggregation(training=False)
         if aggregation != "sum":
@@ -916,6 +937,19 @@ def evaluate_family(
             config=config,
             lambda_weight=lambda_weight,
         )
+    record["dose_response"] = measure_dose_response(
+        kind=kind,
+        model=model,
+        emulator=emulator,
+        config=config,
+        args=args,
+        device=device,
+        logical_batch=logical_batch,
+        forward_batch=forward_batch,
+        lambda_weight=lambda_weight,
+        packed_cache=packed_cache,
+        seq_len=seq_len,
+    )
     del model
     gc.collect()
     if device.type == "cuda":
@@ -950,6 +984,91 @@ def _cached_pack(
     return packed
 
 
+def measure_dose_response(
+    *,
+    kind: str,
+    model,
+    emulator,
+    config: ExperimentConfig,
+    args: argparse.Namespace,
+    device: torch.device,
+    logical_batch: int,
+    forward_batch: int,
+    lambda_weight: float | None,
+    packed_cache: dict[tuple[str, int], PackedSplit],
+    seq_len: int,
+) -> dict[str, Any]:
+    """Curva ``eval.B_mult`` no checkpoint já carregado. Não retreina.
+
+    O denso não tem emulador: o registro é ``n/a`` e ``set_hot_budget``
+    não é chamado. No MoE, cada par (multiplicador, split) recomeça o
+    LRU no B do YAML e aplica o teto com ``set_hot_budget`` antes do
+    forward. ``score_split`` entra com ``reset_lru=False``.
+    """
+
+    if kind == KIND_DENSE:
+        return dose_response.dense_record(config)
+    if kind != KIND_MOE:
+        die(EXIT_CRASH, f"dose–resposta não conhece model_kind={kind!r}")
+    if emulator is None or lambda_weight is None:
+        die(EXIT_CRASH, "MoE sem emulador na dose–resposta")
+    points = dose_response.budget_points(config)
+    if not points:
+        die(EXIT_USAGE, "eval.B_mult vazio; a dose–resposta não tem ponto")
+    reference = points[0].reference_slots
+    budgets: list[dict[str, Any]] = []
+    for point in points:
+        print(
+            f"  dose–resposta {point.multiplier:g}×B "
+            f"→ {point.hot_slots} vagas quentes "
+            f"(referência {reference})",
+            flush=True,
+        )
+        split_rows: dict[str, Any] = {}
+        for split in args.splits:
+            packed = _cached_pack(packed_cache, config, split, seq_len)
+            stats = dose_response.prepare_split_budget(
+                emulator, point.reference_slots, point.hot_slots
+            )
+            row = score_split(
+                model,
+                packed,
+                kind=kind,
+                device=device,
+                logical_batch=logical_batch,
+                forward_batch=forward_batch,
+                max_logical=args.max_batches,
+                log_every=args.log_every,
+                emulator=emulator,
+                config=config,
+                lambda_weight=lambda_weight,
+                reset_lru=False,
+            )
+            row["budget_reassign"] = {
+                "swaps": int(stats.swaps),
+                "bytes_moved": int(stats.bytes_moved),
+                "promotions": int(stats.promotions),
+                "demotions": int(stats.demotions),
+            }
+            split_rows[split] = row
+        budgets.append(
+            {
+                "multiplier": point.multiplier,
+                "hot_slots": point.hot_slots,
+                "yaml_reference": point.is_reference,
+                "splits": split_rows,
+            }
+        )
+    return {
+        "status": "ok",
+        "reason": None,
+        "reference_hot_slots": reference,
+        "method": "reset_lru_at_yaml_b_then_set_hot_budget",
+        "retrained": False,
+        "budgets": budgets,
+    }
+
+
 def _canonical_lambda(config: ExperimentConfig, value: float) -> float | None:
     for item in config.loss.lambda_grid:
         if same_lambda(item, value):
@@ -969,6 +1088,7 @@ def missing_record(family: Family) -> dict[str, Any]:
         "lambda": None,
         "context_matches_checkpoint": False,
         "splits": {},
+        "dose_response": dose_response.missing_record(),
     }
 
 
@@ -1019,7 +1139,10 @@ def build_payload(
         "tokenizer": "gpt2",
         "packing": "non_overlapping_seq_len",
         "residency": "lru_reset_per_split",
-        "dose_response": False,
+        "dose_response": dose_response.curve_was_measured(runs),
+        "retrained": False,
+        "B_mult": [float(multiplier) for multiplier in config.eval.B_mult],
+        "B_reference_slots": config.memory.hot_slots(config.model.E),
         "splits": list(args.splits),
         "max_logical_batches": args.max_batches,
         "device": args.device,
@@ -1098,7 +1221,7 @@ def json_ready(value: Any) -> Any:
 
 
 def print_table(payload: dict[str, Any]) -> None:
-    print("Hold-out WikiText-2 — perplexidade de token (não é dose–resposta)", flush=True)
+    print("Hold-out WikiText-2 — perplexidade de token no B do YAML", flush=True)
     for run in payload["runs"]:
         if run.get("status") != "ok":
             print(f"{run['name']}: {run.get('status')}  {run.get('path')}", flush=True)
@@ -1189,6 +1312,9 @@ def _write_outputs(
             "packing",
             "residency",
             "dose_response",
+            "retrained",
+            "B_mult",
+            "B_reference_slots",
             "splits",
             "max_logical_batches",
             "device",
@@ -1208,9 +1334,39 @@ def _write_outputs(
         write_json(summary, payload)
         written.append(summary)
     print_table(payload)
+    dose_payload = dose_response.build_payload(
+        config,
+        runs,
+        splits=tuple(args.splits),
+        max_logical_batches=args.max_batches,
+    )
+    dose_json, dose_table = dose_artifact_paths(args, families)
+    write_json(dose_json, dose_payload)
+    dose_table.parent.mkdir(parents=True, exist_ok=True)
+    table_text = dose_response.render_markdown(dose_payload)
+    temporary = dose_table.with_suffix(dose_table.suffix + ".tmp")
+    temporary.write_text(table_text, encoding="utf-8")
+    os.replace(temporary, dose_table)
+    written.append(dose_json)
+    written.append(dose_table)
+    print(table_text, flush=True)
     for path in written:
-        print(f"json={path}", flush=True)
+        label = "table" if path.suffix == ".md" else "json"
+        print(f"{label}={path}", flush=True)
     return written
+
+
+def dose_artifact_paths(args: argparse.Namespace, families: list[Family]) -> tuple[Path, Path]:
+    """JSON da curva e a tabela markdown, ao lado do resumo ou do checkpoint."""
+
+    summary = summary_path_for(args, len(families))
+    if summary is not None:
+        directory = Path(summary).parent
+    elif len(families) == 1:
+        directory = families[0].path.parent
+    else:
+        directory = Path(args.outputs) / "holdout"
+    return directory / "dose_response.json", directory / "dose_response.md"
 
 
 def _main(argv: list[str] | None = None) -> None:
@@ -1229,7 +1385,10 @@ def _main(argv: list[str] | None = None) -> None:
     else:
         families = discover_families(args.outputs, config)
     device = resolve_device(args.device)
-    print("Hold-out WikiText-2 (não treina; não é dose–resposta nem smoke_eval)", flush=True)
+    print(
+        "Hold-out WikiText-2 (não treina; depois do B do YAML, dose–resposta em eval.B_mult)",
+        flush=True,
+    )
     print(f"fonte: {source_label(config, 'WikiText-2')}", flush=True)
     print(
         f"dtype=fp32  torch.compile=não  device={device}  splits={','.join(args.splits)}",
