@@ -4,8 +4,9 @@
 Sem CUDA o script explica o procedimento e sai. Com CUDA, mede o forward
 em fp32 no device e imprime p50/p95 locais. Isso não é a coluna do
 relatório: o número que entra no trabalho é na GTX 1060, no hold-out do
-WikiText-2. O batch daqui é o sintético do smoke, só para exercitar a
-subida morno/frio.
+WikiText-2, gravado por ``run_holdout_eval.py``. A curva de ``B`` usa o
+mesmo forward, depois de ``prepare_split_budget``. O batch daqui é o
+sintético do smoke. Sem CUDA o hold-out deixa os ms null.
 
 O relógio cobre o forward (a cópia do expert entra). ``emulator.step`` e
 ``materialize`` ficam fora: o primeiro atualiza o LRU, o segundo devolve
@@ -22,13 +23,15 @@ O procedimento completo está em ``docs/plano-de-hardware.md``.
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 import torch
 
@@ -42,6 +45,7 @@ Latência de parede — só na GTX 1060, com o modelo em CUDA, fp32, sem torch.c
 5. p50/p95 desses forwards. O batch do relatório é o hold-out do WikiText-2.
 
 O emulador segue contando trocas e bytes à parte. Este script não grava results/ e não preenche a tabela.
+A coluna do relatório é o JSON do hold-out, na GTX 1060. CPU: wall_clock=unavailable.
 """
 
 
@@ -98,10 +102,11 @@ def _measure(args: argparse.Namespace) -> None:
 
 
 def _percentile(ordered: list[float], percent: float) -> float:
-    if len(ordered) == 1:
-        return ordered[0]
-    rank = max(0, math.ceil(percent / 100 * len(ordered)) - 1)
-    return ordered[min(rank, len(ordered) - 1)]
+    """Mesma conta de ``run_holdout_eval.percentile``."""
+
+    from run_holdout_eval import percentile
+
+    return percentile(ordered, percent)
 
 
 if __name__ == "__main__":

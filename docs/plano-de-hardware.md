@@ -73,10 +73,13 @@ O cronômetro, por batch, em `eval` e `torch.no_grad()`:
 3. `emulator.step` — LRU, trocas e bytes. Fora do tempo. Não é latência.
 4. `materialize()` de novo — quem ficou fora de `B` volta para pinned ou memmap, senão o batch seguinte não paga a cópia.
 
-p50/p95 desses forwards. O batch do relatório é o hold-out do WikiText-2; `experiments/wall_latency.py` só exercita o caminho com o batch sintético e **não grava número**. Sem CUDA o script recusa a medição em vez de inventar ms. Rode na placa:
+p50/p95 desses forwards. O batch do relatório é o hold-out do WikiText-2. `experiments/run_holdout_eval.py` grava, por split, `wall_p50_ms`, `wall_p95_ms`, `swaps` e `bytes_moved`. A curva de `B` não tem outro cronômetro: `prepare_split_budget` ajusta o teto e o mesmo forward é medido. `wall_report_grade` só fica verdadeiro nesta GTX 1060, com o batch do checkpoint e o split inteiro. Em CPU `wall_clock` é `unavailable` e os ms ficam null.
+
+`experiments/wall_latency.py` só exercita o caminho com o batch sintético e **não grava** o JSON do hold-out. Sem CUDA ele recusa a medição. Rode na placa:
 
 ```bash
 python3 experiments/wall_latency.py --device cuda --batches 8
+python3 experiments/run_holdout_eval.py --device cuda
 ```
 
-fp32, sem `torch.compile`. Treino longo pode ser noutra GPU; a coluna de parede do relatório é desta máquina, com este caminho.
+fp32, sem `torch.compile`. Treino longo pode ser noutra GPU; a coluna de parede do relatório é desta máquina, lida do JSON do hold-out quando `wall_report_grade` é verdadeiro.

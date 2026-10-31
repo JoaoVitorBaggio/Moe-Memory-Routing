@@ -59,15 +59,17 @@ O que o script fecha: a mesma tokenização e os mesmos blocos não sobrepostos 
 
 O treino da grade e do baseline denso percorre `eval.seeds` (sementes `0 .. N-1`, partida 3). O hold-out automático lê a semente 0.
 
-A dose–resposta entra no mesmo script, sem retreino: depois da perplexidade no `B` do YAML, cada checkpoint MoE dessa descoberta (ou o arquivo pedido na linha de comando) repete `valid` e `test` em `eval.B_mult` (`0,5×`, `1×`, `2×`). Cada split recomeça o LRU nesse `B` e `set_hot_budget` aplica o multiplicador sem apagar o carimbo dessa reatribuição. O denso não tem teto quente: a curva dele é `n/a`. A tabela é `dose_response.md`, ao lado de `dose_response.json`. Não há número medido neste repositório.
+A dose–resposta entra no mesmo script, sem retreino: depois da perplexidade no `B` do YAML, cada checkpoint MoE dessa descoberta (ou o arquivo pedido na linha de comando) repete `valid` e `test` em `eval.B_mult` (`0,5×`, `1×`, `2×`). O teto é só `prepare_split_budget`: cada split recomeça o LRU nesse `B` e `set_hot_budget` aplica o multiplicador sem apagar o carimbo dessa reatribuição. O denso não tem teto quente: a curva dele é `n/a`. A tabela é `dose_response.md`, ao lado de `dose_response.json`.
 
-O que continua de fora: o LRU como modelo 2, agregar as sementes além da 0, a latência de parede e a correlação proxy×emulador. `smoke_eval.py` não é este número.
+Cada split, no `B` de referência e em cada ponto de `eval.B_mult`, grava `swaps`, `bytes_moved` e a parede do forward (`wall_p50_ms`, `wall_p95_ms`). A parede de relatório exige a **GTX 1060 com CUDA**, o batch do checkpoint e o split inteiro (`wall_report_grade`). Em CPU `wall_clock` fica `unavailable` e os milissegundos ficam null. Não há número medido neste repositório.
+
+O que continua de fora: o LRU como modelo 2, agregar as sementes além da 0 e a correlação proxy×emulador. `smoke_eval.py` não é este número.
 
 ## Latência de parede
 
 Decidido: reportar latência de parede na GTX 1060 no protocolo mínimo, porque `B` é fixo (não randomizado no treino). O emulador continua com bytes/trocas; a parede é coluna adicional.
 
-O caminho físico (quente na VRAM, morno em CPU pinned, frio em memmap) está em `src/moe_memory/residency.py`. O cronômetro está em [plano-de-hardware.md](plano-de-hardware.md). Não há número medido neste repositório.
+O caminho físico (quente na VRAM, morno em CPU pinned, frio em memmap) está em `src/moe_memory/residency.py`. O cronômetro está em [plano-de-hardware.md](plano-de-hardware.md). O hold-out grava p50/p95, `swaps` e `bytes_moved` no JSON, também em cada ponto da curva de `B`. Não há número medido neste repositório: a coluna de relatório sai na GTX 1060. CPU deixa os ms null.
 
 ## Ablações úteis (depois do mínimo)
 
