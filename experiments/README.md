@@ -51,7 +51,7 @@ outputs/wikitext/lambda-<λ>/
 
 Se os dois tiverem artefato, vale `seed-0`. Para migrar à mão, mover `lambda-<λ>/` para `seed-0/lambda-<λ>/` antes de relançar. `train_wikitext.py` sozinho continua sendo um job (`--seed`, padrão 0); o diretório padrão segue a mesma regra.
 
-O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas). Não é perplexidade de valid/test nem dose–resposta. O LM denso tem corrida própria, abaixo. O hold-out está na seção seguinte. LRU como adversário separado (modelo 2) ainda não tem script. O emulador já aceita trocar o teto (`set_hot_budget`, 0,5× / 1× / 2×) para quando a dose–resposta entrar.
+O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas). Não é perplexidade de valid/test nem dose–resposta. O LM denso tem corrida própria, abaixo. O hold-out, que também varre `eval.B_mult` sem retreinar, está na seção seguinte. LRU como adversário separado (modelo 2) ainda não tem script. O teto da avaliação muda por `set_hot_budget` (0,5× / 1× / 2×).
 
 ## Baseline denso (WikiText-2)
 
@@ -81,13 +81,13 @@ TinyStories fica como caminho opcional de desenvolvimento. Não é o padrão. O 
 python3 experiments/train_baseline.py --corpus TinyStories --steps 2 --device cpu
 ```
 
-A entrega cai em `outputs/baseline/wikitext/` (gitignored). O `summary.json` fica na raiz e lista cada semente (`per_seed`: status, `work_dirs`, `logs`). O job em si fica em `seed-<n>/` (`done.json`, `train.jsonl`, `train.log`, `checkpoint.pt`). O resumo usa os mesmos campos da grade para comparar: `status`, `steps`, `tokens`, `last_total`, `last_task`. `lambda` fica `null`. TinyStories, se rodar, vai para `outputs/baseline/tinystories/seed-<n>/` e não mistura com o resumo do WikiText-2. Dose–resposta continua fora.
+A entrega cai em `outputs/baseline/wikitext/` (gitignored). O `summary.json` fica na raiz e lista cada semente (`per_seed`: status, `work_dirs`, `logs`). O job em si fica em `seed-<n>/` (`done.json`, `train.jsonl`, `train.log`, `checkpoint.pt`). O resumo usa os mesmos campos da grade para comparar: `status`, `steps`, `tokens`, `last_total`, `last_task`. `lambda` fica `null`. TinyStories, se rodar, vai para `outputs/baseline/tinystories/seed-<n>/` e não mistura com o resumo do WikiText-2. O hold-out lê o checkpoint da semente 0. Na curva de `B` esse checkpoint entra como `n/a`: o denso não tem teto quente.
 
 Semente 0 já gravada solta na raiz (`checkpoint.pt` ou `done.json` ao lado do `summary.json`, sem `seed-0/`) continua nessa raiz. Se `seed-0/` também tiver artefato, vale `seed-0`. Para migrar à mão, mover o checkpoint, o `done.json` e os logs para `seed-0/` antes de relançar. `train_baseline.py` sozinho é um job; o `--work-dir` padrão já é `seed-<n>/`, com a mesma exceção da raiz antiga.
 
 ## Hold-out (perplexidade no WikiText-2)
 
-O treino não calcula este número. `experiments/run_holdout_eval.py` lê os checkpoints já gravados e mede a perplexidade de token nos splits oficiais `valid` (seleção) e `test` (relatório). Não treina. Se `corpus.paths.WikiText-2` for um diretório local, não baixa o Hub. Não varre dose–resposta.
+O treino não calcula este número. `experiments/run_holdout_eval.py` lê os checkpoints já gravados e mede a perplexidade de token nos splits oficiais `valid` (seleção) e `test` (relatório). Não treina. Se `corpus.paths.WikiText-2` for um diretório local, não baixa o Hub. Em seguida, sem retreinar, cada MoE repete valid e test em `eval.B_mult`.
 
 O empacotamento é o do treino (BPE do GPT-2, `<|endoftext|>` entre artigos, blocos não sobrepostos via `iter_documents` / `iter_token_ids` / `iter_batches`, sem o embaralhamento da época). O tensor de treino bate com `load_train_sequences`. `seq_len` sai do checkpoint — 256 na corrida da GTX 1060, que é `model.max_seq_len`. A CE é `task_cross_entropy`: a posição `t` prediz `t+1`, e o resto que não fecha `seq_len` cai fora, como no treino. Perplexidade = `exp` dessa média por token previsto. Bits por byte = soma da NLL em nats / `ln(2)` / bytes UTF-8 do decode dos tokens que entraram na conta, sem o EOT. Não é a perplexidade por palavra dos papers de WikiText: o denominador aqui é token, para os quatro checkpoints serem comparáveis entre si e com a `L_task`.
 
@@ -136,6 +136,8 @@ Se o forward estourar a VRAM, repetir com `--batch-size 1` (ou 2). No MoE a PPL 
 
 A saída é `holdout.json` ao lado de cada `checkpoint.pt` e, na descoberta dos quatro, `outputs/holdout/summary.json` (os dois gitignored, como o resto de `outputs/`). O JSON traz, por split, perplexidade, `nll_nats`, bits por byte, tokens previstos, sequências, o `seq_len`, o batch do checkpoint e os passos/cursor do treino. `protocol_complete` fica verdadeiro quando valid e test inteiros rodaram no `seq_len` do checkpoint. Checkpoint ausente na descoberta, `--max-batches` ou `--seq-len` diferente do treino: código 7, e o JSON não é número de relatório.
 
-Dose–resposta (`0,5×B`, `2×B`, `set_hot_budget`), o LRU como modelo 2, agregar as sementes além da 0 e a correlação proxy×emulador continuam fora. O treino das sementes é a grade e o baseline (`eval.seeds`).
+A dose–resposta usa o mesmo processo, nos mesmos checkpoints (semente 0 na descoberta; o layout antigo entra só quando é o único `checkpoint.pt`). O `B` do YAML continua sendo a medição de referência (`splits` no `holdout.json`). Para cada multiplicador, cada split recomeça o LRU nesse `B` (`reset`) e `set_hot_budget` aplica o teto novo sem apagar o carimbo dessa reatribuição — não há outro `reset` antes do forward, e o script não reconstrói o emulador nem chama `sync_physical`. O denso não entra na curva: `status` `n/a`. A saída extra é `dose_response.json` e `dose_response.md` (PPL por multiplicador e por checkpoint), ao lado do `summary.json` na descoberta, ou ao lado do `holdout.json` quando se pede um checkpoint só sem `--summary`.
+
+O LRU como modelo 2, agregar as sementes além da 0 e a correlação proxy×emulador continuam fora. O treino das sementes é a grade e o baseline (`eval.seeds`).
 
 Não colocar saída grande nesta pasta. Métrica pequena vai para `results/`; checkpoint e dataset ficam de fora do Git. O home frio do MoE cai em `outputs/` (gitignored). O baseline denso não grava memmap de expert.

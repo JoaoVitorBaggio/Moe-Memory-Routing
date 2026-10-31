@@ -389,7 +389,15 @@ def test_missing_families_write_an_incomplete_summary(tmp_path: Path):
     payload = json.loads(summary.read_text(encoding="utf-8"))
     assert payload["protocol"] == "wikitext-2-holdout-ppl"
     assert payload["dose_response"] is False
+    assert payload["retrained"] is False
     assert payload["protocol_complete"] is False
+    dose = json.loads((summary.parent / "dose_response.json").read_text(encoding="utf-8"))
+    assert dose["protocol"] == "wikitext-2-dose-response"
+    assert dose["retrained"] is False
+    assert [item["dose_response"]["status"] for item in dose["runs"]] == ["missing"] * 4
+    table = (summary.parent / "dose_response.md").read_text(encoding="utf-8")
+    assert "ausente" in table
+    assert "n/a" in table
     assert [run["name"] for run in payload["runs"]] == [
         "baseline",
         "lambda-0",
@@ -489,8 +497,19 @@ def test_dense_checkpoint_roundtrip_matches_token_cross_entropy(tmp_path: Path):
     payload = json.loads(summary.read_text(encoding="utf-8"))
     assert payload["protocol_complete"] is False
     assert payload["dose_response"] is False
+    assert payload["retrained"] is False
     assert payload["packing"] == "non_overlapping_seq_len"
     run = payload["runs"][0]
+    assert run["dose_response"]["status"] == "n/a"
+    assert run["dose_response"]["budgets"] is None
+    assert "set_hot_budget" in run["dose_response"]["reason"]
+    dose = json.loads((summary.parent / "dose_response.json").read_text(encoding="utf-8"))
+    assert dose["retrained"] is False
+    assert dose["dense_axis"] == "n/a"
+    assert dose["runs"][0]["dose_response"]["status"] == "n/a"
+    table = (summary.parent / "dose_response.md").read_text(encoding="utf-8")
+    assert "n/a" in table
+    assert "baseline" in table
     assert run["status"] == "ok"
     assert run["model_kind"] == "dense"
     assert run["lambda"] is None
@@ -658,5 +677,32 @@ def test_moe_lambda_zero_resets_lru_per_split_and_ignores_saved_levels(tmp_path:
     assert test["lru_tick_end"] == 1
     assert valid["truncated"] is True
     assert test["truncated"] is True
+    assert payload["dose_response"] is True
+    assert payload["retrained"] is False
+    curve = run["dose_response"]
+    assert curve["status"] == "ok"
+    assert curve["retrained"] is False
+    assert curve["method"] == "reset_lru_at_yaml_b_then_set_hot_budget"
+    assert [point["multiplier"] for point in curve["budgets"]] == [0.5, 1.0, 2.0]
+    assert [point["hot_slots"] for point in curve["budgets"]] == [4, 8, 16]
+    layers = config.model.n_layers
+    for point in curve["budgets"]:
+        assert point["splits"]["valid"]["hot"] == point["hot_slots"] * layers
+        assert point["splits"]["test"]["hot"] == point["hot_slots"] * layers
+        assert point["splits"]["valid"]["tokens_scored"] == valid["tokens_scored"]
+    one = next(point for point in curve["budgets"] if point["multiplier"] == 1.0)
+    assert one["yaml_reference"] is True
+    assert one["splits"]["valid"]["nll_nats"] == pytest.approx(valid["nll_nats"], rel=1e-5, abs=1e-5)
+    assert one["splits"]["valid"]["budget_reassign"]["swaps"] == 0
+    assert curve["budgets"][0]["splits"]["valid"]["budget_reassign"]["swaps"] > 0
+    assert curve["budgets"][2]["splits"]["valid"]["budget_reassign"]["swaps"] > 0
+    dose = json.loads((summary.parent / "dose_response.json").read_text(encoding="utf-8"))
+    assert dose["retrained"] is False
+    assert dose["B_mult"] == [0.5, 1.0, 2.0]
+    assert dose["B_reference_slots"] == 8
+    table = (summary.parent / "dose_response.md").read_text(encoding="utf-8")
+    assert "0.5×B (4)" in table
+    assert "2×B (16)" in table
+    assert "lambda-0" in table
     assert not (work / "holdout_lru").exists()
     assert list(work.glob("**/*.f32")) == []

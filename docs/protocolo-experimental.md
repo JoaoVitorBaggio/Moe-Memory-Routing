@@ -57,7 +57,11 @@ Seeds: **3** no mínimo. Hold-out: no WikiText-2, **splits oficiais** valid (sel
 
 O que o script fecha: a mesma tokenização e os mesmos blocos não sobrepostos do treino (`seq_len` do checkpoint; 256 na entrega), a CE `task_cross_entropy`, a classe densa no baseline e a classe MoE nos três λ (inclusive 0). O LRU do MoE recomeça em cada split, no `B` de referência, um passo por batch do checkpoint. `--batch-size` só corta o forward.
 
-O treino da grade e do baseline denso percorre `eval.seeds` (sementes `0 .. N-1`, partida 3). O hold-out automático lê a semente 0. O que continua de fora: a grade `0,5×B` / `2×B` (o emulador já tem `set_hot_budget`), o LRU como modelo 2, agregar as outras sementes, a latência de parede e a correlação proxy×emulador. `smoke_eval.py` não é este número.
+O treino da grade e do baseline denso percorre `eval.seeds` (sementes `0 .. N-1`, partida 3). O hold-out automático lê a semente 0.
+
+A dose–resposta entra no mesmo script, sem retreino: depois da perplexidade no `B` do YAML, cada checkpoint MoE dessa descoberta (ou o arquivo pedido na linha de comando) repete `valid` e `test` em `eval.B_mult` (`0,5×`, `1×`, `2×`). Cada split recomeça o LRU nesse `B` e `set_hot_budget` aplica o multiplicador sem apagar o carimbo dessa reatribuição. O denso não tem teto quente: a curva dele é `n/a`. A tabela é `dose_response.md`, ao lado de `dose_response.json`. Não há número medido neste repositório.
+
+O que continua de fora: o LRU como modelo 2, agregar as sementes além da 0, a latência de parede e a correlação proxy×emulador. `smoke_eval.py` não é este número.
 
 ## Latência de parede
 

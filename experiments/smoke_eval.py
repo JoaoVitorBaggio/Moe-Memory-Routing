@@ -48,7 +48,8 @@ def main() -> None:
         "(não é perplexidade de relatório)"
     )
     print(
-        "dose–resposta ainda não rodou; vagas quentes previstas para "
+        "dose–resposta roda no hold-out (run_holdout_eval.py), não neste forward; "
+        "vagas quentes previstas para "
         + ", ".join(f"{mult}×B→{slot}" for mult, slot in zip(config.eval.B_mult, slots))
     )
 
