@@ -511,11 +511,17 @@ def _write_checkpoint(state: dict[str, Any]) -> None:
 
 
 def _optimizer_state_cpu(optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    # state_dict() devolve os MESMOS dicts de estado do otimizador vivo;
+    # mutar ``slot`` in-place movia exp_avg/exp_avg_sq para a CPU e quebrava
+    # o próximo optimizer.step() (cuda:0 vs cpu). Copiar antes de converter.
     blob = optimizer.state_dict()
-    for slot in blob["state"].values():
-        for key, value in list(slot.items()):
-            if torch.is_tensor(value):
-                slot[key] = value.detach().to(device="cpu").clone()
+    blob["state"] = {
+        index: {
+            key: value.detach().to(device="cpu").clone() if torch.is_tensor(value) else value
+            for key, value in slot.items()
+        }
+        for index, slot in blob["state"].items()
+    }
     return blob
 
 
