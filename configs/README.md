@@ -12,7 +12,7 @@ Hiperparâmetros versionados do experimento mínimo.
 - `memory.warm_slots` — vagas do nível morno para os três níveis existirem. Não é eixo do protocolo; o teto que se varre é `B` no quente.
 - `c.*` — custo de **acesso** por nível. `w(a,b)` **não** aparece no YAML: é `|c(b)−c(a)|` e muda com `c`.
 - `loss.beta` — fixo pequeno (ordem Switch); valor `0.01` é partida, não busca.
-- `loss.lambda_grid` — treinos separados; **não** é Optuna/HPO no mínimo.
+- `loss.lambda_grid` — treinos separados; **não** é Optuna/HPO no mínimo. A corrida overnight que percorre essa lista está em [`experiments/README.md`](../experiments/README.md). Passo, batch e época não entram neste YAML: são knobs operacionais do script.
 - `loss.train_topk_agg` / `infer_topk_agg` — média ponderada no treino, soma na inferência. É o proxy de custo, não a mistura do hidden.
 - `nvme: 20` — escolhido entre 20 e 30; recalibrar na 1060 se a dose–resposta sair flat/invertida.
 - Granularidade do emulador e `router_sees_level` estão aqui para o código não divergir do doc.
