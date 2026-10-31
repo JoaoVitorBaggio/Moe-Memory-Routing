@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Perplexidade de hold-out no WikiText-2 (valid e test). Não treina.
 
-Os quatro checkpoints da entrega, no layout do treino (gitignored):
+Os quatro checkpoints da entrega são a semente 0 (gitignored). O treino
+novo grava ``seed-0/``; se essa pasta ainda não tiver checkpoint e o
+layout antigo tiver, a descoberta usa o antigo:
 
-    outputs/baseline/wikitext/checkpoint.pt          LM denso
-    outputs/wikitext/lambda-0/checkpoint.pt          MoE λ=0
-    outputs/wikitext/lambda-0.5/checkpoint.pt        MoE λ=0.5
-    outputs/wikitext/lambda-1/checkpoint.pt          MoE λ=1
+    outputs/baseline/wikitext/seed-0/checkpoint.pt       LM denso
+    outputs/wikitext/seed-0/lambda-0/checkpoint.pt       MoE λ=0
+    outputs/wikitext/seed-0/lambda-0.5/checkpoint.pt     MoE λ=0.5
+    outputs/wikitext/seed-0/lambda-1/checkpoint.pt       MoE λ=1
+
+Layout antigo da semente 0, ainda aceito:
+
+    outputs/baseline/wikitext/checkpoint.pt
+    outputs/wikitext/lambda-<λ>/checkpoint.pt
+
+As sementes 1..N-1 ficam no disco do treino. Este script não as agrega.
 
 O denso não é o MoE com λ=0: o arquivo denso carrega ``DenseLanguageModel``;
 os outros carregam ``MemoryMoEModel`` (roteador, emulador, β). A CE é
@@ -22,8 +31,8 @@ train. Os pesos ficam no device do forward (fp32). Não há ``sync_physical``
 e não há medição de parede.
 
 Fora deste script: dose–resposta (0,5×B / 2×B), LRU como modelo 2,
-várias sementes, correlação proxy×emulador. ``smoke_eval.py`` continua
-sendo init aleatória.
+agregar as sementes além da 0, correlação proxy×emulador.
+``smoke_eval.py`` continua sendo init aleatória.
 
 Uso, a partir da raiz, na GTX 1060::
 
@@ -32,8 +41,8 @@ Uso, a partir da raiz, na GTX 1060::
 Um checkpoint, ou um corte de CPU (sai com código 7: não é o relatório).
 ``--seq-len`` diferente do checkpoint também sai com 7::
 
-    python3 experiments/run_holdout_eval.py --checkpoint outputs/wikitext/lambda-0.5/checkpoint.pt --device cuda
-    python3 experiments/run_holdout_eval.py --work-dir outputs/baseline/wikitext --max-batches 1 --device cpu
+    python3 experiments/run_holdout_eval.py --checkpoint outputs/wikitext/seed-0/lambda-0.5/checkpoint.pt --device cuda
+    python3 experiments/run_holdout_eval.py --work-dir outputs/baseline/wikitext/seed-0 --max-batches 1 --device cpu
 
 Códigos: 1 uso, 3 OOM, 4 NLL não finita, 5 crash, 7 hold-out incompleto
 (checkpoint ausente, split cortado, ``seq_len`` diferente do treino, ou
@@ -77,6 +86,12 @@ from moe_memory.tokenizer import load_gpt2_encoding
 from train_baseline import CHECKPOINT_VERSION as DENSE_CHECKPOINT_VERSION
 from train_baseline import NOTE as DENSE_NOTE
 from train_baseline import _architecture as dense_architecture
+from seed_layout import (
+    baseline_seed_dir,
+    is_seed_dirname,
+    lambda_run_dir,
+    prefer_checkpoint,
+)
 from train_wikitext import (
     CHECKPOINT_VERSION as MOE_CHECKPOINT_VERSION,
     EXIT_CRASH,
@@ -108,7 +123,7 @@ METRIC_NOTE = (
     "dos papers de WikiText. λ não multiplica a PPL. No MoE, C_mem e entropia "
     "usam a agregação de inferência (sum); o balanço é o do batch lógico do "
     "checkpoint. O LRU recomeça em cada split. Dose–resposta, modelo 2, "
-    "várias sementes e latência de parede ficam fora."
+    "agregar sementes além da 0 e latência de parede ficam fora."
 )
 
 MOE_NOTE = (
@@ -280,22 +295,31 @@ def parse_splits(text: str) -> tuple[str, ...]:
 
 
 def discover_families(outputs: Path, config: ExperimentConfig) -> list[Family]:
-    """Baseline denso + um MoE por valor de ``loss.lambda_grid``, na ordem do YAML."""
+    """Baseline denso + um MoE por λ, semente 0, na ordem do YAML.
 
+    A pasta canônica é ``seed-0``. Se ela ainda não tiver checkpoint e o
+    layout antigo tiver, o caminho antigo entra no lugar.
+    """
+
+    baseline_root = Path(outputs) / "baseline" / "wikitext"
     families = [
         Family(
             name="baseline",
-            path=Path(outputs) / "baseline" / "wikitext" / "checkpoint.pt",
+            path=prefer_checkpoint(baseline_seed_dir(baseline_root, 0), baseline_root),
             expected_kind=KIND_DENSE,
             expected_lambda=None,
         )
     ]
+    grid_root = Path(outputs) / "wikitext"
     for value in config.loss.lambda_grid:
         tag = lambda_tag(float(value))
         families.append(
             Family(
                 name=f"lambda-{tag}",
-                path=Path(outputs) / "wikitext" / f"lambda-{tag}" / "checkpoint.pt",
+                path=prefer_checkpoint(
+                    lambda_run_dir(grid_root, float(value), 0),
+                    grid_root / f"lambda-{tag}",
+                ),
                 expected_kind=KIND_MOE,
                 expected_lambda=float(value),
             )
@@ -312,6 +336,12 @@ def families_from_checkpoints(paths: list[str]) -> list[Family]:
 
 def name_from_path(path: Path) -> str:
     parent = path.parent
+    if (
+        is_seed_dirname(parent.name)
+        and parent.parent.name == "wikitext"
+        and parent.parent.parent.name == "baseline"
+    ):
+        return "baseline"
     if parent.name == "wikitext" and parent.parent.name == "baseline":
         return "baseline"
     if parent.name:

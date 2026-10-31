@@ -12,17 +12,24 @@ tentativa desce o batch (4 → 2 → 1) e retoma o checkpoint. SIGTERM/SIGINT
 no filho espera o passo em curso, grava o checkpoint e o runner repete o
 mesmo batch. Erro de uso não reduz batch.
 
+``eval.seeds`` do YAML define quantas sementes correm: ``0 .. seeds-1``.
+``--seed N`` limita a essa semente. Cada semente é um processo de
+``train_baseline.py``.
+
 Uso, a partir da raiz, na GTX 1060 (corpus padrão = WikiText-2)::
 
     python3 experiments/run_baseline.py --device cuda
+    python3 experiments/run_baseline.py --seed 1 --device cuda
 
 TinyStories é opcional e não é o número de relatório::
 
     python3 experiments/run_baseline.py --corpus TinyStories --steps 2 --device cpu
 
 Saída da entrega em ``outputs/baseline/wikitext/`` (gitignored):
-``summary.json``, ``done.json``, ``train.jsonl``, ``train.log``,
-``checkpoint.pt``.
+``summary.json`` na raiz, e por semente ``seed-<n>/`` com ``done.json``,
+``train.jsonl``, ``train.log``, ``checkpoint.pt``. A semente 0 que já
+está solta na raiz (sem ``seed-0``) continua nesse lugar. O resumo lista
+o status e o caminho de cada semente.
 """
 
 from __future__ import annotations
@@ -47,10 +54,18 @@ from moe_memory.config import ExperimentConfig, load_config
 from moe_memory.dense import MODEL_KIND, capacity_report
 from run_lambda_grid import (
     MAX_INTERRUPTS,
+    apply_seed_request,
     batch_ladder,
+    iteration_seeds,
     should_resume_same,
     should_shrink,
     subprocess_launch,
+)
+from seed_layout import (
+    LEGACY_LAYOUT_NOTE,
+    baseline_seed_dir,
+    per_seed_report,
+    resolve_baseline_seed_dir,
 )
 from train_baseline import (
     NOTE,
@@ -150,6 +165,7 @@ def run_baseline(
 ) -> dict[str, Any]:
     work = Path(request.work_dir)
     work.mkdir(parents=True, exist_ok=True)
+    seeds = iteration_seeds(request)
     capacity = capacity_report(config)
     summary: dict[str, Any] = {
         "model": MODEL_KIND,
@@ -158,7 +174,9 @@ def run_baseline(
         "corpus": request.corpus_name,
         "device": request.device,
         "seq_len": request.seq_len,
-        "seed": request.seed,
+        "seed": seeds[0] if len(seeds) == 1 else None,
+        "seeds": seeds,
+        "eval_seeds": config.eval.seeds,
         "steps": request.steps,
         "epochs": request.epochs,
         "batch_size_start": request.batch_size,
@@ -170,29 +188,45 @@ def run_baseline(
         "parameters": capacity["dense_parameters"],
         "moe_total_parameters": capacity["moe_total_parameters"],
         "moe_active_parameters": capacity["moe_active_parameters"],
+        "layout": "seed-<n>",
+        "layout_note": LEGACY_LAYOUT_NOTE,
         "metric_fields": ["status", "steps", "tokens", "last_total", "last_task"],
         "runs": [],
+        "per_seed": [],
     }
     summary_path = work / "summary.json"
     print(NOTE)
     print(
         f"Baseline denso  corpus={request.corpus_name}  device={request.device}  "
-        f"seq={request.seq_len}  batch={request.batch_size}  seed={request.seed}"
+        f"seq={request.seq_len}  batch={request.batch_size}  "
+        f"sementes={', '.join(str(seed) for seed in seeds)}  "
+        f"(eval.seeds={config.eval.seeds})"
     )
     print("fp32, sem torch.compile. Não é a grade de λ. Hold-out e dose–resposta ficam fora.")
     if request.corpus_name != "WikiText-2":
         print("TinyStories é o caminho de dev. O relatório deste baseline é o WikiText-2.")
-    _write_summary(summary_path, summary)
-    result = run_one(config_path=request.config, request=request, launch=launch)
-    summary["runs"].append(result)
-    _write_summary(summary_path, summary)
-    print(f"status={result['status']}  resumo: {summary_path}")
-    if result["status"] != "done":
-        print("alvo não cumprido")
+    _publish(summary_path, summary)
+    for index, seed in enumerate(seeds, start=1):
+        print(f"[{index}/{len(seeds)}] seed={seed}")
+        result = run_one(
+            config_path=request.config,
+            request=request,
+            launch=launch,
+            seed=seed,
+        )
+        summary["runs"].append(result)
+        _publish(summary_path, summary)
+        print(f"seed={seed}  status={result['status']}")
+    print(f"resumo: {summary_path}")
+    failed = [run["seed"] for run in summary["runs"] if run["status"] != "done"]
+    if failed:
+        print("sementes sem alvo cumprido: " + ", ".join(str(value) for value in failed))
     else:
         print(
-            f"passos={result.get('steps')}  tokens={result.get('tokens')}  "
-            f"L={result.get('last_total')}  L_task={result.get('last_task')}"
+            f"passos={summary['runs'][-1].get('steps')}  "
+            f"tokens={summary['runs'][-1].get('tokens')}  "
+            f"L={summary['runs'][-1].get('last_total')}  "
+            f"L_task={summary['runs'][-1].get('last_task')}"
         )
     return summary
 
@@ -202,28 +236,38 @@ def run_one(
     config_path: Path | None,
     request: argparse.Namespace,
     launch: Launch,
+    seed: int | None = None,
 ) -> dict[str, Any]:
-    work = Path(request.work_dir)
+    if seed is None:
+        seed = request.seed
+    if seed is None:
+        raise RuntimeError("semente ausente; chame resolve_request ou passe seed")
+    seed = int(seed)
+    root = Path(request.work_dir)
+    canonical = baseline_seed_dir(root, seed)
+    work = resolve_baseline_seed_dir(root, seed)
     work.mkdir(parents=True, exist_ok=True)
     log_path = work / "train.log"
     done_path = work / "done.json"
     base = {
         "model": MODEL_KIND,
         "corpus": request.corpus_name,
+        "seed": seed,
         "work_dir": str(work),
         "log": str(log_path),
         "lambda": None,
+        "legacy_layout": work != canonical,
     }
     if is_complete(
         done_path,
         corpus=request.corpus_name,
-        seed=request.seed,
+        seed=seed,
         seq_len=request.seq_len,
         steps=request.steps,
         epochs=request.epochs,
     ):
         done = json.loads(done_path.read_text(encoding="utf-8"))
-        print(f"{request.corpus_name} já cumpriu o alvo; não relança")
+        print(f"seed={seed} {request.corpus_name} já cumpriu o alvo; não relança")
         return {
             **base,
             "status": "done",
@@ -249,19 +293,19 @@ def run_one(
             device=request.device,
             seq_len=request.seq_len,
             batch_size=batch,
-            seed=request.seed,
+            seed=seed,
             steps=request.steps,
             epochs=request.epochs,
             checkpoint_every=request.checkpoint_every,
             work_dir=work,
         )
-        print(f"batch={batch}  (degrau {index + 1}/{len(ladder)})")
+        print(f"seed={seed}  batch={batch}  (degrau {index + 1}/{len(ladder)})")
         code = launch(command, log_path)
         if code == 0:
             if not is_complete(
                 done_path,
                 corpus=request.corpus_name,
-                seed=request.seed,
+                seed=seed,
                 seq_len=request.seq_len,
                 steps=request.steps,
                 epochs=request.epochs,
@@ -349,7 +393,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Pasta da corrida. Padrão: outputs/baseline/wikitext (ou tinystories).",
     )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Uma semente só. Sem esta flag, percorre 0 .. eval.seeds-1 do YAML.",
+    )
     parser.add_argument("--checkpoint-every", type=int, default=DEFAULT_CHECKPOINT_EVERY)
     args = parser.parse_args(argv)
     if args.steps is None and args.epochs is None:
@@ -362,7 +411,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--epochs precisa ser >= 1")
     if args.batch_size < 1:
         raise SystemExit("--batch-size precisa ser >= 1")
-    if args.seed < 0:
+    if args.seed is not None and args.seed < 0:
         raise SystemExit("--seed precisa ser >= 0")
     if args.work_dir is None:
         args.work_dir = default_work_dir(args.corpus)
@@ -387,7 +436,13 @@ def resolve_request(config: ExperimentConfig, args: argparse.Namespace) -> argpa
         raise SystemExit(
             f"seq_len={args.seq_len} fora de 2..max_seq_len={config.model.max_seq_len}"
         )
+    apply_seed_request(config, args)
     return args
+
+
+def _publish(path: Path, summary: dict[str, Any]) -> None:
+    summary["per_seed"] = per_seed_report(summary["runs"])
+    _write_summary(path, summary)
 
 
 def _write_summary(path: Path, summary: dict[str, Any]) -> None:

@@ -20,6 +20,12 @@ Retomar é rodar o mesmo comando: o checkpoint em ``--work-dir`` continua
 o cursor de sequências. OOM e loss não finita saem com código próprio para
 a grade encolher o batch sem alguém no meio. SIGTERM/SIGINT espera o passo
 em curso e só então grava o checkpoint.
+
+Este script treina uma semente (``--seed``, padrão 0). Quem percorre
+``eval.seeds`` é ``experiments/run_lambda_grid.py``. O ``--work-dir``
+padrão é ``outputs/wikitext/seed-<n>/lambda-<λ>/``. Se a semente 0 já
+tiver artefato no layout antigo (``outputs/wikitext/lambda-<λ>/``) e a
+pasta nova ainda estiver vazia, o padrão continua no lugar antigo.
 """
 
 from __future__ import annotations
@@ -35,11 +41,15 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 import torch
 
 from moe_memory.config import ExperimentConfig, load_config
+from seed_layout import lambda_tag, resolve_lambda_run_dir
 from moe_memory.corpus import iter_split, source_label
 from moe_memory.smoke import prepare_train, train_one_batch
 
@@ -58,11 +68,6 @@ CHECKPOINT_VERSION = 1
 
 # Sinal só arma a bandeira. O save corre entre passos, com o cursor já fechado.
 _STOP = {"now": False}
-
-
-def lambda_tag(value: float) -> str:
-    text = f"{float(value):.4f}".rstrip("0").rstrip(".")
-    return text if text else "0"
 
 
 def same_lambda(left: float, right: float) -> bool:
@@ -136,7 +141,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.checkpoint_every < 1:
         die(EXIT_USAGE, "--checkpoint-every precisa ser >= 1")
     if args.work_dir is None:
-        args.work_dir = ROOT / "outputs" / "wikitext" / f"lambda-{lambda_tag(args.lambda_)}"
+        args.work_dir = resolve_lambda_run_dir(
+            ROOT / "outputs" / "wikitext",
+            args.lambda_,
+            args.seed,
+        )
     return args
 
 
