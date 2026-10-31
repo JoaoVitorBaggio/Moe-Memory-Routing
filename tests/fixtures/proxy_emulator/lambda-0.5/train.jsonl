@@ -1,0 +1,7 @@
+{"event":"step","step":1,"lambda":0.5,"c_mem":1.0,"bytes_moved":10,"swaps":1,"entropy":2.0,"finite":true}
+{"event":"step","step":2,"lambda":0.5,"c_mem":2.0,"bytes_moved":20,"swaps":2,"entropy":1.5,"finite":true}
+not-json
+{"event":"nonfinite","step_attempt":3,"lambda":0.5}
+{"event":"step","step":3,"lambda":0.5,"c_mem":3.0,"bytes_moved":30,"swaps":4,"entropy":1.0,"finite":true}
+{"event":"step","step":4,"lambda":0.5,"c_mem":4.0,"bytes_moved":40,"swaps":3,"entropy":0.5,"finite":true}
+{"event":"step","step":5,"lambda":0.5,"c_mem":null,"bytes_moved":99,"swaps":9,"entropy":0.1,"finite":true}

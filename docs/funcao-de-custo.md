@@ -39,7 +39,7 @@ Com **`k = 2`**:
 
 Troca entre conjuntos: política do emulador promove/rebaixa sob `B`. Granularidade do emulador: **por batch** (meio-termo entre fidelidade por token e custo por camada). O roteador **recebe `ℓ(e)`** como entrada (roteamento ciente de memória).
 
-**Requisito do feedback (ponto 5):** o proxy e o emulador precisam falar a mesma língua. Se a loss acha barato misturar experts “frios” mas o LRU/emulador gera thrashing, o roteador otimiza o proxy errado. No relatório: correlacionar (ou ao menos ordenar) `C_mem` na loss com bytes e trocas contados pelo emulador.
+**Requisito do feedback (ponto 5):** o proxy e o emulador precisam falar a mesma língua. Se a loss acha barato misturar experts “frios” mas o LRU/emulador gera thrashing, o roteador otimiza o proxy errado. No relatório: correlacionar (ou ao menos ordenar) `C_mem` na loss com bytes e trocas contados pelo emulador. Isso não treina: `experiments/plot_proxy_emulator.py` lê o `train.jsonl` já gravado (`c_mem`, `bytes_moved`, `swaps`, `entropy`), no layout `seed-<n>/lambda-<λ>/` e no antigo `lambda-<λ>/`, e grava Pearson, Spearman e a curva de entropia. Como rodar, em [`experiments/README.md`](../experiments/README.md).
 
 ## L_tarefa e L_balanço
 
