@@ -69,7 +69,7 @@ Os pesos `c(ℓ)` e `w(a,b)` são variáveis de experimento (`w` amarrado a `c`)
 | # | Modelo | Papel |
 | --- | --- | --- |
 | 1 | MoE top-k (`λ = 0`) | qualidade MoE sem cobrar memória |
-| 2 | MoE + **LRU de experts** | único adversário de offload |
+| 2 | MoE + **LRU de experts** | único adversário de offload; no código, o mesmo `ResidencyEmulator` e o mesmo `λ=0` do modelo 1 |
 | 3 | Denso (ativos comparáveis) | separar esparsidade de penalidade |
 | 4 | Este projeto (`λ > 0`) | roteador + emulador + política de colocação |
 
@@ -97,15 +97,16 @@ python3 experiments/wall_latency.py
 python3 experiments/run_lambda_grid.py --device cuda
 python3 experiments/run_baseline.py --device cuda
 python3 experiments/run_holdout_eval.py --device cuda
+python3 experiments/run_model_comparison.py --manifest-only
 python3 -m pytest
 ```
 
-`smoke_train.py` dá **um** passo num batch aleatório. `train_tinystories.py` dá um passo curto no corpus de desenvolvimento. `smoke_wikitext.py` só carrega os splits oficiais. `wall_latency.py` na GTX 1060 (`--device cuda`) cronometra o forward com experts fora de `B` fora da VRAM; sem CUDA ele não inventa ms. A loss impressa desses smokes é de peso inicial ou de um passo curto. A grade overnight (`run_lambda_grid.py`) treina `λ ∈ {0, 0,5, 1}` no WikiText-2, uma semente por vez (`eval.seeds`, partida 3), e grava log em `outputs/wikitext/seed-<n>/`. `run_baseline.py` treina o LM denso (modelo 3) no mesmo WikiText-2 e nas mesmas sementes, sem roteador e sem residência: não é o MoE com `λ=0`. `run_holdout_eval.py` lê os quatro checkpoints da semente 0 e, em `valid` e `test`, calcula a perplexidade de token (mesmo BPE, mesmo bloco, `seq_len` do checkpoint) e grava `swaps`, `bytes_moved` e a parede p50/p95. No MoE, sem retreinar, `prepare_split_budget` repete a medida em `eval.B_mult` e o mesmo forward entra na curva. O denso não tem esse eixo. A parede de relatório é a da GTX 1060; em CPU os ms ficam null. Não há número medido neste repositório. Detalhe em [`experiments/README.md`](experiments/README.md).
+`smoke_train.py` dá **um** passo num batch aleatório. `train_tinystories.py` dá um passo curto no corpus de desenvolvimento. `smoke_wikitext.py` só carrega os splits oficiais. `wall_latency.py` na GTX 1060 (`--device cuda`) cronometra o forward com experts fora de `B` fora da VRAM; sem CUDA ele não inventa ms. A loss impressa desses smokes é de peso inicial ou de um passo curto. A grade overnight (`run_lambda_grid.py`) treina `λ ∈ {0, 0,5, 1}` no WikiText-2, uma semente por vez (`eval.seeds`, partida 3), e grava log em `outputs/wikitext/seed-<n>/`. `run_baseline.py` treina o LM denso (modelo 3) no mesmo WikiText-2 e nas mesmas sementes, sem roteador e sem residência: não é o MoE com `λ=0`. `run_holdout_eval.py` lê os quatro checkpoints da semente 0 e, em `valid` e `test`, calcula a perplexidade de token (mesmo BPE, mesmo bloco, `seq_len` do checkpoint) e grava `swaps`, `bytes_moved` e a parede p50/p95. No MoE, sem retreinar, `prepare_split_budget` repete a medida em `eval.B_mult` e o mesmo forward entra na curva. O denso não tem esse eixo. A parede de relatório é a da GTX 1060; em CPU os ms ficam null. `run_model_comparison.py` nomeia os quatro braços. O modelo 2 é o mesmo MoE `λ=0` e o mesmo LRU (`ResidencyEmulator`), no checkpoint `seed-0`; a tabela é a fatia de relatório contra o denso e contra `λ>0`. Sem esses JSON os números ficam `pending`. Não há segunda política de eviction e não há número medido neste repositório. Detalhe em [`experiments/README.md`](experiments/README.md).
 
 | Pasta | Para que serve |
 | --- | --- |
 | `src/` | Modelo, roteador, emulador de níveis e loss |
-| `experiments/` | Fumaça, treino WikiText-2 por λ e por semente, baseline denso, perplexidade de hold-out (semente 0) e dose–resposta de `B` (sem retreino). |
+| `experiments/` | Fumaça, treino WikiText-2 por λ e por semente, baseline denso, perplexidade de hold-out (semente 0), dose–resposta de `B` (sem retreino) e a tabela dos quatro braços. |
 | `configs/` | Orçamento, tabela de custos e hiperparâmetros |
 | `notebooks/` | Exploração |
 | `results/` | Tabelas e curvas, quando existirem |
