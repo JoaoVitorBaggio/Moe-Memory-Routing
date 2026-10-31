@@ -8,7 +8,7 @@ Hiperparâmetros versionados do experimento mínimo.
 
 ## Como ler
 
-- `model.*` — arquitetura fina: `d_model`, `n_layers` (todo FFN é MoE), `n_heads` (`d_head = 64`), `expert_hidden` (`d_ff`; o comentário no YAML aponta 768 se faltar capacidade), `max_seq_len` (256, knob até 512), tokenizer GPT-2, fp32. `tie_embeddings` amarra o `lm_head` para o total ficar na faixa 10–50 M.
+- `model.*` — arquitetura fina: `d_model`, `n_layers` (todo FFN é MoE), `n_heads` (`d_head = 64`), `expert_hidden` (`d_ff`; o comentário no YAML aponta 768 se faltar capacidade), `max_seq_len` (256, knob até 512), tokenizer GPT-2, fp32. `tie_embeddings` amarra o `lm_head` para o total ficar na faixa 10–50 M. O LM denso não tem chave própria: a largura do FFN é `k * expert_hidden` (ativos ≈ tronco + `k`·expert). A corrida é `experiments/run_baseline.py` e não usa `loss.lambda_grid`.
 - `memory.warm_slots` — vagas do nível morno para os três níveis existirem. Não é eixo do protocolo; o teto que se varre é `B` no quente.
 - `c.*` — custo de **acesso** por nível. `w(a,b)` **não** aparece no YAML: é `|c(b)−c(a)|` e muda com `c`.
 - `loss.beta` — fixo pequeno (ordem Switch); valor `0.01` é partida, não busca.
