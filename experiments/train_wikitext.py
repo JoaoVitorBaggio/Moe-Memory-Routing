@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Treino de um λ no WikiText-2 (split oficial train). Não avalia hold-out.
 
+A perplexidade de valid/test é ``experiments/run_holdout_eval.py``.
+
 Reusa ``prepare_train`` e ``train_one_batch``. fp32, sem ``torch.compile``.
 λ, β, E, k, B e a arquitetura saem de ``configs/default.yaml``; este script
 não os redefine. A loss do jsonl é de treino, não perplexidade de relatório.
@@ -629,7 +631,7 @@ def _finish(state: dict[str, Any], args: argparse.Namespace, log_path: Path) -> 
         f"tokens={cursor['tokens']}  λ={state['lambda']}  β={state['config'].loss.beta}"
     )
     print(f"log={log_path}")
-    print("perplexidade de valid/test e dose–resposta não entram neste script")
+    print("perplexidade de valid/test: experiments/run_holdout_eval.py. Dose–resposta não entra aqui.")
 
 
 def _last_step(log_path: Path) -> dict[str, Any] | None:

@@ -36,7 +36,7 @@ python3 experiments/train_wikitext.py --lambda 0 --steps 2 --device cpu --seq-le
 
 `--epochs` (padrão 1) e `--steps` são exclusivos. `--seed` mexe no peso e na ordem dos blocos; o loader em si não embaralha. Retomar é repetir o mesmo comando: o cursor de sequências está em `outputs/wikitext/lambda-<λ>/checkpoint.pt` (gitignored), junto com `train.jsonl`. A grade escreve `outputs/wikitext/summary.json` e, por λ, `train.log`. Trocar `--seq-len` ou `--seed` no meio pede outro `--work-dir`.
 
-O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas). Não é perplexidade de valid/test nem dose–resposta. O LM denso tem corrida própria, abaixo. LRU como adversário separado e o hold-out ainda não têm script de relatório. O emulador já aceita trocar o teto (`set_hot_budget`, 0,5× / 1× / 2×) para quando essa avaliação entrar.
+O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas). Não é perplexidade de valid/test nem dose–resposta. O LM denso tem corrida própria, abaixo. O hold-out está na seção seguinte. LRU como adversário separado (modelo 2) ainda não tem script. O emulador já aceita trocar o teto (`set_hot_budget`, 0,5× / 1× / 2×) para quando a dose–resposta entrar.
 
 ## Baseline denso (WikiText-2)
 
@@ -66,6 +66,50 @@ TinyStories fica como caminho opcional de desenvolvimento. Não é o padrão. O 
 python3 experiments/train_baseline.py --corpus TinyStories --steps 2 --device cpu
 ```
 
-A entrega cai em `outputs/baseline/wikitext/` (gitignored): `summary.json` do runner, mais `done.json`, `train.jsonl`, `train.log` e `checkpoint.pt`. O resumo usa os mesmos campos da grade para comparar: `status`, `steps`, `tokens`, `last_total`, `last_task`. `lambda` fica `null`. TinyStories, se rodar, vai para `outputs/baseline/tinystories/` e não mistura com esse resumo. Hold-out e dose–resposta continuam fora.
+A entrega cai em `outputs/baseline/wikitext/` (gitignored): `summary.json` do runner, mais `done.json`, `train.jsonl`, `train.log` e `checkpoint.pt`. O resumo usa os mesmos campos da grade para comparar: `status`, `steps`, `tokens`, `last_total`, `last_task`. `lambda` fica `null`. TinyStories, se rodar, vai para `outputs/baseline/tinystories/` e não mistura com esse resumo. O hold-out lê esse `checkpoint.pt`; dose–resposta continua fora.
+
+## Hold-out (perplexidade no WikiText-2)
+
+O treino não calcula este número. `experiments/run_holdout_eval.py` lê os checkpoints já gravados e mede a perplexidade de token nos splits oficiais `valid` (seleção) e `test` (relatório). Não treina. Se `corpus.paths.WikiText-2` for um diretório local, não baixa o Hub. Não varre dose–resposta.
+
+O empacotamento é o do treino (BPE do GPT-2, `<|endoftext|>` entre artigos, blocos não sobrepostos via `iter_documents` / `iter_token_ids` / `iter_batches`, sem o embaralhamento da época). O tensor de treino bate com `load_train_sequences`. `seq_len` sai do checkpoint — 256 na corrida da GTX 1060, que é `model.max_seq_len`. A CE é `task_cross_entropy`: a posição `t` prediz `t+1`, e o resto que não fecha `seq_len` cai fora, como no treino. Perplexidade = `exp` dessa média por token previsto. Bits por byte = soma da NLL em nats / `ln(2)` / bytes UTF-8 do decode dos tokens que entraram na conta, sem o EOT. Não é a perplexidade por palavra dos papers de WikiText: o denominador aqui é token, para os quatro checkpoints serem comparáveis entre si e com a `L_task`.
+
+O denso e o MoE não compartilham classe. `λ=0` continua sendo MoE (roteador, emulador, `β`). O roteador vê `ℓ(e)`. Cada split recomeça o LRU no `B` do YAML — não reaproveita o cache do fim do treino, nem o do outro split — e dá um passo de emulador a cada batch gravado no checkpoint. `--batch-size` só parte o forward; o grão do LRU não muda, então a PPL do MoE não depende desse microbatch. Os pesos ficam no device do forward, em fp32. Isto não mede parede: o offload físico continua em `wall_latency.py`, e o script não chama `sync_physical` (não mexe no memmap frio do treino).
+
+`smoke_eval.py` segue sendo um forward de init aleatória. Não é este número.
+
+Na máquina do treino (Fedora, GTX 1060), a partir da raiz, com os quatro checkpoints no lugar:
+
+```bash
+python3 experiments/run_holdout_eval.py --device cuda
+```
+
+Layout esperado (gitignored):
+
+```text
+outputs/baseline/wikitext/checkpoint.pt
+outputs/wikitext/lambda-0/checkpoint.pt
+outputs/wikitext/lambda-0.5/checkpoint.pt
+outputs/wikitext/lambda-1/checkpoint.pt
+```
+
+Um checkpoint só:
+
+```bash
+python3 experiments/run_holdout_eval.py --checkpoint outputs/wikitext/lambda-0.5/checkpoint.pt --device cuda
+python3 experiments/run_holdout_eval.py --work-dir outputs/baseline/wikitext --device cuda
+```
+
+Um corte de CPU que não é o relatório (código de saída 7). Não mexe no `seq_len` do checkpoint — isso trocaria o contexto do treino:
+
+```bash
+python3 experiments/run_holdout_eval.py --checkpoint outputs/wikitext/lambda-0/checkpoint.pt --max-batches 1 --device cpu
+```
+
+Se o forward estourar a VRAM, repetir com `--batch-size 1` (ou 2). No MoE a PPL continua a do batch gravado no checkpoint. fp32, batch modesto: o treino operacional é 4, e o eval usa esse valor salvo a grade ter descido para 2 ou 1.
+
+A saída é `holdout.json` ao lado de cada `checkpoint.pt` e, na descoberta dos quatro, `outputs/holdout/summary.json` (os dois gitignored, como o resto de `outputs/`). O JSON traz, por split, perplexidade, `nll_nats`, bits por byte, tokens previstos, sequências, o `seq_len`, o batch do checkpoint e os passos/cursor do treino. `protocol_complete` fica verdadeiro quando valid e test inteiros rodaram no `seq_len` do checkpoint. Checkpoint ausente na descoberta, `--max-batches` ou `--seq-len` diferente do treino: código 7, e o JSON não é número de relatório.
+
+Dose–resposta (`0,5×B`, `2×B`, `set_hot_budget`), o LRU como modelo 2, três sementes e a correlação proxy×emulador continuam fora.
 
 Não colocar saída grande nesta pasta. Métrica pequena vai para `results/`; checkpoint e dataset ficam de fora do Git. O home frio do MoE cai em `outputs/` (gitignored). O baseline denso não grava memmap de expert.

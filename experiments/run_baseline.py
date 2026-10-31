@@ -4,7 +4,8 @@
 Não percorre ``λ``. O modelo não tem roteador nem residência: não é o
 ponto ``λ=0`` da grade MoE. β, E, k, B e a tabela ``c`` continuam no YAML
 para o MoE; aqui só entram na largura do FFN (``k * expert_hidden``) e
-no tronco compartilhado. Hold-out e dose–resposta ficam de fora.
+no tronco compartilhado. O hold-out é ``experiments/run_holdout_eval.py``.
+Dose–resposta fica de fora.
 
 Se o filho morrer por OOM, loss não finita, crash ou kill -9, a próxima
 tentativa desce o batch (4 → 2 → 1) e retoma o checkpoint. SIGTERM/SIGINT

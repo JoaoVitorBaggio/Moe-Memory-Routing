@@ -36,9 +36,10 @@ python3 experiments/train_tinystories.py --steps 1
 python3 experiments/smoke_wikitext.py
 python3 experiments/run_lambda_grid.py --device cuda
 python3 experiments/run_baseline.py --device cuda
+python3 experiments/run_holdout_eval.py --device cuda
 python3 -m pytest
 ```
 
-`smoke_train.py` instancia modelo, emulador e loss a partir de `configs/default.yaml`, faz um forward e um backward num batch aleatório e dá um passo de AdamW. `smoke_eval.py` faz um forward com a agregação de inferência (`sum`). `--lambda 0` usa o ponto da grade sem `C_mem`. O device padrão é `cpu`. `train_tinystories.py` e `smoke_wikitext.py` leem os corpora do YAML.
+`smoke_train.py` instancia modelo, emulador e loss a partir de `configs/default.yaml`, faz um forward e um backward num batch aleatório e dá um passo de AdamW. `smoke_eval.py` faz um forward com a agregação de inferência (`sum`) em init aleatória — não é o hold-out. `--lambda 0` usa o ponto da grade sem `C_mem`. O device padrão é `cpu`. `train_tinystories.py` e `smoke_wikitext.py` leem os corpora do YAML.
 
-A loss impressa é de init aleatória ou de um passo curto. Não é perplexidade de relatório, não é latência de parede. A corrida overnight de WikiText-2, um λ por vez, e o baseline denso (WikiText-2, sem o caminho de memória) estão em [`experiments/README.md`](../experiments/README.md).
+A loss impressa do smoke é de init aleatória ou de um passo curto. Não é perplexidade de relatório, não é latência de parede. A corrida overnight de WikiText-2, um λ por vez, o baseline denso e o hold-out (`run_holdout_eval.py`, valid e test, mesma CE do treino) estão em [`experiments/README.md`](../experiments/README.md).

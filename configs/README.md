@@ -14,6 +14,7 @@ Hiperparâmetros versionados do experimento mínimo.
 - `loss.beta` — fixo pequeno (ordem Switch); valor `0.01` é partida, não busca.
 - `loss.lambda_grid` — treinos separados; **não** é Optuna/HPO no mínimo. A corrida overnight que percorre essa lista está em [`experiments/README.md`](../experiments/README.md). Passo, batch e época não entram neste YAML: são knobs operacionais do script.
 - `loss.train_topk_agg` / `infer_topk_agg` — média ponderada no treino, soma na inferência. É o proxy de custo, não a mistura do hidden.
+- `eval.B_mult` / `eval.seeds` — dose–resposta e sementes, ainda sem script. A perplexidade no `B` de referência (valid e test) é `experiments/run_holdout_eval.py`.
 - `nvme: 20` — escolhido entre 20 e 30; recalibrar na 1060 se a dose–resposta sair flat/invertida.
 - Granularidade do emulador e `router_sees_level` estão aqui para o código não divergir do doc.
 - `corpus.active` — `dev` ou `report`. O nome em si (`TinyStories`, `WikiText-2`) também vale na API.
