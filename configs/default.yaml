@@ -44,7 +44,7 @@ loss:
 # Dose–resposta (avaliação; não HPO)
 eval:
   B_mult: [0.5, 1.0, 2.0]
-  seeds: 3
+  seeds: 3                # run_lambda_grid e run_baseline: sementes 0 .. seeds-1
   holdout_note: "WikiText-2 splits oficiais; TinyStories só dev"
 
 hardware_ref:

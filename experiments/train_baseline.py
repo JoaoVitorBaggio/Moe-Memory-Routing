@@ -11,9 +11,13 @@ de desenvolvimento: o contexto padrão desse caminho é o ``smoke.seq_len``,
 como ``train_tinystories.py``. No WikiText-2 o contexto é
 ``model.max_seq_len`` (256 no YAML).
 
-Padrão operacional, o mesmo da grade overnight: semente 0, uma época,
-batch 4. A grade densa (``run_baseline.py``) desce 4 → 2 → 1 se a VRAM
-estourar. ``--steps`` corta em passos e é exclusivo com ``--epochs``.
+Padrão operacional, o mesmo da grade overnight: uma época, batch 4.
+``--seed`` padrão é 0. Quem percorre ``eval.seeds`` é
+``experiments/run_baseline.py``, um processo por semente. O
+``--work-dir`` padrão é ``outputs/baseline/<corpus>/seed-<n>/``. Se a
+semente 0 já tiver artefato na raiz antiga e ``seed-0`` ainda estiver
+vazio, o padrão continua na raiz. A grade densa desce 4 → 2 → 1 se a
+VRAM estourar. ``--steps`` corta em passos e é exclusivo com ``--epochs``.
 
 Uso, a partir da raiz::
 
@@ -51,6 +55,7 @@ from moe_memory.dense import (
     prepare_baseline,
     train_dense_step,
 )
+from seed_layout import resolve_baseline_seed_dir
 from train_wikitext import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_CHECKPOINT_EVERY,
@@ -180,7 +185,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.checkpoint_every < 1:
         die(EXIT_USAGE, "--checkpoint-every precisa ser >= 1")
     if args.work_dir is None:
-        args.work_dir = default_work_dir(args.corpus)
+        args.work_dir = resolve_baseline_seed_dir(default_work_dir(args.corpus), args.seed)
     return args
 
 

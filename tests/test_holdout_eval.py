@@ -230,12 +230,15 @@ def test_discovered_paths_are_the_four_training_work_dirs():
     ]
     assert list(config.loss.lambda_grid) == [0.0, 0.5, 1.0]
     by_name = {family.name: family for family in families}
-    assert by_name["baseline"].path == train_baseline.default_work_dir("WikiText-2") / "checkpoint.pt"
+    direct_baseline = train_baseline.parse_args([])
+    assert by_name["baseline"].path == direct_baseline.work_dir / "checkpoint.pt"
+    assert direct_baseline.work_dir.name in {"seed-0", "wikitext"}
     assert by_name["baseline"].expected_kind == "dense"
     assert by_name["baseline"].expected_lambda is None
     for value, name in ((0.0, "lambda-0"), (0.5, "lambda-0.5"), (1.0, "lambda-1")):
         args = train_wikitext.parse_args(["--lambda", str(value)])
         assert by_name[name].path == args.work_dir / "checkpoint.pt"
+        assert args.work_dir.parent.name in {"seed-0", "wikitext"}
         assert by_name[name].expected_kind == "moe"
         assert by_name[name].expected_lambda == value
 

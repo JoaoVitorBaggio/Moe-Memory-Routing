@@ -113,7 +113,8 @@ def test_defaults_are_wikitext_not_a_lambda_run():
     assert args.seed == 0
     assert args.seq_len is None
     assert args.device == "cpu"
-    assert args.work_dir == ROOT / "outputs" / "baseline" / "wikitext"
+    wiki_root = ROOT / "outputs" / "baseline" / "wikitext"
+    assert args.work_dir == train_baseline.resolve_baseline_seed_dir(wiki_root, 0)
     with pytest.raises(SystemExit):
         train_baseline.parse_args(["--steps", "1", "--epochs", "1"])
 
@@ -124,15 +125,18 @@ def test_defaults_are_wikitext_not_a_lambda_run():
     request = run_baseline.resolve_request(config, runner)
     assert request.corpus_name == "WikiText-2"
     assert request.seq_len == 256
+    assert request.seed is None
+    assert request.seeds == [0, 1, 2]
     assert request.work_dir == ROOT / "outputs" / "baseline" / "wikitext"
     assert not train_baseline.losses_are_finite({"total": float("nan"), "task": 1.0, "grad_norm": 1.0})
 
 
 def test_tinystories_is_optional_and_uses_the_smoke_length():
+    stories = ROOT / "outputs" / "baseline" / "tinystories"
     args = train_baseline.parse_args(["--corpus", "TinyStories"])
-    assert args.work_dir == ROOT / "outputs" / "baseline" / "tinystories"
+    assert args.work_dir == train_baseline.resolve_baseline_seed_dir(stories, 0)
     dev = train_baseline.parse_args(["--corpus", "dev"])
-    assert dev.work_dir.name == "tinystories"
+    assert dev.work_dir == train_baseline.resolve_baseline_seed_dir(stories, 0)
     config = load_config()
     assert train_baseline.canonical_corpus(config, "dev") == "TinyStories"
     assert train_baseline.default_seq_len(config, "TinyStories") == config.smoke.seq_len
@@ -437,14 +441,17 @@ def test_runner_shrinks_after_oom_and_writes_a_comparable_summary(tmp_path: Path
         calls.append(command)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         batch = int(command[command.index("--batch-size") + 1])
+        work = Path(command[command.index("--work-dir") + 1])
         if len(calls) == 1:
             log_path.write_text("out of memory\n", encoding="utf-8")
             return train_baseline.EXIT_OOM
         assert batch == 2
+        assert work == output / "seed-0"
+        assert command[command.index("--seed") + 1] == "0"
         assert "--lambda" not in command
         assert "train_baseline.py" in command[1]
         assert command[command.index("--corpus") + 1] == "WikiText-2"
-        (output / "done.json").write_text(
+        (work / "done.json").write_text(
             json.dumps(_dense_done(batch_size=batch)),
             encoding="utf-8",
         )
