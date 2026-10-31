@@ -32,6 +32,8 @@ O denso iguala parâmetros *ativos* ≈ tronco + `k`·tamanho_do_expert (`k=2`),
 
 O modelo 2 existe para mostrar que o ganho **não** é “qualquer MoE” nem “qualquer offload”.
 
+No código de hoje o modelo 1 e o modelo 2 são o mesmo caminho. `ResidencyEmulator` já é LRU; não há segunda classe de eviction, e o denso não é o MoE com `λ=0`. O modelo 2 é a fatia de relatório desse adversário: o hold-out no `B` de referência e a dose (`0,5×` / `1×` / `2×`, `set_hot_budget` depois do LRU fresco) quando o JSON da curva existir, confrontados com o modelo 3 e com o modelo 4. O empacotamento está em `experiments/run_model_comparison.py`. Ele não treina de novo e não mede sozinho: copia o checkpoint da semente 0 (`seed-0/lambda-0`, ou o layout antigo se for o único arquivo) para as duas linhas. Célula `pending` não é número.
+
 ## Dose–resposta (ponto 6 do feedback)
 
 - Eixo de dose na **avaliação:** orçamento `B` ∈ {0,5×, 1×, 2×}.
@@ -59,11 +61,11 @@ O que o script fecha: a mesma tokenização e os mesmos blocos não sobrepostos 
 
 O treino da grade e do baseline denso percorre `eval.seeds` (sementes `0 .. N-1`, partida 3). O hold-out automático lê a semente 0.
 
-A dose–resposta entra no mesmo script, sem retreino: depois da perplexidade no `B` do YAML, cada checkpoint MoE dessa descoberta (ou o arquivo pedido na linha de comando) repete `valid` e `test` em `eval.B_mult` (`0,5×`, `1×`, `2×`). O teto é só `prepare_split_budget`: cada split recomeça o LRU nesse `B` e `set_hot_budget` aplica o multiplicador sem apagar o carimbo dessa reatribuição. O denso não tem teto quente: a curva dele é `n/a`. A tabela é `dose_response.md`, ao lado de `dose_response.json`.
+A dose–resposta entra no mesmo script, sem retreino: depois da perplexidade no `B` do YAML, cada checkpoint MoE dessa descoberta (ou o arquivo pedido na linha de comando) repete `valid` e `test` em `eval.B_mult` (`0,5×`, `1×`, `2×`). O teto é só `prepare_split_budget`: cada split recomeça o LRU nesse `B` e `set_hot_budget` aplica o multiplicador sem apagar o carimbo dessa reatribuição. O denso não tem teto quente: a curva dele é `n/a`. A tabela é `dose_response.md`, ao lado de `dose_response.json`. O resumo marca `dose_response: true` quando a curva de algum MoE foi medida.
 
 Cada split, no `B` de referência e em cada ponto de `eval.B_mult`, grava `swaps`, `bytes_moved` e a parede do forward (`wall_p50_ms`, `wall_p95_ms`). A parede de relatório exige a **GTX 1060 com CUDA**, o batch do checkpoint e o split inteiro (`wall_report_grade`). Em CPU `wall_clock` fica `unavailable` e os milissegundos ficam null. Não há número medido neste repositório.
 
-O que continua de fora: o LRU como modelo 2, agregar as sementes além da 0 e a correlação proxy×emulador. `smoke_eval.py` não é este número.
+O modelo 2 não é uma corrida a mais: é o rótulo do mesmo `λ=0` da semente 0, empacotado por `experiments/run_model_comparison.py`. Agregar as outras sementes e a correlação proxy×emulador continuam fora. `smoke_eval.py` não é este número.
 
 ## Latência de parede
 

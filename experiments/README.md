@@ -51,7 +51,7 @@ outputs/wikitext/lambda-<λ>/
 
 Se os dois tiverem artefato, vale `seed-0`. Para migrar à mão, mover `lambda-<λ>/` para `seed-0/lambda-<λ>/` antes de relançar. `train_wikitext.py` sozinho continua sendo um job (`--seed`, padrão 0); o diretório padrão segue a mesma regra.
 
-O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas). Não é perplexidade de valid/test nem dose–resposta. O LM denso tem corrida própria, abaixo. O hold-out, que também varre `eval.B_mult` sem retreinar, está na seção seguinte. LRU como adversário separado (modelo 2) ainda não tem script. O teto da avaliação muda por `set_hot_budget` (0,5× / 1× / 2×).
+O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas). Não é perplexidade de valid/test nem dose–resposta. O LM denso tem corrida própria, abaixo. O hold-out, que também varre `eval.B_mult` sem retreinar, está na seção seguinte. O modelo 2 não tem treino próprio: é o mesmo `λ=0` e o mesmo LRU, nomeado em `run_model_comparison.py`. O teto da avaliação muda por `set_hot_budget` (0,5× / 1× / 2×).
 
 ## Baseline denso (WikiText-2)
 
@@ -138,8 +138,30 @@ Se o forward estourar a VRAM, repetir com `--batch-size 1` (ou 2). No MoE a PPL 
 
 A saída é `holdout.json` ao lado de cada `checkpoint.pt` e, na descoberta dos quatro, `outputs/holdout/summary.json` (os dois gitignored, como o resto de `outputs/`). O JSON traz, por split, perplexidade, `nll_nats`, bits por byte, tokens previstos, sequências, o `seq_len`, o batch do checkpoint, os passos/cursor do treino, `swaps`, `bytes_moved` e o bloco de parede. `wall_note` diz quando o ms é coluna de relatório. `protocol_complete` fica verdadeiro quando valid e test inteiros rodaram no `seq_len` do checkpoint — isso não exige GPU. Checkpoint ausente na descoberta, `--max-batches` ou `--seq-len` diferente do treino: código 7, e o JSON não é número de relatório. `wall_report_grade` falso também tira a parede da tabela.
 
-A dose–resposta usa o mesmo `score_split`, nos mesmos checkpoints (semente 0 na descoberta; o layout antigo entra só quando é o único `checkpoint.pt`). O `B` do YAML continua sendo a medição de referência (`splits` no `holdout.json`). Para cada multiplicador, `prepare_split_budget` recomeça o LRU nesse `B` e `set_hot_budget` aplica o teto sem apagar o carimbo — não há outro `reset` antes do forward, não há `--b-mult` e o script não atribui `hot_slots` à parte. A parede e os bytes desse passe são os do mesmo forward. O denso não entra na curva: `status` `n/a`. A saída extra é `dose_response.json` e `dose_response.md` (a tabela markdown é PPL por multiplicador; o JSON do split também traz a parede), ao lado do `summary.json` na descoberta, ou ao lado do `holdout.json` quando se pede um checkpoint só sem `--summary`.
+A dose–resposta usa o mesmo `score_split`, nos mesmos checkpoints (semente 0 na descoberta; o layout antigo entra só quando é o único `checkpoint.pt`). O `B` do YAML continua sendo a medição de referência (`splits` no `holdout.json`). Para cada multiplicador, `prepare_split_budget` recomeça o LRU nesse `B` e `set_hot_budget` aplica o teto sem apagar o carimbo — não há outro `reset` antes do forward, não há `--b-mult` e o script não atribui `hot_slots` à parte. A parede e os bytes desse passe são os do mesmo forward. O denso não entra na curva: `status` `n/a`. A saída extra é `dose_response.json` e `dose_response.md` (a tabela markdown é PPL por multiplicador; o JSON do split também traz a parede), ao lado do `summary.json` na descoberta, ou ao lado do `holdout.json` quando se pede um checkpoint só sem `--summary`. `dose_response: true` no resumo significa que a curva foi medida.
 
-O LRU como modelo 2, agregar as sementes além da 0 e a correlação proxy×emulador continuam fora. O treino das sementes é a grade e o baseline (`eval.seeds`).
+Agregar as sementes além da 0 e a correlação proxy×emulador continuam fora deste script. O treino das sementes é a grade e o baseline (`eval.seeds`). O rótulo do modelo 2 não é uma passagem a mais: é o mesmo `λ=0` da semente 0.
+
+## Comparação dos quatro braços (modelo 2)
+
+`experiments/run_model_comparison.py` não treina e não mede. Ele nomeia os braços do protocolo e escreve o schema da tabela que o relatório preenche. O checkpoint é o da semente 0, o mesmo que `run_holdout_eval.py` descobre (`prefer_checkpoint`: `seed-0` se o arquivo existir, senão o layout antigo, senão o caminho `seed-0`).
+
+| id | Rótulo | Código hoje |
+| --- | --- | --- |
+| model1 | MoE top-k λ=0 | `MemoryMoEModel` + `ResidencyEmulator` (LRU), `seed-0/lambda-0` |
+| model2 | MoE + LRU adversary | o mesmo código, o mesmo checkpoint e o mesmo λ=0 do model1 |
+| model3 | Denso | `DenseLanguageModel`; não é o MoE com λ=0; `seed-0` do baseline |
+| model4 | MoE λ>0 | o mesmo emulador LRU; o treino é que usa λ>0, também na semente 0 |
+
+Não há segunda política de eviction. O modelo 2 é a fatia de relatório: hold-out no `B` de referência e a curva de dose, contra o denso e contra λ>0. Os números do modelo 2 são cópia do modelo 1 (`metrics_shared_with`). Célula `pending` não é número.
+
+O hold-out entra se `outputs/holdout/summary.json` existir (ou `--holdout`). `dose_response: true` nesse resumo significa que cada corrida já traz o bloco `dose_response` (o denso é `n/a`). O arquivo irmão é `outputs/holdout/dose_response.json`, protocolo `wikitext-2-dose-response`, residência `lru_reset_per_split_then_set_hot_budget`, método `reset_lru_at_yaml_b_then_set_hot_budget`. O teto de cada `multiplier` tem de bater com `MemoryConfig.scaled_hot_slots`. Este script não chama `set_hot_budget` e não retreina.
+
+```bash
+python3 experiments/run_model_comparison.py --manifest-only
+python3 experiments/run_model_comparison.py --holdout outputs/holdout/summary.json
+```
+
+A saída padrão é `outputs/comparison/comparison.json` (gitignored). `metrics_complete` só fica verdadeiro quando o hold-out de referência e a curva de dose preencheram a tabela. Enquanto isso, o JSON não é número de relatório.
 
 Não colocar saída grande nesta pasta. Métrica pequena vai para `results/`; checkpoint e dataset ficam de fora do Git. O home frio do MoE cai em `outputs/` (gitignored). O baseline denso não grava memmap de expert.

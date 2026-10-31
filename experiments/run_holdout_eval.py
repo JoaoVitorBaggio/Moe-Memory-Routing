@@ -45,8 +45,10 @@ entram na descoberta e não são agregadas.
 
 O número de relatório da parede é na GTX 1060 (``wall_report_grade``).
 
-Fora deste script: LRU como modelo 2, agregar as sementes além da 0,
-correlação proxy×emulador. ``smoke_eval.py`` continua sendo init
+Fora deste script: agregar as sementes além da 0 e a correlação
+proxy×emulador. O rótulo de modelo 2 é o mesmo checkpoint ``λ=0`` da
+semente 0 (não uma segunda política); quem empacota a comparação é
+``run_model_comparison.py``. ``smoke_eval.py`` continua sendo init
 aleatória.
 
 Uso, a partir da raiz, na GTX 1060::
@@ -146,8 +148,9 @@ METRIC_NOTE = (
     "O denso é n/a nesse eixo. A descoberta é a semente 0. wall_p50_ms e "
     "wall_p95_ms são o forward; sem CUDA ficam null (wall_clock=unavailable). "
     "Número de relatório da parede: GTX 1060, batch do checkpoint, split "
-    "inteiro (wall_report_grade). Modelo 2, agregar sementes além da 0 e a "
-    "correlação proxy×emulador ficam fora."
+    "inteiro (wall_report_grade). Agregar sementes além da 0 e a "
+    "correlação proxy×emulador ficam fora. O rótulo de modelo 2 é o mesmo "
+    "λ=0 da semente 0, empacotado por run_model_comparison.py."
 )
 
 WALL_CLOCK_CUDA = "cuda"

@@ -54,7 +54,7 @@ Não é objetivo do núcleo emular N placas distintas como backends separados.
 | `k` / `E` | `k = 2`; **`E = 32`** |
 | `B` | 25% dos experts (**8/32**; artificial; tudo cabe na 1060) |
 | `λ` / `β` | Grade `{0, 0,5, 1}`, um treino por `λ`; `β` fixo pequeno na ordem do Switch (exato em aberto) |
-| Baseline-2 | LRU de experts apenas |
+| Baseline-2 | LRU de experts apenas — o mesmo `ResidencyEmulator` do `λ=0`, não uma segunda política |
 | Denso | tronco + `k`·expert |
 | Roteador | Linear/MLP + **`ℓ(e)` como entrada** (ciente de memória); não tool-calls |
 | Emulador | Granularidade **por batch** |
