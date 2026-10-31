@@ -21,6 +21,7 @@ from moe_memory.comparison import (
     POLICY_CLASS,
     SPLITS,
     TABLE_COLUMNS,
+    WALL_FIELDS,
     ComparisonError,
     build_comparison,
     lambda_tag,
@@ -440,6 +441,37 @@ def test_dose_rejects_a_second_policy_a_dense_budget_and_a_conflicting_number():
     assert twin["status"] == "conflict"
 
 
+def test_wall_fields_from_holdout_are_copied_and_cpu_null_stays_filled():
+    holdout = _full_holdout()
+    for run in holdout["runs"]:
+        for split in run["splits"].values():
+            split.update(
+                wall_p50_ms=None,
+                wall_p95_ms=None,
+                wall_clock="unavailable",
+                wall_samples=0,
+                wall_report_grade=False,
+                wall_gpu=None,
+                wall_forward_batch=2,
+            )
+    payload = build_comparison(load_config(), holdout=holdout)
+    row = _rows(payload, "model2", split="valid", B_mult=1.0)[0]
+    twin = _rows(payload, "model1", split="valid", B_mult=1.0)[0]
+    assert row["status"] == "filled"
+    assert row["perplexity"] == twin["perplexity"]
+    assert row["wall_p50_ms"] is None
+    assert row["wall_p95_ms"] is None
+    assert row["wall_clock"] == "unavailable"
+    assert row["wall_samples"] == 0
+    assert row["wall_report_grade"] is False
+    assert row["wall_forward_batch"] == 2
+    assert twin["wall_clock"] == row["wall_clock"]
+    dense = _rows(payload, "model3", split="test", B_mult=1.0)[0]
+    assert dense["status"] == "filled"
+    assert dense["swaps"] is None
+    assert dense["wall_clock"] == "unavailable"
+
+
 def test_seed0_checkpoint_wins_and_legacy_is_only_a_fallback(tmp_path: Path):
     outputs = tmp_path / "outputs"
     legacy = outputs / "wikitext" / "lambda-0" / "checkpoint.pt"
@@ -462,6 +494,7 @@ def test_manifest_families_match_holdout_discovery(tmp_path: Path):
     for value in config.loss.lambda_grid:
         assert lambda_tag(value) == holdout.lambda_tag(value)
     assert holdout.REPORT_SPLITS == SPLITS
+    assert holdout.WALL_FIELDS == WALL_FIELDS
     discovered = holdout.discover_families(tmp_path, config)
     payload = build_comparison(config, outputs=tmp_path)
     by_family = {}

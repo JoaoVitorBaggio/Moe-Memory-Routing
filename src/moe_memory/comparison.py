@@ -84,6 +84,18 @@ METRIC_KEYS = (
     "c_mem",
 )
 
+# O #9 grava estes campos no mesmo split do hold-out e da curva.
+# Ausência ou null (CPU) não impede a perplexidade e não é outra política.
+WALL_FIELDS = (
+    "wall_p50_ms",
+    "wall_p95_ms",
+    "wall_clock",
+    "wall_samples",
+    "wall_report_grade",
+    "wall_gpu",
+    "wall_forward_batch",
+)
+
 TABLE_COLUMNS = (
     "arm_id",
     "protocol_number",
@@ -109,6 +121,7 @@ TABLE_COLUMNS = (
     "filled_from",
     "status",
     *METRIC_KEYS,
+    *WALL_FIELDS,
 )
 
 # Nomes que pareceriam uma corrida própria do modelo 2. O protocolo não tem.
@@ -889,6 +902,7 @@ def _metrics_of(split_row: dict[str, Any], model_kind: str) -> tuple[str, dict[s
         if isinstance(value, float) and not math.isfinite(value):
             raise ComparisonError(f"{key} não é finito")
         metrics[key] = value
+    metrics.update(_wall_of(split_row))
     if model_kind == "dense":
         for key in _RESIDENCY_METRIC_KEYS:
             if metrics[key] is not None:
@@ -1071,8 +1085,48 @@ def _overlap_agrees(
     return True
 
 
+def _wall_of(split_row: dict[str, Any]) -> dict[str, Any]:
+    """Copia a parede do #9. Campo ausente vira null. Não entra no status filled."""
+
+    wall: dict[str, Any] = {}
+    for key in ("wall_p50_ms", "wall_p95_ms"):
+        wall[key] = _optional_number(split_row, key)
+    clock = split_row.get("wall_clock", None)
+    if clock is not None and not isinstance(clock, str):
+        raise ComparisonError("wall_clock não é texto")
+    wall["wall_clock"] = clock
+    samples = split_row.get("wall_samples", None)
+    if samples is not None and (isinstance(samples, bool) or not isinstance(samples, int)):
+        raise ComparisonError("wall_samples não é inteiro")
+    wall["wall_samples"] = samples
+    grade = split_row.get("wall_report_grade", None)
+    if grade is not None and not isinstance(grade, bool):
+        raise ComparisonError("wall_report_grade não é booleano")
+    wall["wall_report_grade"] = grade
+    gpu = split_row.get("wall_gpu", None)
+    if gpu is not None and not isinstance(gpu, str):
+        raise ComparisonError("wall_gpu não é texto")
+    wall["wall_gpu"] = gpu
+    forward = split_row.get("wall_forward_batch", None)
+    if forward is not None and (isinstance(forward, bool) or not isinstance(forward, int)):
+        raise ComparisonError("wall_forward_batch não é inteiro")
+    wall["wall_forward_batch"] = forward
+    return wall
+
+
+def _optional_number(split_row: dict[str, Any], key: str) -> int | float | None:
+    if key not in split_row or split_row[key] is None:
+        return None
+    value = split_row[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ComparisonError(f"{key} não é numérico")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ComparisonError(f"{key} não é finito")
+    return value
+
+
 def _metrics_of_row(row: dict[str, Any]) -> dict[str, Any]:
-    return {key: row[key] for key in METRIC_KEYS}
+    return {key: row[key] for key in (*METRIC_KEYS, *WALL_FIELDS)}
 
 
 def _values_close(left: Any, right: Any) -> bool:
@@ -1100,7 +1154,7 @@ def _with(
 
 
 def _blank_metrics() -> dict[str, Any]:
-    return {key: None for key in METRIC_KEYS}
+    return {key: None for key in (*METRIC_KEYS, *WALL_FIELDS)}
 
 
 def _row(data: dict[str, Any]) -> dict[str, Any]:

@@ -153,7 +153,7 @@ Agregar as sementes além da 0 e a correlação proxy×emulador continuam fora d
 | model3 | Denso | `DenseLanguageModel`; não é o MoE com λ=0; `seed-0` do baseline |
 | model4 | MoE λ>0 | o mesmo emulador LRU; o treino é que usa λ>0, também na semente 0 |
 
-Não há segunda política de eviction. O modelo 2 é a fatia de relatório: hold-out no `B` de referência e a curva de dose, contra o denso e contra λ>0. Os números do modelo 2 são cópia do modelo 1 (`metrics_shared_with`). Célula `pending` não é número.
+Não há segunda política de eviction. O modelo 2 é a fatia de relatório: hold-out no `B` de referência e a curva de dose, contra o denso e contra λ>0. Os números do modelo 2 são cópia do modelo 1 (`metrics_shared_with`). Se o JSON do hold-out trouxer a parede (`wall_p50_ms`, `wall_p95_ms`, `wall_clock` e o restante do bloco), a tabela copia esses campos; em CPU eles ficam null e a perplexidade continua válida. Célula `pending` não é número.
 
 O hold-out entra se `outputs/holdout/summary.json` existir (ou `--holdout`). `dose_response: true` nesse resumo significa que cada corrida já traz o bloco `dose_response` (o denso é `n/a`). O arquivo irmão é `outputs/holdout/dose_response.json`, protocolo `wikitext-2-dose-response`, residência `lru_reset_per_split_then_set_hot_budget`, método `reset_lru_at_yaml_b_then_set_hot_budget`. O teto de cada `multiplier` tem de bater com `MemoryConfig.scaled_hot_slots`. Este script não chama `set_hot_budget` e não retreina.
 
