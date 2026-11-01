@@ -46,9 +46,11 @@ datasets/
 **/*.arrow
 **/*.parquet
 
-# Artefatos grandes de resultado. O README da pasta continua versionado.
+# Artefatos grandes de resultado. Resumos Markdown entram no Git.
+# Checkpoint, array e log continuam de fora; o bruto fica em outputs/.
 results/**
-!results/README.md
+!results/
+!results/*.md
 *.npy
 *.npz
 *.bin

@@ -1,6 +1,6 @@
 # Referências
 
-Obras-âncora do blueprint. Não há número de desempenho deste projeto.
+Obras-âncora do blueprint. Esta página não traz métrica. A loss de treino da semente 0 está em [`results/`](../results/README.md); hold-out e parede seguem sem número.
 
 ## Shazeer et al., 2017
 
