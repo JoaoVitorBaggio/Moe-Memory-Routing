@@ -1,6 +1,6 @@
 # Protocolo experimental
 
-Nada disto foi executado. Onde faltar número, o texto diz **a definir**.
+A loss de treino da semente 0 no WikiText-2 está em [`results/`](../results/README.md). O resto deste protocolo (hold-out, sementes 1 e 2, dose–resposta, parede, modelo 2 como linha de relatório, proxy×emulador) não tem número medido neste repositório. Onde faltar número, o texto diz **a definir**.
 
 ## Experimento mínimo
 
@@ -55,7 +55,7 @@ Seeds: **3** no mínimo. Hold-out: no WikiText-2, **splits oficiais** valid (sel
 
 ## Script de perplexidade
 
-`experiments/run_holdout_eval.py` calcula a perplexidade de token do WikiText-2 em `valid` e `test` a partir dos checkpoints já treinados. Não há número medido neste repositório: a corrida é na GTX 1060, fora daqui.
+`experiments/run_holdout_eval.py` calcula a perplexidade de token do WikiText-2 em `valid` e `test` a partir dos checkpoints já treinados. Não há perplexidade de hold-out medida neste repositório: a corrida é na GTX 1060, fora daqui. A loss de treino da semente 0 não entra nesta tabela.
 
 O que o script fecha: a mesma tokenização e os mesmos blocos não sobrepostos do treino (`seq_len` do checkpoint; 256 na entrega), a CE `task_cross_entropy`, a classe densa no baseline e a classe MoE nos três λ (inclusive 0). O LRU do MoE recomeça em cada split, no `B` de referência, um passo por batch do checkpoint. `--batch-size` só corta o forward.
 
@@ -63,15 +63,15 @@ O treino da grade e do baseline denso percorre `eval.seeds` (sementes `0 .. N-1`
 
 A dose–resposta entra no mesmo script, sem retreino: depois da perplexidade no `B` do YAML, cada checkpoint MoE dessa descoberta (ou o arquivo pedido na linha de comando) repete `valid` e `test` em `eval.B_mult` (`0,5×`, `1×`, `2×`). O teto é só `prepare_split_budget`: cada split recomeça o LRU nesse `B` e `set_hot_budget` aplica o multiplicador sem apagar o carimbo dessa reatribuição. O denso não tem teto quente: a curva dele é `n/a`. A tabela é `dose_response.md`, ao lado de `dose_response.json`. O resumo marca `dose_response: true` quando a curva de algum MoE foi medida.
 
-Cada split, no `B` de referência e em cada ponto de `eval.B_mult`, grava `swaps`, `bytes_moved` e a parede do forward (`wall_p50_ms`, `wall_p95_ms`). A parede de relatório exige a **GTX 1060 com CUDA**, o batch do checkpoint e o split inteiro (`wall_report_grade`). Em CPU `wall_clock` fica `unavailable` e os milissegundos ficam null. Não há número medido neste repositório.
+Cada split, no `B` de referência e em cada ponto de `eval.B_mult`, grava `swaps`, `bytes_moved` e a parede do forward (`wall_p50_ms`, `wall_p95_ms`). A parede de relatório exige a **GTX 1060 com CUDA**, o batch do checkpoint e o split inteiro (`wall_report_grade`). Em CPU `wall_clock` fica `unavailable` e os milissegundos ficam null. Não há bytes, trocas nem parede medidos neste repositório.
 
-O modelo 2 não é uma corrida a mais: é o rótulo do mesmo `λ=0` da semente 0, empacotado por `experiments/run_model_comparison.py`. Agregar as outras sementes continua fora. A correlação proxy×emulador e a curva de entropia não treinam: `experiments/plot_proxy_emulator.py` lê o `train.jsonl` em `outputs/wikitext/seed-*/lambda-*/` e, no layout antigo da semente 0, em `outputs/wikitext/lambda-*/`. Não há número medido neste repositório. `smoke_eval.py` não é este número.
+O modelo 2 não é uma corrida a mais: é o rótulo do mesmo `λ=0` da semente 0, empacotado por `experiments/run_model_comparison.py`. Agregar as outras sementes continua fora. A correlação proxy×emulador e a curva de entropia não treinam: `experiments/plot_proxy_emulator.py` lê o `train.jsonl` em `outputs/wikitext/seed-*/lambda-*/` e, no layout antigo da semente 0, em `outputs/wikitext/lambda-*/`. Não há correlação proxy×emulador nem curva de entropia medida neste repositório. `smoke_eval.py` não é este número.
 
 ## Latência de parede
 
 Decidido: reportar latência de parede na GTX 1060 no protocolo mínimo, porque `B` é fixo (não randomizado no treino). O emulador continua com bytes/trocas; a parede é coluna adicional.
 
-O caminho físico (quente na VRAM, morno em CPU pinned, frio em memmap) está em `src/moe_memory/residency.py`. O cronômetro está em [plano-de-hardware.md](plano-de-hardware.md). O hold-out grava p50/p95, `swaps` e `bytes_moved` no JSON, também em cada ponto da curva de `B`. Não há número medido neste repositório: a coluna de relatório sai na GTX 1060. CPU deixa os ms null.
+O caminho físico (quente na VRAM, morno em CPU pinned, frio em memmap) está em `src/moe_memory/residency.py`. O cronômetro está em [plano-de-hardware.md](plano-de-hardware.md). O hold-out grava p50/p95, `swaps` e `bytes_moved` no JSON, também em cada ponto da curva de `B`. Não há latência de parede medida neste repositório: a coluna de relatório sai na GTX 1060. CPU deixa os ms null.
 
 ## Ablações úteis (depois do mínimo)
 
