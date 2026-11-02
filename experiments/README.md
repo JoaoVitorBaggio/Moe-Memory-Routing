@@ -51,7 +51,7 @@ outputs/wikitext/lambda-<λ>/
 
 Se os dois tiverem artefato, vale `seed-0`. Para migrar à mão, mover `lambda-<λ>/` para `seed-0/lambda-<λ>/` antes de relançar. `train_wikitext.py` sozinho continua sendo um job (`--seed`, padrão 0); o diretório padrão segue a mesma regra.
 
-O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas, entropia, bytes). Não é perplexidade de valid/test nem dose–resposta. A semente 0 já copiada para o Git (loss do último passo, 2026-10-31) está em [`results/lambda_grid_wikitext_2026-10-31.md`](../results/lambda_grid_wikitext_2026-10-31.md). As outras sementes não. A correlação desse proxy com o emulador está na seção seguinte. O LM denso tem corrida própria. O hold-out, que também varre `eval.B_mult` sem retreinar, vem depois. O modelo 2 não tem treino próprio: é o mesmo `λ=0` e o mesmo LRU, nomeado em `run_model_comparison.py`. O teto da avaliação muda por `set_hot_budget` (0,5× / 1× / 2×).
+O jsonl é traço de treino (`L`, `L_task`, `C_mem`, `|grad|`, trocas, entropia, bytes). Não é perplexidade de valid/test nem dose–resposta. A semente 0 (loss do último passo, 2026-10-31) está em [`results/lambda_grid_wikitext_2026-10-31.md`](../results/lambda_grid_wikitext_2026-10-31.md). As sementes 1 e 2 estão em [`results/lambda_grid_seeds_wikitext_2026-11-02.md`](../results/lambda_grid_seeds_wikitext_2026-11-02.md). A correlação desse proxy com o emulador está na seção seguinte. O LM denso tem corrida própria. O hold-out, que também varre `eval.B_mult` sem retreinar, vem depois. O modelo 2 não tem treino próprio: é o mesmo `λ=0` e o mesmo LRU, nomeado em `run_model_comparison.py`. O teto da avaliação muda por `set_hot_budget` (0,5× / 1× / 2×).
 
 ## Correlação proxy × emulador
 
@@ -92,7 +92,7 @@ Se o mesmo λ da semente 0 existir nos dois, entra `seed-0/lambda-<λ>/train.jso
 | `entropy.svg` | Entropia do roteador por passo |
 | `c_mem_vs_bytes.svg`, `c_mem_vs_swaps.svg` | Um ponto por passo; a legenda traz r e ρ |
 
-O SVG abre no navegador. Não há matplotlib. Linha que não é passo MoE fica de fora: evento `nonfinite`, JSON quebrado, e o baseline denso (`c_mem` null, sem `swaps`). Se não sobrar passo utilizável, o processo sai com código 1 e não inventa correlação. Série constante (variância zero) deixa Pearson e Spearman nulos, com o motivo no JSON. Não há correlação nem figura de entropia medida neste repositório: isto só lê o log da GTX 1060. A loss de treino da semente 0 está em [`results/`](../results/README.md).
+O SVG abre no navegador. Não há matplotlib. Linha que não é passo MoE fica de fora: evento `nonfinite`, JSON quebrado, e o baseline denso (`c_mem` null, sem `swaps`). Se não sobrar passo utilizável, o processo sai com código 1 e não inventa correlação. Série constante (variância zero) deixa Pearson e Spearman nulos, com o motivo no JSON. O resumo numérico da corrida de 2026-11-02 (Pearson, Spearman, entropia inicial e final) está em [`results/proxy_emulator_wikitext_2026-11-02.md`](../results/proxy_emulator_wikitext_2026-11-02.md). O SVG continua em `outputs/` e não entra no Git. A loss de treino da semente 0 está em [`results/`](../results/README.md).
 
 ## Baseline denso (WikiText-2)
 
@@ -122,7 +122,7 @@ TinyStories fica como caminho opcional de desenvolvimento. Não é o padrão. O 
 python3 experiments/train_baseline.py --corpus TinyStories --steps 2 --device cpu
 ```
 
-A entrega cai em `outputs/baseline/wikitext/` (gitignored). O `summary.json` fica na raiz e lista cada semente (`per_seed`: status, `work_dirs`, `logs`). O job em si fica em `seed-<n>/` (`done.json`, `train.jsonl`, `train.log`, `checkpoint.pt`). O resumo usa os mesmos campos da grade para comparar: `status`, `steps`, `tokens`, `last_total`, `last_task`. `lambda` fica `null`. TinyStories, se rodar, vai para `outputs/baseline/tinystories/seed-<n>/` e não mistura com o resumo do WikiText-2. O hold-out lê o checkpoint da semente 0. Na curva de `B` esse checkpoint entra como `n/a`: o denso não tem teto quente. A loss de treino da semente 0 (2026-10-31) está em [`results/baseline_dense_wikitext_2026-10-31.md`](../results/baseline_dense_wikitext_2026-10-31.md). Hold-out desse checkpoint continua sem número aqui.
+A entrega cai em `outputs/baseline/wikitext/` (gitignored). O `summary.json` fica na raiz e lista cada semente (`per_seed`: status, `work_dirs`, `logs`). O job em si fica em `seed-<n>/` (`done.json`, `train.jsonl`, `train.log`, `checkpoint.pt`). O resumo usa os mesmos campos da grade para comparar: `status`, `steps`, `tokens`, `last_total`, `last_task`. `lambda` fica `null`. TinyStories, se rodar, vai para `outputs/baseline/tinystories/seed-<n>/` e não mistura com o resumo do WikiText-2. O hold-out lê o checkpoint da semente 0. Na curva de `B` esse checkpoint entra como `n/a`: o denso não tem teto quente. A loss de treino da semente 0 (2026-10-31) está em [`results/baseline_dense_wikitext_2026-10-31.md`](../results/baseline_dense_wikitext_2026-10-31.md). O hold-out desse checkpoint (semente 0, 2026-11-02) está em [`results/holdout_wikitext_2026-11-02.md`](../results/holdout_wikitext_2026-11-02.md).
 
 Semente 0 já gravada solta na raiz (`checkpoint.pt` ou `done.json` ao lado do `summary.json`, sem `seed-0/`) continua nessa raiz. Se `seed-0/` também tiver artefato, vale `seed-0`. Para migrar à mão, mover o checkpoint, o `done.json` e os logs para `seed-0/` antes de relançar. `train_baseline.py` sozinho é um job; o `--work-dir` padrão já é `seed-<n>/`, com a mesma exceção da raiz antiga.
 
@@ -181,7 +181,7 @@ A saída é `holdout.json` ao lado de cada `checkpoint.pt` e, na descoberta dos 
 
 A dose–resposta usa o mesmo `score_split`, nos mesmos checkpoints (semente 0 na descoberta; o layout antigo entra só quando é o único `checkpoint.pt`). O `B` do YAML continua sendo a medição de referência (`splits` no `holdout.json`). Para cada multiplicador, `prepare_split_budget` recomeça o LRU nesse `B` e `set_hot_budget` aplica o teto sem apagar o carimbo — não há outro `reset` antes do forward, não há `--b-mult` e o script não atribui `hot_slots` à parte. A parede e os bytes desse passe são os do mesmo forward. O denso não entra na curva: `status` `n/a`. A saída extra é `dose_response.json` e `dose_response.md` (a tabela markdown é PPL por multiplicador; o JSON do split também traz a parede), ao lado do `summary.json` na descoberta, ou ao lado do `holdout.json` quando se pede um checkpoint só sem `--summary`. `dose_response: true` no resumo significa que a curva foi medida.
 
-Agregar as sementes além da 0 continua fora deste script. O treino das sementes é a grade e o baseline (`eval.seeds`). O rótulo do modelo 2 não é uma passagem a mais: é o mesmo `λ=0` da semente 0. A correlação proxy×emulador é o pós-processamento acima; o número da corrida ainda não está neste repositório.
+Agregar as sementes além da 0 continua fora deste script. O treino das sementes é a grade e o baseline (`eval.seeds`). O rótulo do modelo 2 não é uma passagem a mais: é o mesmo `λ=0` da semente 0. A correlação proxy×emulador é o pós-processamento acima; o número da corrida de 2026-11-02 está em [`results/proxy_emulator_wikitext_2026-11-02.md`](../results/proxy_emulator_wikitext_2026-11-02.md).
 
 ## Comparação dos quatro braços (modelo 2)
 
@@ -203,6 +203,6 @@ python3 experiments/run_model_comparison.py --manifest-only
 python3 experiments/run_model_comparison.py --holdout outputs/holdout/summary.json
 ```
 
-A saída padrão é `outputs/comparison/comparison.json` (gitignored). `metrics_complete` só fica verdadeiro quando o hold-out de referência e a curva de dose preencheram a tabela. Enquanto isso, o JSON não é número de relatório.
+A saída padrão é `outputs/comparison/comparison.json` (gitignored). `metrics_complete` só fica verdadeiro quando o hold-out de referência e a curva de dose preencheram a tabela. Célula `pending` não é número. O preenchimento de 2026-11-02 (`metrics_complete` verdadeiro; nenhuma célula `pending`) está em [`results/model_comparison_wikitext_2026-11-02.md`](../results/model_comparison_wikitext_2026-11-02.md).
 
 Não colocar saída grande nesta pasta. Métrica pequena vai para `results/`; checkpoint e dataset ficam de fora do Git. O home frio do MoE cai em `outputs/` (gitignored). O baseline denso não grava memmap de expert.
