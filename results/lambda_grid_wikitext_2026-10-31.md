@@ -8,7 +8,7 @@ Fonte local (gitignored, fora deste commit): `outputs/wikitext/summary.json` e `
 
 Uma época do split `train` do WikiText-2. 2336 passos, batch 4, `seq_len` 256, β = 0.01, fp32, CUDA. Código de saída 0 em λ = 0.0, 0.5 e 1.0. Tokens do treino: 2391808 nos três λ.
 
-O protocolo pede no mínimo 3 sementes (`eval.seeds`). Aqui só a semente 0. As sementes 1 e 2 não têm corrida registrada.
+O protocolo pede no mínimo 3 sementes (`eval.seeds`). Esta nota é só a semente 0. As sementes 1 e 2 estão em [lambda_grid_seeds_wikitext_2026-11-02.md](lambda_grid_seeds_wikitext_2026-11-02.md). O JSON de 2026-11-02 repete os `last_task` / `last_total` da tabela abaixo.
 
 ## Loss de treino no último passo
 
@@ -22,13 +22,12 @@ O protocolo pede no mínimo 3 sementes (`eval.seeds`). Aqui só a semente 0. As 
 
 Ponto decimal como no JSON. Com λ = 0.0, `last_total` e `last_task` não coincidem: β continua na loss. Esta nota não separa `C_mem` e o termo de balanço.
 
-## Sem medição neste repositório
+## Medido depois, na semente 0 (2026-11-02)
 
-- Perplexidade de hold-out (`valid`, `test`).
-- Sementes 1 e 2.
-- Dose–resposta de `B` (0,5× / 1× / 2×).
-- Latência de parede (p50/p95), `swaps` e `bytes_moved` de relatório.
-- Modelo 2 (LRU) como linha própria. No código ele reusa o checkpoint λ = 0; a tabela de comparação não foi preenchida.
-- Correlação proxy×emulador e curva de entropia do roteador.
+- Perplexidade de hold-out (`valid`, `test`), parede p50/p95, `swaps` e `bytes_moved`: [holdout_wikitext_2026-11-02.md](holdout_wikitext_2026-11-02.md).
+- Dose–resposta de `B` (0,5× / 1× / 2×): [dose_response_wikitext_2026-11-02.md](dose_response_wikitext_2026-11-02.md).
+- Sementes 1 e 2, loss do último passo: [lambda_grid_seeds_wikitext_2026-11-02.md](lambda_grid_seeds_wikitext_2026-11-02.md).
+- Modelo 2 (LRU) como linha de relatório. No código ele reusa o checkpoint λ = 0; a tabela foi preenchida em [model_comparison_wikitext_2026-11-02.md](model_comparison_wikitext_2026-11-02.md).
+- Correlação proxy×emulador e entropia do roteador: [proxy_emulator_wikitext_2026-11-02.md](proxy_emulator_wikitext_2026-11-02.md).
 
-O LM denso da mesma data está em [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md). Ele fica fora desta tabela: é outra corrida, sem roteador.
+Hold-out das sementes 1 e 2 continua sem número. O LM denso da mesma data está em [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md). Ele fica fora desta tabela: é outra corrida, sem roteador.
