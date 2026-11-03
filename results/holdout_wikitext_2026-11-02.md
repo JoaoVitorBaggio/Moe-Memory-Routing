@@ -25,5 +25,5 @@ A curva 0,5× / 1× / 2× está em [dose_response_wikitext_2026-11-02.md](dose_r
 
 ## Ainda sem número
 
-- Hold-out das sementes 1 e 2. O script de descoberta lê a semente 0.
+- PPL de hold-out do LM denso nas sementes 1 e 2. O hold-out MoE dessas sementes está em [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). O script de descoberta continua lendo a semente 0.
 - `swaps` e `bytes_moved` do denso. O JSON traz null, não zero.
