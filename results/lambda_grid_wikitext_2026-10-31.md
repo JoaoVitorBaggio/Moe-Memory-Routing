@@ -30,4 +30,4 @@ Ponto decimal como no JSON. Com λ = 0.0, `last_total` e `last_task` não coinci
 - Modelo 2 (LRU) como linha de relatório. No código ele reusa o checkpoint λ = 0; a tabela foi preenchida em [model_comparison_wikitext_2026-11-02.md](model_comparison_wikitext_2026-11-02.md).
 - Correlação proxy×emulador e entropia do roteador: [proxy_emulator_wikitext_2026-11-02.md](proxy_emulator_wikitext_2026-11-02.md).
 
-Hold-out das sementes 1 e 2 continua sem número. O LM denso da mesma data está em [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md). Ele fica fora desta tabela: é outra corrida, sem roteador.
+Hold-out do MoE nas sementes 1 e 2 está em [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). O LM denso da semente 0 está em [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md). A loss do denso nas sementes 1 e 2 está em [baseline_dense_wikitext_2026-11-03.md](baseline_dense_wikitext_2026-11-03.md). O denso fica fora desta tabela: é outra corrida, sem roteador. A PPL de hold-out do denso nas sementes 1 e 2 continua sem número.

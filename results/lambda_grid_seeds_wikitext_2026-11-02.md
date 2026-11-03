@@ -30,5 +30,4 @@ Com λ = 0.0, `last_total` e `last_task` não coincidem: β continua na loss. Es
 
 ## Ainda sem número
 
-- Hold-out (`valid`, `test`), parede, `swaps` e `bytes_moved` das sementes 1 e 2.
-- Loss de treino do LM denso nas sementes 1 e 2. Este JSON só traz a grade MoE. O denso da semente 0 segue em [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md).
+- PPL de hold-out do LM denso nas sementes 1 e 2. O hold-out do MoE dessas sementes está em [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). A loss do denso está em [baseline_dense_wikitext_2026-11-03.md](baseline_dense_wikitext_2026-11-03.md). O denso da semente 0 segue em [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md). Este JSON da grade só traz o MoE.

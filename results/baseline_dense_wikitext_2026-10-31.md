@@ -30,5 +30,5 @@ Ponto decimal como no JSON. Isso é loss de treino.
 
 ## Ainda sem número
 
-- Sementes 1 e 2 do denso. O protocolo pede no mínimo 3. O JSON de 2026-11-02 só traz a grade MoE.
+- PPL de hold-out do denso nas sementes 1 e 2. A loss de treino dessas sementes está em [baseline_dense_wikitext_2026-11-03.md](baseline_dense_wikitext_2026-11-03.md). O protocolo pede no mínimo 3; a loss das três já está nas notas.
 - Correlação proxy×emulador. O denso não entra (`c_mem` ausente). O resumo do MoE está em [proxy_emulator_wikitext_2026-11-02.md](proxy_emulator_wikitext_2026-11-02.md).
