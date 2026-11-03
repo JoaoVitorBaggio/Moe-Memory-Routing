@@ -28,6 +28,6 @@ No 1×B a perplexidade copiada (2 casas) é a do hold-out:
 | model4 | lambda-0.5 | 333.99 | 337.37 |
 | model4 | lambda-1 | 326.59 | 330.18 |
 
-Nas linhas MoE de 1×B, `filled_from` é `holdout+dose_response`. No denso de 1×B, `filled_from` é `holdout`. Nas pontas 0,5× e 2× do MoE, `filled_from` é `dose_response`. A PPL dessas pontas está em [dose_response_wikitext_2026-11-02.md](dose_response_wikitext_2026-11-02.md). Parede, `swaps` e bytes do `B` de referência estão em [holdout_wikitext_2026-11-02.md](holdout_wikitext_2026-11-02.md).
+Nas linhas MoE de 1×B, `filled_from` é `holdout+dose_response`. No denso de 1×B, `filled_from` é `holdout`. Nas pontas 0,5× e 2× do MoE, `filled_from` é `dose_response`. PPL, parede, `swaps` e `bytes_moved` da curva (0,5×, 1× e 2×) estão em [dose_response_wikitext_2026-11-02.md](dose_response_wikitext_2026-11-02.md). Parede, `swaps` e bytes do forward de referência, feito antes da curva, estão em [holdout_wikitext_2026-11-02.md](holdout_wikitext_2026-11-02.md). A parede de 1×B na dose pode diferir um pouco desse hold-out; a PPL em 2 casas coincide.
 
 Nas células `filled`, `wall_report_grade` é verdadeiro, `wall_clock` é cuda, `wall_gpu` é NVIDIA GeForce GTX 1060 6GB e `wall_forward_batch` é 4.
