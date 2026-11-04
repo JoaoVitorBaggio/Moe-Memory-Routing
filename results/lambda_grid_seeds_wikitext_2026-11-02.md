@@ -28,6 +28,6 @@ A semente 2 com λ = 0.0 tem 2583 passos. As outras oito linhas têm 2336. Époc
 
 Com λ = 0.0, `last_total` e `last_task` não coincidem: β continua na loss. Esta nota não separa `C_mem` e o termo de balanço.
 
-## Ainda sem número
+## Medido depois
 
-- PPL de hold-out do LM denso nas sementes 1 e 2. O hold-out do MoE dessas sementes está em [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). A loss do denso está em [baseline_dense_wikitext_2026-11-03.md](baseline_dense_wikitext_2026-11-03.md). O denso da semente 0 segue em [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md). Este JSON da grade só traz o MoE.
+- PPL de hold-out do LM denso nas sementes 1 e 2: seção LM denso de [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). O hold-out do MoE dessas sementes está na mesma nota. A loss do denso está em [baseline_dense_wikitext_2026-11-03.md](baseline_dense_wikitext_2026-11-03.md). O denso da semente 0 segue em [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md). Este JSON da grade só traz o MoE.

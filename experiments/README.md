@@ -92,7 +92,7 @@ Se o mesmo λ da semente 0 existir nos dois, entra `seed-0/lambda-<λ>/train.jso
 | `entropy.svg` | Entropia do roteador por passo |
 | `c_mem_vs_bytes.svg`, `c_mem_vs_swaps.svg` | Um ponto por passo; a legenda traz r e ρ |
 
-O SVG abre no navegador. Não há matplotlib. Linha que não é passo MoE fica de fora: evento `nonfinite`, JSON quebrado, e o baseline denso (`c_mem` null, sem `swaps`). Se não sobrar passo utilizável, o processo sai com código 1 e não inventa correlação. Série constante (variância zero) deixa Pearson e Spearman nulos, com o motivo no JSON. O resumo numérico da corrida de 2026-11-02 (Pearson, Spearman, entropia inicial e final) está em [`results/proxy_emulator_wikitext_2026-11-02.md`](../results/proxy_emulator_wikitext_2026-11-02.md). O SVG continua em `outputs/` e não entra no Git. A loss de treino da semente 0 está em [`results/`](../results/README.md).
+O SVG abre no navegador. Não há matplotlib. Linha que não é passo MoE fica de fora: evento `nonfinite`, JSON quebrado, e o baseline denso (`c_mem` null, sem `swaps`). Se não sobrar passo utilizável, o processo sai com código 1 e não inventa correlação. Série constante (variância zero) deixa Pearson e Spearman nulos, com o motivo no JSON. O resumo numérico da corrida de 2026-11-02 (Pearson, Spearman, entropia inicial e final) está em [`results/proxy_emulator_wikitext_2026-11-02.md`](../results/proxy_emulator_wikitext_2026-11-02.md). As três figuras dessa corrida estão copiadas em `results/` (`entropy.svg`, `c_mem_vs_bytes.svg`, `c_mem_vs_swaps.svg`). O script continua gravando a saída em `outputs/proxy-emulator/`, que o Git ignora. A loss de treino da semente 0 está em [`results/`](../results/README.md).
 
 ## Baseline denso (WikiText-2)
 

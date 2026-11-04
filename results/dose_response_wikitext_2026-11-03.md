@@ -8,7 +8,7 @@ A semente 0 está em [dose_response_wikitext_2026-11-02.md](dose_response_wikite
 
 ## Como a curva foi feita
 
-Perplexidade de hold-out (exp da task cross-entropy) no checkpoint já treinado. Cada split recomeça o LRU no `B` do YAML (reset) e o multiplicador entra por `set_hot_budget`, que reatribui pelo LRU fresco e não apaga o carimbo de uso. Não há reset entre `set_hot_budget` e o forward. O bloco `splits` do hold-out continua sendo a medição de referência, nesse mesmo `B`, feita antes da curva. 1×B, quando está em `eval.B_mult`, repete esse `B` por `set_hot_budget`. O LM denso não tem teto quente: `n/a` em todo o eixo de `B`. Nesta corrida o JSON só lista os três MoE de cada semente. O denso das sementes 1 e 2 não foi medido; a linha `n/a` registra isso, não um forward. Cada split da curva é o `score_split` do hold-out, então o JSON traz `swaps`, `bytes_moved` e a parede desse forward (`wall_p50_ms`, `wall_p95_ms`). Em CPU os ms ficam null. O teto não tem outro caminho: `prepare_split_budget`, sem atribuir `hot_slots` à parte.
+Perplexidade de hold-out (exp da task cross-entropy) no checkpoint já treinado. Cada split recomeça o LRU no `B` do YAML (reset) e o multiplicador entra por `set_hot_budget`, que reatribui pelo LRU fresco e não apaga o carimbo de uso. Não há reset entre `set_hot_budget` e o forward. O bloco `splits` do hold-out continua sendo a medição de referência, nesse mesmo `B`, feita antes da curva. 1×B, quando está em `eval.B_mult`, repete esse `B` por `set_hot_budget`. O LM denso não tem teto quente: `n/a` em todo o eixo de `B`. Nesta corrida o JSON só lista os três MoE de cada semente. A linha `n/a` não é um forward desta curva: o denso não entra em `set_hot_budget`. O hold-out do denso nessas sementes foi medido à parte e o `dose_response.status` continua `n/a`: seção LM denso de [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). Cada split da curva é o `score_split` do hold-out, então o JSON traz `swaps`, `bytes_moved` e a parede desse forward (`wall_p50_ms`, `wall_p95_ms`). Em CPU os ms ficam null. O teto não tem outro caminho: `prepare_split_budget`, sem atribuir `hot_slots` à parte.
 
 `B` de referência (YAML): 8 vagas quentes. 0,5×B = 4 vagas, 1×B = 8, 2×B = 16.
 
@@ -80,7 +80,3 @@ A PPL em 1×B, com 2 casas, coincide com o hold-out de referência em [holdout_w
 - semente 2, λ = 1: 43.90 / 44.56 contra 44.55 / 44.46
 
 `swaps` e `bytes_moved` em 1×B coincidem com os inteiros do hold-out.
-
-## Ainda sem número
-
-- Curva de `B` do LM denso nas sementes 1 e 2. O denso não tem teto quente; o hold-out dele nessas sementes também não foi medido.
