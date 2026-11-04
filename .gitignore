@@ -46,11 +46,13 @@ datasets/
 **/*.arrow
 **/*.parquet
 
-# Artefatos grandes de resultado. Resumos Markdown entram no Git.
-# Checkpoint, array e log continuam de fora; o bruto fica em outputs/.
+# Artefatos grandes de resultado. Resumos Markdown e as figuras SVG
+# publicadas entram no Git. Checkpoint, array, CSV e log continuam de fora;
+# o bruto fica em outputs/.
 results/**
 !results/
 !results/*.md
+!results/*.svg
 *.npy
 *.npz
 *.bin

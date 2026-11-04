@@ -25,6 +25,6 @@ No denso, `L_task` e `L_total` coincidem no último passo. Ponto decimal como no
 
 A semente 0, na nota de 31/10, tem `last_task` = `last_total` = 5.889871597290039, 2336 passos, batch 4, saída 0.
 
-## Ainda sem número
+## Medido depois, no mesmo dia (~22:47–22:49)
 
-- PPL de hold-out (`valid`, `test`) do denso nas sementes 1 e 2. Parede, `swaps` e `bytes_moved` desse hold-out também. O hold-out medido em 2026-11-03 é só a grade MoE: [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). Na curva de `B`, o denso entra como `n/a`: [dose_response_wikitext_2026-11-03.md](dose_response_wikitext_2026-11-03.md). O hold-out do denso na semente 0 está em [holdout_wikitext_2026-11-02.md](holdout_wikitext_2026-11-02.md) (`test` 339.05; `swaps` e `bytes_moved` null).
+Hold-out do denso em `valid` e `test`, na mesma máquina (Fedora, GTX 1060 6GB, `device` cuda, `wall_report_grade` verdadeiro). PPL em 2 casas: semente 1, `valid` 317.19 e `test` 318.16; semente 2, `valid` 327.86 e `test` 327.09. `swaps` e `bytes_moved` são null. A dose continua `n/a`. A parede p50/p95 e o batch do forward estão na seção LM denso de [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). A semente 1 mede o forward em batch 2; a semente 2, em batch 4. Esses ms não se comparam. A semente 0 continua em [holdout_wikitext_2026-11-02.md](holdout_wikitext_2026-11-02.md) (`test` 339.05; `swaps` e `bytes_moved` null). Na curva de `B`, o denso segue `n/a`: [dose_response_wikitext_2026-11-03.md](dose_response_wikitext_2026-11-03.md).

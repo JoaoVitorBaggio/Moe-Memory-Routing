@@ -1,6 +1,6 @@
 # Protocolo experimental
 
-Os números medidos no WikiText-2 estão em [`results/`](../results/README.md): loss de treino das três sementes da grade, hold-out e parede da semente 0, dose–resposta de `B`, proxy×emulador e a tabela dos quatro braços (2026-11-02). Hold-out das sementes 1 e 2, e a loss do denso nessas sementes, ainda não têm número. Onde faltar número, o texto diz **a definir**.
+Os números medidos no WikiText-2 estão em [`results/`](../results/README.md). O índice dessa pasta lista o que já tem número e o que ainda falta. Onde faltar número, o texto diz **a definir**.
 
 ## Experimento mínimo
 

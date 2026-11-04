@@ -23,7 +23,6 @@ PPL e ms com 2 casas. `swaps` e `bytes_moved` inteiros, como no JSON.
 
 A curva 0,5× / 1× / 2× está em [dose_response_wikitext_2026-11-02.md](dose_response_wikitext_2026-11-02.md). 1×B é este mesmo `B`. A loss de treino da semente 0 continua em [lambda_grid_wikitext_2026-10-31.md](lambda_grid_wikitext_2026-10-31.md) e [baseline_dense_wikitext_2026-10-31.md](baseline_dense_wikitext_2026-10-31.md).
 
-## Ainda sem número
+## Medido depois
 
-- PPL de hold-out do LM denso nas sementes 1 e 2. O hold-out MoE dessas sementes está em [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). O script de descoberta continua lendo a semente 0.
-- `swaps` e `bytes_moved` do denso. O JSON traz null, não zero.
+- Hold-out do LM denso nas sementes 1 e 2 (`valid`, `test`, parede, `swaps` e `bytes_moved` null, não zero): seção LM denso de [holdout_wikitext_2026-11-03.md](holdout_wikitext_2026-11-03.md). O hold-out MoE dessas sementes está na mesma nota. O script de descoberta continua lendo a semente 0. Nesta semente 0, `swaps` e `bytes_moved` do denso também são null.
