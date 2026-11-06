@@ -8,9 +8,11 @@
 
 lstm_predictor:
   vocab_size: 50257
-  n_experts: 32
+  # Gate do OLMoE (16 camadas, 64 experts). Não é o E=32 nem as 4
+  # camadas do experimento em configs/default.yaml.
+  n_experts: 64
   k: 2
-  n_model_layers: 4
+  n_model_layers: 16
   embedding_dim: 128
   hidden_size: 256
   n_lstm_layers: 2

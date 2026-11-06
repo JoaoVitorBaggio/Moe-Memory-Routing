@@ -20,7 +20,7 @@ A contagem da arquitetura fechada é 47.939.328 parâmetros (~48 M): a embedding
 | `moe_memory/loss.py` | CE do próximo token, `C_mem` e o balanceamento do Switch. Treino: média ponderada dos top-2. Inferência: soma dos top-2. Essa diferença é do **custo**, não do hidden (“custo real de acesso”). |
 | `moe_memory/config.py` | Lê e valida o YAML. |
 | `moe_memory/smoke.py` | Um passo de treino. O atalho sintético não lê corpus. |
-| `moe_memory/lstm_predictor.py` | Segundo modelo. LSTM de 2 camadas, hidden 256, embedding 128. Prevê experts por token e destila um roteador congelado. Não entra na loss do experimento atual. |
+| `moe_memory/lstm_predictor.py` | Segundo modelo. LSTM de 2 camadas, hidden 256, embedding 128. Para cada token prevê o vetor de 64 experts de cada uma das 16 camadas e destila o roteador congelado. Não entra na loss do experimento atual. |
 | `moe_memory/lookahead.py` | Folga do prefetch: RAM→GPU = 1 camada, SSD→GPU = 3 ou 4. |
 | `moe_memory/expert_manager.py` | Busca experts pelo score, com home em RAM ou SSD. |
 | `moe_memory/sida_budget.py` | Gancho de comparação no mesmo `k`. Não mede. A comparação com o SiDA continua suspensa. |

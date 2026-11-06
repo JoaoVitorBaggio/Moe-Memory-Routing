@@ -1,9 +1,10 @@
 """Preditor LSTM do segundo modelo.
 
-Uma LSTM de duas camadas lê o token e devolve um logit por expert.
-A previsão é por token, não por camada do transformer. O backbone do
-MoE grande fica congelado: o passo offline só atualiza este módulo e
-destila os logits de um roteador que não precisa caber na GPU.
+Uma LSTM de duas camadas lê o token e devolve, para cada camada do
+professor, o vetor de logits dos experts. Não junta as camadas num
+vetor só. O backbone do MoE grande fica congelado: o passo offline só
+atualiza este módulo e destila os logits de um roteador que não precisa
+caber na GPU.
 
 Se a acurácia desse roteador ficar abaixo do piso configurado, o
 critério pede hidden 512. A função só devolve o tamanho. Não retreina
@@ -103,7 +104,9 @@ class ExpertLSTMPredictor(nn.Module):
             num_layers=config.n_lstm_layers,
             batch_first=True,
         )
-        self.head = nn.Linear(config.hidden_size, config.n_experts)
+        self.head = nn.Linear(
+            config.hidden_size, config.n_model_layers * config.n_experts
+        )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -117,13 +120,15 @@ class ExpertLSTMPredictor(nn.Module):
         nn.init.zeros_(self.head.bias)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """``token_ids`` é ``[B, T]`` long. Sai ``[B, T, E]``, um vetor por token."""
+        """``token_ids`` é ``[B, T]`` long. Sai ``[B, T, L, E]``, um vetor por camada."""
 
         if token_ids.ndim != 2:
             raise ValueError(f"token_ids tem shape {tuple(token_ids.shape)}; esperado [B, T]")
         embedded = self.embed(token_ids)
         sequence, _state = self.lstm(embedded)
-        return self.head(sequence)
+        flat = self.head(sequence)
+        batch, seq, _width = flat.shape
+        return flat.view(batch, seq, self.config.n_model_layers, self.config.n_experts)
 
     def predict(
         self,
@@ -132,10 +137,10 @@ class ExpertLSTMPredictor(nn.Module):
         teacher_index: torch.Tensor | None = None,
         token_offset: int = 0,
     ) -> ExpertPrediction:
-        """Top-k por token. Nos passos de fallback, o índice é o do roteador verdadeiro."""
+        """Top-k por camada. Nos passos de fallback, o índice é o do roteador verdadeiro."""
 
         logits = self.forward(token_ids)
-        batch, seq, _experts = logits.shape
+        batch, seq, n_layers, _experts = logits.shape
         k = self.config.k
         index = torch.topk(logits, k=k, dim=-1).indices
         probs = logits.softmax(dim=-1)
@@ -147,14 +152,16 @@ class ExpertLSTMPredictor(nn.Module):
                 raise ValueError(
                     "fallback periódico precisa do índice do roteador verdadeiro"
                 )
-            if teacher_index.shape != (batch, seq, k):
+            if teacher_index.shape != (batch, seq, n_layers, k):
                 raise ValueError(
                     f"teacher_index tem shape {tuple(teacher_index.shape)}; "
-                    f"esperado {(batch, seq, k)}"
+                    f"esperado {(batch, seq, n_layers, k)}"
                 )
-            mask = fallback.view(1, seq, 1)
+            mask = fallback.view(1, seq, 1, 1)
             index = torch.where(mask, teacher_index, index)
-            teacher_scores = torch.ones(batch, seq, k, device=logits.device, dtype=scores.dtype)
+            teacher_scores = torch.ones(
+                batch, seq, n_layers, k, device=logits.device, dtype=scores.dtype
+            )
             scores = torch.where(mask, teacher_scores, scores)
         return ExpertPrediction(
             logits=logits,
@@ -172,26 +179,83 @@ def freeze_module(module: nn.Module) -> None:
         parameter.requires_grad_(False)
 
 
+def reshape_teacher_logits(
+    teacher_logits: torch.Tensor | dict[str, Any],
+    token_ids: torch.Tensor,
+    *,
+    n_layers: int,
+    n_experts: int,
+) -> torch.Tensor:
+    """Leva o traço até ``[B, T, L, E]`` sem misturar camadas.
+
+    O dump guarda ``[n_tokens, L, E]``. Um batch ``[B, T]`` com
+    ``B * T == n_tokens`` entra na ordem em que o arquivo foi gravado.
+    ``[B, T, L, E]`` passa direto. Um dict de traço usa a chave
+    ``teacher_logits``.
+    """
+
+    if isinstance(teacher_logits, dict):
+        if "teacher_logits" not in teacher_logits:
+            raise ValueError("o traço não tem teacher_logits")
+        teacher_logits = teacher_logits["teacher_logits"]
+    if token_ids.ndim != 2:
+        raise ValueError(f"token_ids tem shape {tuple(token_ids.shape)}; esperado [B, T]")
+    batch, seq = token_ids.shape
+    expected = (batch, seq, n_layers, n_experts)
+    if teacher_logits.ndim == 3:
+        if teacher_logits.shape[0] != batch * seq or tuple(teacher_logits.shape[1:]) != (
+            n_layers,
+            n_experts,
+        ):
+            raise ValueError(
+                f"teacher_logits {tuple(teacher_logits.shape)} não cabe em {expected}"
+            )
+        return teacher_logits.reshape(expected)
+    if teacher_logits.ndim == 4:
+        if tuple(teacher_logits.shape) != expected:
+            raise ValueError(
+                f"teacher_logits {tuple(teacher_logits.shape)} não é {expected}"
+            )
+        return teacher_logits
+    raise ValueError(
+        f"teacher_logits tem shape {tuple(teacher_logits.shape)}; "
+        "esperado [n_tokens, L, E] ou [B, T, L, E]"
+    )
+
+
 def distillation_loss(student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
-    """KL do professor congelado para o aluno. O gradiente não volta ao professor."""
+    """KL por camada, no eixo dos experts. O gradiente não volta ao professor.
+
+    Os dois tensores têm o mesmo shape, ``[B, T, L, E]`` ou o achatado
+    ``[B, T*L, E]``. O softmax é no último eixo, então as camadas não
+    viram um vetor só.
+    """
 
     if student_logits.shape != teacher_logits.shape:
         raise ValueError(
             f"logits {tuple(student_logits.shape)} e {tuple(teacher_logits.shape)} diferem"
         )
+    if student_logits.ndim < 2 or student_logits.shape[-1] < 2:
+        raise ValueError(f"logits {tuple(student_logits.shape)} não têm eixo de experts")
     teacher = teacher_logits.detach().softmax(dim=-1)
     log_student = student_logits.log_softmax(dim=-1)
-    return F.kl_div(log_student, teacher, reduction="batchmean")
+    flat_student = log_student.reshape(-1, student_logits.shape[-1])
+    flat_teacher = teacher.reshape(-1, teacher.shape[-1])
+    return F.kl_div(flat_student, flat_teacher, reduction="batchmean")
 
 
 def offline_train_step(
     predictor: ExpertLSTMPredictor,
     token_ids: torch.Tensor,
-    teacher_logits: torch.Tensor,
+    teacher_logits: torch.Tensor | dict[str, Any],
     optimizer: torch.optim.Optimizer,
     backbone: nn.Module | None = None,
 ) -> float:
-    """Um passo só nos pesos do preditor. ``teacher_logits`` já vem de fora."""
+    """Um passo só nos pesos do preditor. ``teacher_logits`` já vem de fora.
+
+    Aceita o tensor do dump, ``[n_tokens, L, E]``, o mesmo já em
+    ``[B, T, L, E]``, ou o dict gravado por ``save_teacher_trace``.
+    """
 
     if backbone is not None:
         frozen = [parameter.requires_grad for parameter in backbone.parameters()]
@@ -201,7 +265,14 @@ def offline_train_step(
         raise RuntimeError("o preditor não tem parâmetro treinável")
     predictor.train()
     optimizer.zero_grad(set_to_none=True)
-    loss = distillation_loss(predictor(token_ids), teacher_logits)
+    student = predictor(token_ids)
+    teacher = reshape_teacher_logits(
+        teacher_logits,
+        token_ids,
+        n_layers=predictor.config.n_model_layers,
+        n_experts=predictor.config.n_experts,
+    )
+    loss = distillation_loss(student, teacher)
     loss.backward()
     optimizer.step()
     return float(loss.detach())

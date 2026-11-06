@@ -11,7 +11,9 @@ from moe_memory.lstm_predictor import (
     load_lstm_config,
     offline_train_step,
     recommended_hidden_size,
+    reshape_teacher_logits,
 )
+from moe_memory.olmoe_teacher import load_teacher_trace, save_teacher_trace
 from moe_memory.sida_budget import ActivationBudget, budgets_match
 
 
@@ -42,18 +44,20 @@ def test_yaml_defaults_match_the_project_decision():
     assert config.embedding_dim == 128
     assert config.hidden_if_router_accuracy_drops == 512
     assert config.k == 2
+    assert config.n_experts == 64
+    assert config.n_model_layers == 16
     predictor = ExpertLSTMPredictor(config)
     assert predictor.lstm.num_layers == 2
     assert predictor.lstm.hidden_size == 256
     assert predictor.embed.embedding_dim == 128
-    assert predictor.head.out_features == config.n_experts
+    assert predictor.head.out_features == 16 * 64
 
 
-def test_prediction_is_one_expert_set_per_token_not_per_layer():
-    predictor = ExpertLSTMPredictor(_config())
+def test_each_layer_keeps_its_own_expert_logits():
+    predictor = ExpertLSTMPredictor(_config(n_model_layers=3, n_experts=4))
     tokens = torch.randint(0, 32, (2, 5))
     logits = predictor(tokens)
-    assert logits.shape == (2, 5, 4)
+    assert logits.shape == (2, 5, 3, 4)
 
 
 def test_low_router_accuracy_recommends_a_wider_hidden_without_retraining():
@@ -68,17 +72,17 @@ def test_low_router_accuracy_recommends_a_wider_hidden_without_retraining():
 
 
 def test_periodic_fallback_replaces_only_the_scheduled_tokens():
-    predictor = ExpertLSTMPredictor(_config(fallback_every=2))
+    predictor = ExpertLSTMPredictor(_config(fallback_every=2, n_model_layers=4))
     tokens = torch.zeros(1, 4, dtype=torch.long)
-    teacher = torch.tensor([[[1, 2], [3, 0], [1, 2], [2, 3]]])
+    teacher = torch.tensor([[[1, 2], [3, 0], [1, 2], [2, 3]]]).unsqueeze(2).expand(1, 4, 4, 2).contiguous()
     prediction = predictor.predict(tokens, teacher_index=teacher, token_offset=0)
     assert prediction.fallback_mask.tolist() == [True, False, True, False]
     assert torch.equal(prediction.index[0, 0], teacher[0, 0])
     assert torch.equal(prediction.index[0, 2], teacher[0, 2])
-    assert prediction.scores[0, 0].tolist() == [1.0, 1.0]
+    assert torch.equal(prediction.scores[0, 0], torch.ones(4, 2))
     student = predictor.predict(tokens[:, 1:2], teacher_index=None, token_offset=1)
     assert student.fallback_mask.tolist() == [False]
-    assert student.index.shape == (1, 1, 2)
+    assert student.index.shape == (1, 1, 4, 2)
 
 
 def test_fallback_without_the_true_router_is_rejected():
@@ -100,7 +104,7 @@ def test_offline_step_updates_the_predictor_and_leaves_the_backbone_frozen():
     backbone_before = [parameter.detach().clone() for parameter in backbone.parameters()]
     optimizer = torch.optim.AdamW(predictor.parameters(), lr=1e-2)
     tokens = torch.randint(0, config.vocab_size, (2, 3))
-    teacher = torch.randn(2, 3, config.n_experts)
+    teacher = torch.randn(2, 3, config.n_model_layers, config.n_experts)
     first = offline_train_step(predictor, tokens, teacher, optimizer, backbone=backbone)
     second = offline_train_step(predictor, tokens, teacher, optimizer, backbone=backbone)
     assert first >= 0.0 and second >= 0.0
@@ -128,6 +132,39 @@ def test_activation_budget_matches_sida_at_the_same_k():
     tokens = torch.randint(0, 32, (1, 2))
     prediction = predictor.predict(
         tokens,
-        teacher_index=torch.zeros(1, 2, config.k, dtype=torch.long),
+        teacher_index=torch.zeros(1, 2, predictor.config.n_model_layers, config.k, dtype=torch.long),
     )
     assert prediction.index.shape[-1] == ours.experts_per_token_per_layer
+    assert prediction.logits.shape[-2:] == (
+        predictor.config.n_model_layers,
+        predictor.config.n_experts,
+    )
+
+
+def test_dump_tensor_enters_the_step_without_pooling_layers(tmp_path):
+    config = _config(n_model_layers=2, n_experts=4, vocab_size=16)
+    predictor = ExpertLSTMPredictor(config)
+    tokens = torch.randint(0, config.vocab_size, (2, 3))
+    flat = torch.zeros(6, 2, 4)
+    flat[:, 0, 0] = 4
+    flat[:, 1, 3] = 4
+    aligned = reshape_teacher_logits(flat, tokens, n_layers=2, n_experts=4)
+    assert aligned.shape == (2, 3, 2, 4)
+    assert not torch.allclose(aligned[:, :, 0], aligned[:, :, 1])
+    student = predictor(tokens)
+    assert student.shape == (2, 3, 2, 4)
+    by_layer = distillation_loss(student, aligned)
+    by_flat_rows = distillation_loss(
+        student.reshape(2, 6, 4),
+        aligned.reshape(2, 6, 4),
+    )
+    assert torch.allclose(by_layer, by_flat_rows)
+    path = tmp_path / "traco.pt"
+    save_teacher_trace(path, tokens.reshape(-1), flat, split="train", top_k=2)
+    blob = load_teacher_trace(path)
+    assert tuple(blob["teacher_logits"].shape) == (6, 2, 4)
+    from_file = reshape_teacher_logits(blob, tokens, n_layers=2, n_experts=4)
+    assert torch.equal(from_file, aligned)
+    optimizer = torch.optim.SGD(predictor.parameters(), lr=0.0)
+    value = offline_train_step(predictor, tokens, blob, optimizer)
+    assert abs(value - float(by_layer.detach())) < 1e-5

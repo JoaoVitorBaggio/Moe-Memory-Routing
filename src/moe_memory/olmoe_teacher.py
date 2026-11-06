@@ -5,11 +5,10 @@ BPE do GPT-2 no WikiText-2). Os ids gravados são esses, na mesma ordem.
 O OLMoE não usa esse tokenizer; a linha ``i`` do logit é o gate na
 passagem do ``token_ids[i]``, não uma retokenização.
 
-``offline_train_step`` espera ``teacher_logits`` com shape ``[B, T, E]``:
-um vetor por token, alinhado aos ``token_ids``, para a KL. O gate do
-OLMoE é a linear ``mlp.gate``, uma por camada (16 camadas, 64 experts,
-top-8). Este módulo grava o logit completo de cada camada, não o índice
-top-k, e não muda a assinatura do passo.
+O gate do OLMoE é a linear ``mlp.gate``, uma por camada (16 camadas,
+64 experts, top-8). Este módulo grava o logit completo de cada camada,
+não o índice top-k. ``offline_train_step`` lê esse tensor
+``[n_tokens, n_layers, n_experts]`` e a KL compara cada camada.
 
 O peso sai do ``corpus.cache_dir`` que o loader já usa, ou de um
 diretório local. ``local_files_only`` impede o download. Quem não tem o
@@ -36,14 +35,12 @@ OLMOE_GATE = "mlp.gate"
 TEACHER_TRACE_FORMAT = "olmoe-teacher-logits-v1"
 
 LAYOUT_NOTE = (
-    "offline_train_step espera teacher_logits [B, T, E]: um vetor de logits "
-    "por token, a mesma forma da saída do preditor, para a KL. "
-    "O gate do OLMoE (mlp.gate, linear) emite um vetor por camada. "
-    "Este arquivo guarda teacher_logits [n_tokens, n_layers, n_experts], "
-    "os logits completos do router, não o índice top-k. "
+    "teacher_logits tem shape [n_tokens, n_layers, n_experts]: "
+    "um vetor de logits por camada, por token. Não é a média das camadas. "
+    "offline_train_step aceita esse tensor, ou [B, T, n_layers, n_experts], "
+    "e a KL compara cada camada no eixo dos experts. "
     "token_ids[i] alinha com teacher_logits[i]. "
-    "A assinatura de offline_train_step não muda nesta leva; "
-    "reduzir as camadas a um vetor fica para depois."
+    "O arquivo guarda os logits completos do router, não o índice top-k."
 )
 
 
@@ -237,7 +234,7 @@ def save_teacher_trace(
         "token_ids": token_ids.detach().cpu().long(),
         "teacher_logits": teacher_logits.detach().cpu().float(),
         "stored_layout": "[n_tokens, n_layers, n_experts]",
-        "offline_train_step_layout": "[B, T, E]",
+        "offline_train_step_layout": "[B, T, n_layers, n_experts]",
         "layout_note": LAYOUT_NOTE,
     }
     destination = Path(path)

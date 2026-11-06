@@ -95,7 +95,7 @@ def test_saved_trace_records_the_per_layer_layout(tmp_path):
     assert blob["gate"] == "mlp.gate"
     assert blob["top_k"] == 2
     assert blob["stored_layout"] == "[n_tokens, n_layers, n_experts]"
-    assert blob["offline_train_step_layout"] == "[B, T, E]"
+    assert blob["offline_train_step_layout"] == "[B, T, n_layers, n_experts]"
     assert "um vetor" in blob["layout_note"]
     assert "por camada" in blob["layout_note"]
     assert torch.equal(blob["token_ids"], token_ids)

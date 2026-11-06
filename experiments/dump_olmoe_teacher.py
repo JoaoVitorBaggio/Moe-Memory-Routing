@@ -6,10 +6,10 @@ GPT-2). O peso é o ``allenai/OLMoE-1B-7B-0924`` já em
 ``corpus.cache_dir``, ou em ``--model-dir``. Não há download.
 
 O arquivo guarda, token a token, ``token_ids`` e ``teacher_logits``.
-``offline_train_step`` espera um vetor por token, ``[B, T, E]``. O gate
-é a linear ``mlp.gate``: 16 camadas, 64 experts, top-8. O traço guarda
-o logit de cada camada, ``[n_tokens, 16, 64]``, não o índice top-k.
-Reduzir isso a um vetor fica fora desta leva.
+O gate é a linear ``mlp.gate``: 16 camadas, 64 experts, top-8. O traço
+guarda o logit de cada camada, ``[n_tokens, 16, 64]``, não o índice
+top-k. ``offline_train_step`` consome esse shape: a KL compara cada
+camada, sem juntar as 16 num vetor só.
 
 Uso, com o peso já no disco::
 
