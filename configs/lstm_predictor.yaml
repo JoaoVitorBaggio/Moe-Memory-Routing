@@ -1,0 +1,20 @@
+# Segundo modelo. Não altera configs/default.yaml nem a pergunta do
+# experimento WikiText-2 (λ, quatro braços, tabela c).
+#
+# O piso de acurácia é critério de configuração: se a acurácia do
+# roteador professor ficar abaixo dele, o próximo preditor usa hidden
+# 512. Nenhum número abaixo é acurácia medida, e o código não retreina
+# sozinho. O lookahead de SSD é 4, dentro da faixa 3–4.
+
+lstm_predictor:
+  vocab_size: 50257
+  n_experts: 32
+  k: 2
+  n_model_layers: 4
+  embedding_dim: 128
+  hidden_size: 256
+  n_lstm_layers: 2
+  fallback_every: 8
+  router_accuracy_floor: 0.9
+  hidden_if_router_accuracy_drops: 512
+  ssd_lookahead_layers: 4

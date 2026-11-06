@@ -8,13 +8,17 @@ um MoE genérico com outros defaults.
 from moe_memory.config import load_config
 from moe_memory.dense import DenseLanguageModel
 from moe_memory.emulator import ResidencyEmulator
+from moe_memory.expert_manager import ExpertMemoryManager
 from moe_memory.levels import COLD, HOT, WARM
 from moe_memory.loss import LossTerms, compute_loss
+from moe_memory.lstm_predictor import ExpertLSTMPredictor, load_lstm_config
 from moe_memory.model import MemoryMoEModel
 
 __all__ = [
     "COLD",
     "DenseLanguageModel",
+    "ExpertLSTMPredictor",
+    "ExpertMemoryManager",
     "HOT",
     "LossTerms",
     "MemoryMoEModel",
@@ -22,6 +26,7 @@ __all__ = [
     "WARM",
     "compute_loss",
     "load_config",
+    "load_lstm_config",
 ]
 
 __version__ = "0.1.0"

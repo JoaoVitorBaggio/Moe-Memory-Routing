@@ -206,3 +206,11 @@ python3 experiments/run_model_comparison.py --holdout outputs/holdout/summary.js
 A saída padrão é `outputs/comparison/comparison.json` (gitignored). `metrics_complete` só fica verdadeiro quando o hold-out de referência e a curva de dose preencheram a tabela. Célula `pending` não é número. O preenchimento de 2026-11-02 (`metrics_complete` verdadeiro; nenhuma célula `pending`) está em [`results/model_comparison_wikitext_2026-11-02.md`](../results/model_comparison_wikitext_2026-11-02.md).
 
 Não colocar saída grande nesta pasta. Métrica pequena vai para `results/`; checkpoint e dataset ficam de fora do Git. O home frio do MoE cai em `outputs/` (gitignored). O baseline denso não grava memmap de expert.
+
+## Segundo modelo (preditor LSTM)
+
+Isto não muda o protocolo acima, o YAML `configs/default.yaml` nem os quatro braços. O preditor mora em `configs/lstm_predictor.yaml` e o gancho abaixo só imprime o saldo de ativação (`k` experts por token por camada). Não há corrida, acurácia nem latência.
+
+```bash
+python3 experiments/sida_activation_hook.py
+```
