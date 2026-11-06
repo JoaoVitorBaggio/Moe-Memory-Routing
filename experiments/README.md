@@ -214,3 +214,5 @@ Isto não muda o protocolo acima, o YAML `configs/default.yaml` nem os quatro br
 ```bash
 python3 experiments/sida_activation_hook.py
 ```
+
+A comparação com o SiDA continua suspensa. `experiments/dump_olmoe_teacher.py` só grava o traço do router do OLMoE (logits de `mlp.gate`, um por camada) para o passo offline. O peso tem de já estar em `corpus.cache_dir` ou em `--model-dir`. O script não baixa e não mede.
