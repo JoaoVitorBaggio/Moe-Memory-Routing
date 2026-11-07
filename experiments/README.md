@@ -215,4 +215,4 @@ Isto não muda o protocolo acima, o YAML `configs/default.yaml` nem os quatro br
 python3 experiments/sida_activation_hook.py
 ```
 
-A comparação com o SiDA continua suspensa. `experiments/dump_olmoe_teacher.py` só grava o traço do router do OLMoE (logits de `mlp.gate`, um por camada, `[n_tokens, 16, 64]`) para o passo offline. O passo lê esse tensor sem juntar as camadas. O peso tem de já estar em `corpus.cache_dir` ou em `--model-dir`. O script não baixa e não mede.
+A comparação com o SiDA continua suspensa. `experiments/dump_olmoe_teacher.py` grava a escolha da LSTM (ela é o roteador) num trecho de 2048 tokens do WikiText-2, não o corpus inteiro e não os logits do gate. O OLMoE entra só como fragmento local congelado: o fp16 inteiro não cabe em 5.5 GB. Sem cache, o script sai com erro e não roda o modelo. Não treina.

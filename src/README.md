@@ -20,11 +20,11 @@ A contagem da arquitetura fechada é 47.939.328 parâmetros (~48 M): a embedding
 | `moe_memory/loss.py` | CE do próximo token, `C_mem` e o balanceamento do Switch. Treino: média ponderada dos top-2. Inferência: soma dos top-2. Essa diferença é do **custo**, não do hidden (“custo real de acesso”). |
 | `moe_memory/config.py` | Lê e valida o YAML. |
 | `moe_memory/smoke.py` | Um passo de treino. O atalho sintético não lê corpus. |
-| `moe_memory/lstm_predictor.py` | Segundo modelo. LSTM de 2 camadas, hidden 256, embedding 128. Para cada token prevê o vetor de 64 experts de cada uma das 16 camadas e destila o roteador congelado. Não entra na loss do experimento atual. |
+| `moe_memory/lstm_predictor.py` | Segundo modelo. LSTM de 2 camadas, hidden 256, embedding 128. No traço em voo ela é o roteador: escolhe os experts por token. Não entra na loss do experimento atual. |
 | `moe_memory/lookahead.py` | Folga do prefetch: RAM→GPU = 1 camada, SSD→GPU = 3 ou 4. |
 | `moe_memory/expert_manager.py` | Busca experts pelo score, com home em RAM ou SSD. |
 | `moe_memory/sida_budget.py` | Gancho de comparação no mesmo `k`. Não mede. A comparação com o SiDA continua suspensa. |
-| `moe_memory/olmoe_teacher.py` | Traço dos logits de `mlp.gate` do OLMoE, token a token, um vetor por camada. Não baixa o peso e não entra na pergunta do WikiText-2. |
+| `moe_memory/olmoe_teacher.py` | Trecho curto do WikiText-2 e fragmento local do OLMoE. Grava o índice escolhido pela LSTM, não os logits do gate. Sem cache, não roda o modelo. |
 
 `w(a,b) = |c(b) − c(a)|` não aparece no YAML: a loss deriva da tabela `c`.
 

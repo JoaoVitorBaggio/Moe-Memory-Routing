@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Grava os logits do router do OLMoE no WikiText-2. Não treina o preditor.
+"""Grava as escolhas da LSTM no WikiText-2. A LSTM é o roteador.
 
-O texto passa pelo leitor que o repositório já usa (WikiText-2, BPE do
-GPT-2). O peso é o ``allenai/OLMoE-1B-7B-0924`` já em
-``corpus.cache_dir``, ou em ``--model-dir``. Não há download.
+Não grava logits do gate do OLMoE e não treina. O texto é um trecho
+curto do leitor que o repositório já usa. O padrão são 2048 tokens, não
+o corpus inteiro.
 
-O arquivo guarda, token a token, ``token_ids`` e ``teacher_logits``.
-O gate é a linear ``mlp.gate``: 16 camadas, 64 experts, top-8. O traço
-guarda o logit de cada camada, ``[n_tokens, 16, 64]``, não o índice
-top-k. ``offline_train_step`` consome esse shape: a KL compara cada
-camada, sem juntar as 16 num vetor só.
+O peso, se existir, é um fragmento já em ``corpus.cache_dir`` ou em
+``--model-dir`` (``local_files_only``). O OLMoE em fp16 não cabe em
+5.5 GB: o script não carrega o modelo inteiro e não baixa. Sem o cache,
+sai com erro e não roda o modelo. Os tensores lidos ficam congelados.
 
-Uso, com o peso já no disco::
+Uso::
 
-    python3 experiments/dump_olmoe_teacher.py --output outputs/olmoe-teacher/train.pt
-    python3 experiments/dump_olmoe_teacher.py --model-dir /caminho/do/snapshot --output traco.pt
+    python3 experiments/dump_olmoe_teacher.py --output outputs/olmoe-teacher/choices.pt
+    python3 experiments/dump_olmoe_teacher.py --model-dir /caminho/do/snapshot --output choices.pt
 
 Não rode este script para a comparação com o SiDA. Ela continua suspensa.
+Não há passo de treino aqui.
 """
 
 from __future__ import annotations
@@ -29,55 +29,72 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from moe_memory.config import load_config
+from moe_memory.lstm_predictor import ExpertLSTMPredictor, load_lstm_config
 from moe_memory.olmoe_teacher import (
+    DEFAULT_FRAGMENT_TOKENS,
+    MAX_FRAGMENT_BYTES,
     OLMOE_MODEL_ID,
-    OLMOE_TOP_K,
-    load_olmoe,
+    load_frozen_fragment,
+    lstm_expert_choices,
     olmoe_load_spec,
-    require_olmoe_gate_shape,
-    save_teacher_trace,
-    trace_router_logits,
+    require_local_olmoe,
+    save_router_choices,
     wikitext_token_ids,
 )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Traço dos logits do router do OLMoE.")
+    parser = argparse.ArgumentParser(
+        description="A LSTM escolhe os experts num trecho curto do WikiText-2."
+    )
     parser.add_argument("--config", type=Path, default=None)
-    parser.add_argument("--model-dir", type=Path, default=None, help="Snapshot local. Sem isto, usa corpus.cache_dir.")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Snapshot local. Sem isto, usa corpus.cache_dir. Não baixa.",
+    )
     parser.add_argument("--split", default="train")
-    parser.add_argument("--seq-len", type=int, default=None, help="Bloco do forward. Padrão: model.max_seq_len.")
-    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=DEFAULT_FRAGMENT_TOKENS,
+        help=(
+            f"Trecho do WikiText-2, em tokens do leitor. Padrão: {DEFAULT_FRAGMENT_TOKENS}. "
+            "Não é o corpus inteiro. O OLMoE em fp16 não cabe em 5.5 GB; "
+            "o script só abre um fragmento local do peso e a LSTM escolhe os experts."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.max_tokens < 1:
+        raise SystemExit("max_tokens precisa ser >= 1")
     config = load_config(args.config)
     if config.corpus.report != "WikiText-2":
         raise SystemExit(f"corpus.report={config.corpus.report!r}; este traço é o WikiText-2")
-    seq_len = config.model.max_seq_len if args.seq_len is None else args.seq_len
-    if seq_len < 1:
-        raise SystemExit("seq_len precisa ser >= 1")
-    if args.max_tokens is not None and args.max_tokens < 1:
-        raise SystemExit("max_tokens precisa ser >= 1")
     spec = olmoe_load_spec(config, args.model_dir)
-    token_ids = wikitext_token_ids(config, args.split)
-    if args.max_tokens is not None:
-        token_ids = token_ids[: args.max_tokens]
-    model = load_olmoe(config, args.model_dir)
-    teacher_logits = trace_router_logits(model, token_ids, seq_len=seq_len)
-    require_olmoe_gate_shape(teacher_logits)
-    save_teacher_trace(
+    try:
+        snapshot = require_local_olmoe(spec)
+        fragment = load_frozen_fragment(snapshot)
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise SystemExit(str(exc)) from exc
+    if any(tensor.requires_grad for tensor in fragment.values()):
+        raise SystemExit("o fragmento do OLMoE precisa estar congelado")
+    token_ids = wikitext_token_ids(config, args.split, max_tokens=args.max_tokens)
+    predictor = ExpertLSTMPredictor(load_lstm_config())
+    expert_index = lstm_expert_choices(predictor, token_ids)
+    save_router_choices(
         args.output,
         token_ids,
-        teacher_logits,
+        expert_index,
         split=args.split,
-        top_k=OLMOE_TOP_K,
+        fragment_tokens=args.max_tokens,
     )
-    where = spec.model_dir if spec.model_dir is not None else spec.cache_dir
     print(
-        f"{OLMOE_MODEL_ID}  origem={where}  local_files_only={spec.local_files_only}\n"
-        f"split={args.split}  tokens={token_ids.shape[0]}  "
-        f"teacher_logits={tuple(teacher_logits.shape)}  "
-        f"layout=[n_tokens, n_layers, n_experts]\n"
+        f"{OLMOE_MODEL_ID}  origem={snapshot}  local_files_only=True  "
+        f"fragmento_bytes<={MAX_FRAGMENT_BYTES}\n"
+        f"split={args.split}  teto={args.max_tokens}  tokens={token_ids.shape[0]}  "
+        f"expert_index={tuple(expert_index.shape)}  layout=[n_tokens, n_layers, k]\n"
         f"arquivo={args.output}"
     )
 

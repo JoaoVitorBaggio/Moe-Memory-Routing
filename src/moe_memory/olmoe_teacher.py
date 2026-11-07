@@ -1,18 +1,14 @@
-"""Traço do roteador do OLMoE para o passo offline do preditor.
+"""Traço em que a LSTM é o roteador. Não é aluno do gate do OLMoE.
 
-O leitor é o do repositório (``iter_documents`` / ``iter_token_ids``,
-BPE do GPT-2 no WikiText-2). Os ids gravados são esses, na mesma ordem.
-O OLMoE não usa esse tokenizer; a linha ``i`` do logit é o gate na
-passagem do ``token_ids[i]``, não uma retokenização.
+O script lê um trecho curto do WikiText-2 pelo leitor do repositório
+e grava, por token, os experts que a LSTM escolheu. Não grava
+``teacher_logits``.
 
-O gate do OLMoE é a linear ``mlp.gate``, uma por camada (16 camadas,
-64 experts, top-8). Este módulo grava o logit completo de cada camada,
-não o índice top-k. ``offline_train_step`` lê esse tensor
-``[n_tokens, n_layers, n_experts]`` e a KL compara cada camada.
-
-O peso sai do ``corpus.cache_dir`` que o loader já usa, ou de um
-diretório local. ``local_files_only`` impede o download. Quem não tem o
-peso em disco recebe erro. A comparação com o SiDA não entra aqui.
+O peso do OLMoE, se entrar, é um fragmento já no disco
+(``local_files_only``). O fp16 inteiro não cabe em 5.5 GB, então o
+modelo cheio não é carregado nem executado. Sem cache, o erro é claro
+e o modelo não roda. Os tensores lidos ficam congelados: sem otimizador
+e sem backward. A comparação com o SiDA não entra aqui.
 """
 
 from __future__ import annotations
@@ -33,6 +29,10 @@ OLMOE_N_EXPERTS = 64
 OLMOE_TOP_K = 8
 OLMOE_GATE = "mlp.gate"
 TEACHER_TRACE_FORMAT = "olmoe-teacher-logits-v1"
+ROUTER_TRACE_FORMAT = "lstm-router-choices-v1"
+DEFAULT_FRAGMENT_TOKENS = 2048
+MAX_FRAGMENT_BYTES = 8 * 1024 * 1024
+_WEIGHT_SUFFIXES = (".safetensors", ".pt", ".pth", ".bin")
 
 LAYOUT_NOTE = (
     "teacher_logits tem shape [n_tokens, n_layers, n_experts]: "
@@ -79,24 +79,131 @@ def olmoe_load_spec(config, model_dir: str | Path | None = None) -> OlmoeLoadSpe
 
 
 def load_olmoe(config, model_dir: str | Path | None = None):
-    """Carrega o peso já presente no disco. Não baixa."""
+    """Recusa o modelo inteiro. O fp16 não cabe em 5.5 GB e não há download."""
 
-    spec = olmoe_load_spec(config, model_dir)
-    try:
-        from transformers import OlmoeForCausalLM
-    except ImportError as exc:
-        raise ImportError(
-            "carregar o OLMoE precisa do pacote transformers, e do peso já em disco"
-        ) from exc
+    del config, model_dir
+    raise RuntimeError(
+        "o OLMoE em fp16 não cabe em 5.5 GB. "
+        "Este passo não carrega o modelo inteiro e não baixa. "
+        "Use load_frozen_fragment num snapshot local."
+    )
+
+
+def _hub_dir(cache_dir: Path, model_id: str) -> Path:
+    return cache_dir / ("models--" + model_id.replace("/", "--"))
+
+
+def _weight_files(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return [
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix in _WEIGHT_SUFFIXES
+    ]
+
+
+def locate_snapshot(spec: OlmoeLoadSpec) -> Path | None:
+    """Acha o snapshot no disco. Não baixa e não abre o modelo."""
+
     if spec.model_dir is not None:
-        return OlmoeForCausalLM.from_pretrained(
-            str(spec.model_dir),
-            local_files_only=True,
+        return spec.model_dir if spec.model_dir.is_dir() else None
+    if spec.cache_dir is None:
+        return None
+    root = _hub_dir(spec.cache_dir, spec.model_id)
+    snapshots = root / "snapshots"
+    if snapshots.is_dir():
+        for candidate in sorted(path for path in snapshots.iterdir() if path.is_dir()):
+            if (candidate / "config.json").is_file():
+                return candidate
+    if (root / "config.json").is_file():
+        return root
+    return None
+
+
+def require_local_olmoe(spec: OlmoeLoadSpec) -> Path:
+    """Devolve o snapshot local. Se faltar, erro claro e o modelo não roda."""
+
+    if not spec.local_files_only:
+        raise RuntimeError("a leitura do OLMoE fica em local_files_only")
+    where = spec.model_dir if spec.model_dir is not None else spec.cache_dir
+    snapshot = locate_snapshot(spec)
+    if snapshot is None or not (snapshot / "config.json").is_file() or not _weight_files(snapshot):
+        raise FileNotFoundError(
+            f"não achei {spec.model_id} em {where}. "
+            "O traço só lê cache local (local_files_only) e não baixa. "
+            "O modelo não foi executado."
         )
-    return OlmoeForCausalLM.from_pretrained(
-        spec.model_id,
-        cache_dir=str(spec.cache_dir),
-        local_files_only=True,
+    return snapshot
+
+
+def _flatten_tensors(blob: object, prefix: str = "") -> dict[str, torch.Tensor]:
+    if torch.is_tensor(blob):
+        return {prefix or "weight": blob}
+    if isinstance(blob, dict):
+        found: dict[str, torch.Tensor] = {}
+        for key, value in blob.items():
+            name = f"{prefix}.{key}" if prefix else str(key)
+            found.update(_flatten_tensors(value, name))
+        return found
+    return {}
+
+
+def _freeze(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    frozen: dict[str, torch.Tensor] = {}
+    for name, tensor in tensors.items():
+        out = tensor.detach().to(device="cpu")
+        out.requires_grad_(False)
+        frozen[name] = out
+    return frozen
+
+
+def load_frozen_fragment(
+    snapshot: Path,
+    *,
+    max_bytes: int = MAX_FRAGMENT_BYTES,
+) -> dict[str, torch.Tensor]:
+    """Lê só um pedaço pequeno do peso. Não instancia o OLMoE e não treina.
+
+    Arquivo maior que ``max_bytes`` fica de fora. Se só houver o fp16
+    inteiro, o erro diz que o modelo não foi executado.
+    """
+
+    if max_bytes < 1:
+        raise ValueError("max_bytes precisa ser >= 1")
+    if not (snapshot / "config.json").is_file():
+        raise FileNotFoundError(
+            f"{snapshot} não tem config.json. Não há download. O modelo não foi executado."
+        )
+    loaded: dict[str, torch.Tensor] = {}
+    used = 0
+    saw_weight = False
+    for path in _weight_files(snapshot):
+        saw_weight = True
+        size = path.stat().st_size
+        if path.suffix not in {".pt", ".pth", ".bin"}:
+            continue
+        if size > max_bytes or size > max_bytes - used:
+            continue
+        blob = torch.load(path, map_location="cpu", weights_only=True)
+        tensors = _freeze(_flatten_tensors(blob))
+        nbytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors.values())
+        if nbytes > max_bytes - used:
+            continue
+        loaded.update(tensors)
+        used += nbytes
+        if used >= max_bytes:
+            break
+    if loaded:
+        return loaded
+    if not saw_weight:
+        raise FileNotFoundError(
+            f"{snapshot} não tem arquivo de peso. Não há download. O modelo não foi executado."
+        )
+    raise FileNotFoundError(
+        "não há fragmento pequeno de OLMoE nesse cache. "
+        "O fp16 inteiro não cabe em 5.5 GB; este passo não carrega o modelo "
+        "inteiro e não baixa. O modelo não foi executado."
     )
 
 
@@ -109,11 +216,50 @@ def token_ids_from_documents(documents: Iterator[str] | list[str], encoding) -> 
     return torch.tensor(ids, dtype=torch.long)
 
 
-def wikitext_token_ids(config, split: str) -> torch.Tensor:
-    """WikiText-2 pelo leitor do repositório. Não retokeniza com o OLMoE."""
+def take_token_ids(tokens: Iterator[int], max_tokens: int) -> torch.Tensor:
+    """Corta o leitor no teto. Não pede o resto do corpus."""
+
+    if max_tokens < 1:
+        raise ValueError("max_tokens precisa ser >= 1")
+    ids: list[int] = []
+    for token in tokens:
+        ids.append(int(token))
+        if len(ids) >= max_tokens:
+            break
+    if not ids:
+        raise ValueError("o leitor não devolveu token")
+    return torch.tensor(ids, dtype=torch.long)
+
+
+def wikitext_token_ids(config, split: str, *, max_tokens: int | None = None) -> torch.Tensor:
+    """WikiText-2 pelo leitor do repositório. Não retokeniza com o OLMoE.
+
+    ``max_tokens`` limita o trecho. ``None`` lê o split inteiro.
+    """
 
     documents = iter_documents(config, split, name="WikiText-2", streaming=False)
-    return token_ids_from_documents(documents, load_gpt2_encoding())
+    encoding = load_gpt2_encoding()
+    if max_tokens is None:
+        return token_ids_from_documents(documents, encoding)
+    return take_token_ids(iter_token_ids(documents, encoding), max_tokens)
+
+
+def lstm_expert_choices(predictor: nn.Module, token_ids: torch.Tensor) -> torch.Tensor:
+    """A LSTM escolhe os experts. Sem gradiente e sem roteador professor.
+
+    ``token_ids`` é ``[n_tokens]``. Sai ``[n_tokens, n_layers, k]`` long.
+    """
+
+    if token_ids.ndim != 1 or token_ids.numel() == 0:
+        raise ValueError("token_ids precisa ser [n_tokens] não vazio")
+    predictor.eval()
+    with torch.no_grad():
+        logits = predictor(token_ids.view(1, -1))
+        index = torch.topk(logits, k=predictor.config.k, dim=-1).indices
+    choices = index[0].detach().cpu().long()
+    if choices.shape[0] != token_ids.shape[0]:
+        raise RuntimeError("a escolha não ficou alinhada token a token")
+    return choices
 
 
 def iter_gate_modules(model: nn.Module) -> list[nn.Module]:
@@ -240,6 +386,54 @@ def save_teacher_trace(
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, destination)
+
+
+def save_router_choices(
+    path: str | Path,
+    token_ids: torch.Tensor,
+    expert_index: torch.Tensor,
+    *,
+    split: str,
+    fragment_tokens: int,
+) -> None:
+    """Grava a escolha da LSTM. Não grava logits de gate."""
+
+    if token_ids.ndim != 1 or token_ids.dtype != torch.long:
+        raise ValueError("token_ids precisa ser long [n_tokens]")
+    if expert_index.ndim != 3 or expert_index.shape[0] != token_ids.shape[0]:
+        raise ValueError(
+            "expert_index precisa ser [n_tokens, n_layers, k] alinhado a token_ids; "
+            f"shapes {tuple(token_ids.shape)} e {tuple(expert_index.shape)}"
+        )
+    if fragment_tokens < 1:
+        raise ValueError("fragment_tokens precisa ser >= 1")
+    payload = {
+        "format": ROUTER_TRACE_FORMAT,
+        "model_id": OLMOE_MODEL_ID,
+        "router": "lstm",
+        "split": split,
+        "fragment_tokens": int(fragment_tokens),
+        "token_ids": token_ids.detach().cpu().long(),
+        "expert_index": expert_index.detach().cpu().long(),
+        "stored_layout": "[n_tokens, n_layers, k]",
+        "layout_note": (
+            "A LSTM é o roteador e escolhe os experts na hora. "
+            "expert_index[i] alinha com token_ids[i]. "
+            "Não há teacher_logits."
+        ),
+    }
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, destination)
+
+
+def load_router_choices(path: str | Path) -> dict:
+    blob = torch.load(Path(path), map_location="cpu", weights_only=False)
+    if not isinstance(blob, dict) or blob.get("format") != ROUTER_TRACE_FORMAT:
+        raise ValueError(f"{path} não é um traço {ROUTER_TRACE_FORMAT}")
+    if "teacher_logits" in blob:
+        raise ValueError(f"{path} ainda traz teacher_logits; o traço é a escolha da LSTM")
+    return blob
 
 
 def load_teacher_trace(path: str | Path) -> dict:

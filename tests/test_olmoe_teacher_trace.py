@@ -7,16 +7,26 @@ from torch import nn
 
 from moe_memory.config import load_config
 from moe_memory.corpus import documents_from_texts, resolve_cache_dir
+from moe_memory.lstm_predictor import ExpertLSTMPredictor, LstmPredictorConfig
 from moe_memory.olmoe_teacher import (
+    DEFAULT_FRAGMENT_TOKENS,
     OLMOE_MODEL_ID,
     OLMOE_N_EXPERTS,
     OLMOE_N_LAYERS,
     TEACHER_TRACE_FORMAT,
+    OlmoeLoadSpec,
     collect_router_logits,
+    load_frozen_fragment,
+    load_olmoe,
+    load_router_choices,
     load_teacher_trace,
+    lstm_expert_choices,
     olmoe_load_spec,
+    require_local_olmoe,
     require_olmoe_gate_shape,
+    save_router_choices,
     save_teacher_trace,
+    take_token_ids,
     token_ids_from_documents,
     trace_router_logits,
 )
@@ -131,3 +141,94 @@ def test_load_spec_uses_the_corpus_cache_and_refuses_a_download():
     assert local.model_dir == Path("/tmp/olmoe-snapshot")
     assert local.cache_dir is None
     assert local.local_files_only is True
+
+
+def test_token_cap_stops_before_the_rest_of_the_stream():
+    assert DEFAULT_FRAGMENT_TOKENS == 2048
+
+    def source():
+        for item in range(10):
+            if item >= 4:
+                raise AssertionError("o leitor passou do teto")
+            yield item
+
+    assert take_token_ids(source(), 3).tolist() == [0, 1, 2]
+
+
+def test_missing_cache_stops_before_any_model(tmp_path):
+    spec = OlmoeLoadSpec(
+        model_id=OLMOE_MODEL_ID,
+        cache_dir=tmp_path,
+        model_dir=None,
+        local_files_only=True,
+    )
+    ran = False
+    try:
+        require_local_olmoe(spec)
+        ran = True
+    except FileNotFoundError as exc:
+        text = str(exc)
+        assert "não baixa" in text
+        assert "não foi executado" in text
+    assert ran is False
+    try:
+        load_olmoe(None)
+    except RuntimeError as exc:
+        assert "5.5 GB" in str(exc)
+    else:
+        raise AssertionError("o modelo inteiro não devia carregar")
+
+
+def test_frozen_fragment_is_small_and_a_huge_file_is_refused(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    torch.save({"expert.weight": torch.ones(2, 2)}, snapshot / "fragment.pt")
+    fragment = load_frozen_fragment(snapshot)
+    assert set(fragment) == {"expert.weight"}
+    assert fragment["expert.weight"].requires_grad is False
+    assert torch.equal(fragment["expert.weight"], torch.ones(2, 2))
+
+    huge = tmp_path / "huge"
+    huge.mkdir()
+    (huge / "config.json").write_text("{}", encoding="utf-8")
+    torch.save({"expert.weight": torch.zeros(64)}, huge / "model.pt")
+    try:
+        load_frozen_fragment(huge, max_bytes=32)
+    except FileNotFoundError as exc:
+        assert "5.5 GB" in str(exc)
+        assert "não foi executado" in str(exc)
+    else:
+        raise AssertionError("arquivo grande devia ser recusado")
+
+
+def test_lstm_records_expert_choices_not_teacher_logits(tmp_path):
+    config = LstmPredictorConfig(
+        vocab_size=16,
+        n_experts=4,
+        k=2,
+        n_model_layers=3,
+        embedding_dim=8,
+        hidden_size=8,
+        n_lstm_layers=2,
+        fallback_every=2,
+        router_accuracy_floor=0.9,
+        hidden_if_router_accuracy_drops=16,
+        ssd_lookahead_layers=4,
+    )
+    config.validate()
+    predictor = ExpertLSTMPredictor(config)
+    tokens = torch.tensor([1, 2, 3, 4])
+    choices = lstm_expert_choices(predictor, tokens)
+    assert choices.shape == (4, 3, 2)
+    assert choices.dtype == torch.long
+    assert int(choices.max()) < 4
+    assert not choices.requires_grad
+    path = tmp_path / "choices.pt"
+    save_router_choices(path, tokens, choices, split="train", fragment_tokens=DEFAULT_FRAGMENT_TOKENS)
+    blob = load_router_choices(path)
+    assert blob["router"] == "lstm"
+    assert blob["fragment_tokens"] == 2048
+    assert "teacher_logits" not in blob
+    assert torch.equal(blob["token_ids"], tokens)
+    assert torch.equal(blob["expert_index"], choices)
