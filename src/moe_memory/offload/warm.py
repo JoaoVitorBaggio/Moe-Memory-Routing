@@ -88,7 +88,17 @@ class WarmTier:
         if ready:
             return
         t0 = _now()
-        event.wait()
+        while True:
+            if event.wait(timeout=0.05):
+                break
+            with self._cv:
+                self._raise_if_error()
+                current = self._events.get(key)
+                if current is None or key not in self._wanted:
+                    raise KeyError(f"expert {key} não foi pedido ao morno")
+                if current.is_set():
+                    break
+                event = current
         with self._cv:
             self._raise_if_error()
             if key not in self.pool or not self._events[key].is_set():
@@ -150,8 +160,10 @@ class WarmTier:
             thread.join(timeout=5)
 
     def _request_locked(self, key: tuple[int, int], step: int) -> None:
-        previous = self._wanted.get(key)
-        self._wanted[key] = step if previous is None else min(previous, step)
+        # O passo novo substitui o antigo. O min entre repetições já foi
+        # feito em ``sync``. Segurar o passo velho impede a vaga de quem
+        # o token vai executar agora.
+        self._wanted[key] = step
         self._cancel.discard(key)
         event = self._events.get(key)
         if event is None:
@@ -183,13 +195,16 @@ class WarmTier:
                 for key in self.pool.occupied()
                 if key not in self._inflight
                 and self._holds.get(key, 0) == 0
-                and self._wanted.get(key, -1) > self._wanted[urgent]
+                and self._wanted.get(key, 10**9) > self._wanted[urgent]
             ]
             if not victims:
                 return
-            victim = max(victims, key=lambda key: (self._wanted[key], key))
+            victim = max(victims, key=lambda key: (self._wanted.get(key, 10**9), key))
             self.pool.evict(victim)
-            self._events[victim] = threading.Event()
+            if victim in self._wanted:
+                self._events[victim] = threading.Event()
+            else:
+                self._events.pop(victim, None)
 
     def _pick_locked(self) -> tuple[int, int] | None:
         pending = []
@@ -203,10 +218,32 @@ class WarmTier:
         key = pending[0][1]
         slot = self.pool.reserve(key)
         if slot is None:
-            return None
+            self._evict_for_locked(key)
+            slot = self.pool.reserve(key)
+            if slot is None:
+                return None
         self._inflight.add(key)
         self.read_order.append(key)
         return key
+
+    def _evict_for_locked(self, urgent: tuple[int, int]) -> None:
+        urgent_step = self._wanted.get(urgent, 0)
+        victims = [
+            key
+            for key in self.pool.occupied()
+            if key not in self._inflight
+            and self._holds.get(key, 0) == 0
+            and key != urgent
+            and self._wanted.get(key, 10**9) > urgent_step
+        ]
+        if not victims:
+            return
+        victim = max(victims, key=lambda key: (self._wanted.get(key, 10**9), key))
+        self.pool.evict(victim)
+        if victim in self._wanted:
+            self._events[victim] = threading.Event()
+        else:
+            self._events.pop(victim, None)
 
     def _worker(self) -> None:
         while True:

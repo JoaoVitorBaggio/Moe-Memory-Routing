@@ -9,8 +9,10 @@ do top-K.
 
 ``TwoHorizonLstmRouter`` é a extensão de dois níveis (SSD, 07/11/2026).
 Um tronco, uma cabeça linear por camada, duas defasagens. A máscara
-morno/quente está em ``tier_mask.py``. Não move peso e não entra na
-loss dos quatro braços.
+morno/quente está em ``tier_mask.py``. Cada sequência começa com o
+conjunto inicial cheio (``k1`` por camada, fora do ``b2``): o score do
+prompt, ou o do token ``BOS_ID`` se não houver prompt. Não move peso e
+não entra na loss dos quatro braços.
 
 ``HEAD_INIT_STD`` deixa a softmax perto da uniforme e, por ser maior
 que zero, o primeiro backward já alcança o LSTM. Não é cota de hardware.
@@ -30,6 +32,11 @@ from torch import nn
 # uniforme, e não zero para o gradiente chegar ao LSTM no primeiro passo.
 # Constante do esqueleto, não medição de banda nem de t_tok.
 HEAD_INIT_STD = 1e-3
+
+# Token que pontua o conjunto inicial quando a sequência não tem prompt.
+# Não entra no lote de treino nem no decode. O Qwen3 público não fixa um
+# BOS único; este desenho usa o id 0.
+BOS_ID = 0
 
 
 @dataclass
@@ -259,7 +266,8 @@ class TwoHorizonLstmRouter(nn.Module):
     experts novos no morno, somando as camadas. ``refresh_n1`` e
     ``refresh_n2``, se não forem ``None``, seguram o quente e o morno
     por esse número de tokens. O orçamento ``b2`` continua valendo no
-    passo em que o morno atualiza.
+    passo em que o morno atualiza, e não cobre o conjunto inicial:
+    ``plan`` semeia ``k1`` experts por camada antes do primeiro token.
 
     O peso mole da mistura é a softmax só sobre os experts quentes
     daquele token (a massa some 1). Isso é o ``norm_topk_prob`` do
@@ -378,13 +386,27 @@ class TwoHorizonLstmRouter(nn.Module):
         self,
         token_ids: torch.Tensor,
         state: TwoHorizonState | None = None,
+        *,
+        warm_start: bool = True,
     ) -> tuple["TierPlan", TwoHorizonState]:
-        """Scores defasados e a máscara dos dois níveis, a mesma da inferência."""
+        """Scores defasados e a máscara dos dois níveis, a mesma da inferência.
 
-        from moe_memory.tier_mask import plan_from_scores
+        Sem estado prévio e com ``warm_start``, o morno e o quente nascem
+        no ``initial_set`` do BOS. O token 0 não entra nesta sequência: só
+        pontua. ``warm_start=False`` é o morno vazio, o comportamento
+        antigo, em que o ``b2`` enche o conjunto durante a sequência.
+        """
+
+        from moe_memory.tier_mask import initial_set, plan_from_scores
 
         decision, new_state = self.forward(token_ids, state)
-        tier_in = None if state is None else state.tier
+        if state is not None and state.tier is not None:
+            tier_in = state.tier
+        elif warm_start:
+            scores = self.bos_scores(token_ids.shape[0], token_ids.device, decision.raw_scores.dtype)
+            tier_in = initial_set(scores, self.k1)
+        else:
+            tier_in = None
         masks, tier_out = plan_from_scores(
             decision.warm_scores,
             decision.hot_scores,
@@ -399,6 +421,59 @@ class TwoHorizonLstmRouter(nn.Module):
         )
         new_state.tier = tier_out
         return masks, new_state
+
+    def bos_scores(
+        self,
+        batch: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """Score cru do BOS, ``[B, camadas, E]``. Não grava o token na sequência."""
+
+        if batch < 1:
+            raise ValueError("batch do BOS precisa ser >= 1")
+        if not 0 <= BOS_ID < self.vocab_size:
+            raise ValueError(f"BOS id {BOS_ID} está fora do vocabulário {self.vocab_size}")
+        ids = torch.full((batch, 1), BOS_ID, dtype=torch.long, device=device)
+        with torch.no_grad():
+            decision, _state = self.forward(ids)
+        scores = decision.raw_scores[:, -1].detach()
+        if dtype is not None and scores.dtype != dtype:
+            scores = scores.to(dtype=dtype)
+        return scores
+
+    def initial_tier(self, batch: int = 1, device: torch.device | None = None) -> "TierState":
+        """Conjunto inicial do BOS, o mesmo que ``plan`` semeia sem prompt."""
+
+        from moe_memory.tier_mask import TierState, initial_set
+
+        if device is None:
+            device = self.embed.weight.device
+        tier: TierState = initial_set(self.bos_scores(batch, device), self.k1)
+        return tier
+
+    def bootstrap(self, prompt_ids: torch.Tensor) -> TwoHorizonState:
+        """Lê o prompt e devolve o LSTM com o conjunto inicial já cheio.
+
+        O ``step`` do tier continua 0: o prompt não é token decodificado
+        e não gasta ``b2``. O score do conjunto é o raw do último token
+        do prompt. Sem prompt, o caminho é ``plan`` / ``initial_tier``.
+        """
+
+        from moe_memory.tier_mask import initial_set
+
+        if prompt_ids.ndim == 1:
+            prompt_ids = prompt_ids.unsqueeze(0)
+        if prompt_ids.ndim != 2 or prompt_ids.numel() < 1:
+            raise ValueError("prompt precisa ser [B, T] ou [T], com ao menos um token")
+        if prompt_ids.dtype != torch.long:
+            raise ValueError("prompt precisa ser long")
+        if int(prompt_ids.min().item()) < 0 or int(prompt_ids.max().item()) >= self.vocab_size:
+            raise ValueError("token do prompt fora do vocabulário")
+        with torch.no_grad():
+            decision, state = self.forward(prompt_ids)
+        state.tier = initial_set(decision.raw_scores[:, -1].detach(), self.k1)
+        return state
 
     def _project(self, recurrent: torch.Tensor) -> torch.Tensor:
         parts = [head(recurrent) for head in self.heads]
