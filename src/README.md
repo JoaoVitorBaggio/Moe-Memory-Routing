@@ -26,6 +26,8 @@ A contagem da arquitetura fechada é 47.939.328 parâmetros (~48 M): a embedding
 
 `w(a,b) = |c(b) − c(a)|` não aparece no YAML: a loss deriva da tabela `c`.
 
+`moe_memory/offload/` move o expert de verdade no Qwen3-30B-A3B. Fica ao lado dos quatro braços: não lê `configs/default.yaml`. O repack e o bench estão em `scripts/repack_qwen3_experts.py` e `scripts/bench_offload_decode.py`. O checkpoint de ~61 GB não cabe junto da saída nos ~44 GB livres; sem `--delete-source-after-each-shard` o repack recusa. Detalhe em [`docs/metodo-router-lstm-adiantado.md`](../docs/metodo-router-lstm-adiantado.md).
+
 O LSTM de dois níveis e o adapter do Qwen3 não leem `configs/default.yaml` e não alteram os quatro braços. A cópia entre SSD, RAM e VRAM não está neste código: `TierPlan.prefetch` só devolve os ids.
 
 Homes físicos, quando o device é CUDA: morno = CPU pinned (sobe no forward se o top-2 escolheu); frio = memmap (sobe se foi escolhido ou se o LRU promoveu). No smoke de CPU os `nn.Parameter` continuam no device de compute. O procedimento da parede na 1060 está em [`docs/plano-de-hardware.md`](../docs/plano-de-hardware.md).

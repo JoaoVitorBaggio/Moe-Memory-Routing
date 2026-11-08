@@ -101,3 +101,13 @@ O Pre-gated MoE adianta o gate a partir do estado interno da rede. Cada nível d
 ### O que a medição de 07/11/2026 fixa
 
 Naquela máquina, o orçamento por token fica em cerca de 5–6 experts novos a partir do SSD (no piso, `5/384 ≈ 1,3%` dos 384 que o token executa: `48 * 8`) e cerca de 90 a partir da RAM. O cache morno, em cerca de 12–13 GB, comporta cerca de 1.400 dos 6.144 experts, ~22%. O `t_tok` de ~68 ms é limite superior de código ingênuo, batch 1, sem otimização. Um passo otimizado tende a ser mais curto, e o orçamento aperta. A conta, as bandas e as ressalvas estão na nota de medição.
+
+### Movimento do byte
+
+Quem executa a cópia é `src/moe_memory/offload/`. O `TierPlan` continua só listando `(camada, expert)`. Isto não altera `configs/default.yaml` nem os quatro braços.
+
+O store guarda cada expert num bloco contíguo alinhado a 4 KiB, `gate|up|down`, com um índice pequeno. Atenção, normas, embeddings, `lm_head` e o gate original ficam num arquivo residente. O repack (`scripts/repack_qwen3_experts.py`) lê os safetensors em streaming, um expert por vez, e limita a taxa de escrita com fsync por pedaço. Não carrega o modelo. Um download de ~61 GB sem teto travou o PC por page cache suja; o padrão é 80 MB/s.
+
+Na máquina de 07/11/2026 o checkpoint tem cerca de 61 GB e sobram cerca de 44 GB. A saída repete os corpos (~54 GiB) e o resto da rede. Sem apagar a fonte, os dois não cabem juntos, e o script sai sem escrever. `--delete-source-after-each-shard` apaga cada shard depois do fsync; o pico extra fica na ordem do maior shard. A flag é destrutiva e o padrão é não usá-la.
+
+O morno é um pool fixo de vagas em RAM pinned. O tamanho padrão sai do orçamento de ~12 GiB. Threads leem o store com `O_DIRECT` quando o sistema aceita, senão `pread`, no horizonte `L2`, e soltam quem o plano tira do conjunto. O quente é um pool fixo na VRAM, `k1` vagas por camada mais a folga. A cópia sobe num stream CUDA separado, com events, no horizonte `L1`, e pode sobrepor o compute. Sem folga a VRAM reusa a vaga de quem saiu: residentes (~3 GB) mais os 384 experts (~3,6 GB) já encostam nos 6 GB da 1060. Se o expert não chegou, o token espera e o tempo entra no stall daquele nível. `--mode on-demand` não adianta a cópia. O bench (`scripts/bench_offload_decode.py`) grava tokens/s, stall, bytes lidos, picos e misses em `outputs/`. `--dry-run` não abre o checkpoint.
