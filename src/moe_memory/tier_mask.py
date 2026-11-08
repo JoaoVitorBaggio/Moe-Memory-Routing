@@ -16,7 +16,7 @@ conjunto: ele só é reavaliado a cada N tokens, contados desde o começo
 da sequência (o estado carrega o passo). No passo parado a contagem de
 novos é zero. O teto ``b2`` vale no passo em que o morno muda.
 
-O prefetch lista ids. O próximo passo do projeto é quem move o byte.
+O prefetch lista ids. Quem move o byte é ``moe_memory.offload``.
 """
 
 from __future__ import annotations

@@ -42,6 +42,10 @@ logs/
 # Datasets baixados (WikiText-2, TinyStories, cache do Hugging Face)
 data/
 datasets/
+models/
+
+# Store de experts do offload (dezenas de GB; o índice mora no mesmo arquivo)
+*.moestore
 .cache/
 **/*.arrow
 **/*.parquet
