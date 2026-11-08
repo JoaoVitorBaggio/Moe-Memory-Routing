@@ -1,6 +1,6 @@
 # Roteador LSTM adiantado
 
-Este desenho substitui o roteador do OLMoE por um LSTM que lê só o fluxo de tokens. Fica ao lado do experimento dos quatro braços: não altera `configs/default.yaml`, não muda a loss com `λ` e não destila o roteador original. Não há número medido neste texto. `L`, `K` e o tamanho do estado do LSTM saem da máquina, na hora da corrida, pelo `scripts/hw_microbench.py`. O módulo `src/moe_memory/lstm_ahead_router.py` é um esqueleto. Ele fixa a forma do cálculo, com dimensão minúscula no teste, sem peso de OLMoE e sem laço de treino.
+Este desenho substitui o roteador do OLMoE por um LSTM que lê só o fluxo de tokens. Fica ao lado do experimento dos quatro braços: não altera `configs/default.yaml`, não muda a loss com `λ` e não destila o roteador original. Não há número medido nas seções do OLMoE. A extensão no fim deste arquivo é a decisão de 07/11/2026; as bandas medidas estão em [medicoes-hw-fedora-qwen3.md](medicoes-hw-fedora-qwen3.md) e não preenchem `L` nem `K` deste esqueleto. `L`, `K` e o tamanho do estado do LSTM saem da máquina, na hora da corrida, pelo `scripts/hw_microbench.py`. O módulo `src/moe_memory/lstm_ahead_router.py` é um esqueleto. Ele fixa a forma do cálculo, com dimensão minúscula no teste, sem peso de OLMoE e sem laço de treino.
 
 ## O que corre no lugar do roteador
 
@@ -59,3 +59,45 @@ Treinar no `L` mínimo da fórmula e comparar a perplexidade com a do OLMoE orig
 `scripts/hw_microbench.py` lê só o `config.json`, por arquivo local ou pela URL do config no Hub. Pesos não entram. Ele calcula `S_e`, mede a banda pinned de host para GPU quando há CUDA e aceita `t_tok` como argumento. Sem `t_tok` e com CUDA, mede um proxy: o tempo das três multiplicações de um expert SwiGLU, um token, nas dimensões do config. Esse proxy não é o tempo de token do OLMoE. Faltam a atenção, os outros experts e o tráfego de ativação. Sem CUDA as duas medições são puladas e o processo termina sem erro. `L` e `K` numéricos só aparecem quando `BW`, `t_tok`, `m` e `M_hot` foram medidos ou passados no argumento. Nada disso é preenchido com um valor de placa inventado.
 
 `src/moe_memory/lstm_ahead_router.py` é o esqueleto: embedding de token, um LSTM, logits por camada para a posição `t+L`, softmax, top-K só como índice do que carregar, peso mole igual à probabilidade do LSTM no expert escolhido, inicialização quase uniforme. O teste usa dimensões minúsculas e não carrega o OLMoE.
+
+## Extensão para SSD: roteamento em dois níveis (decidido em 07/11/2026)
+
+Esta seção registra a decisão de 07/11/2026. Fica ao lado dos quatro braços: não altera `configs/default.yaml`, não muda a loss com `λ` e não mexe no esqueleto do OLMoE nem nos braços já medidos. As bandas e os tempos estão em [medicoes-hw-fedora-qwen3.md](medicoes-hw-fedora-qwen3.md). São estimativas de viabilidade. Não há treino nem perplexidade desta extensão.
+
+No protocolo, **não cabe** é o MoE pequeno sob o teto artificial `B`, porque aquele modelo cabe na 1060. O alvo daqui é outro: o checkpoint inteiro é maior do que a RAM e a VRAM juntas. Não há teto artificial, e esta nota não reclassifica os quatro braços.
+
+### Alvo
+
+O modelo é o Qwen3-30B-A3B, licença Apache 2.0. Em bf16 o checkpoint fica em torno de 61 GB. São 48 camadas e 128 experts por camada, com 8 experts executados por token em cada camada. `hidden_size` é 2048 e `moe_intermediate_size` é 768. Cada expert é um SwiGLU de três projeções, `S_e = 3 * 2048 * 768 * 2 = 9437184` bytes, cerca de 9,4 MB. Há `48 * 128 = 6144` experts. Os corpos somam `6144 * 9437184 = 57982058496` bytes, 54 GiB. A máquina tem 16 GB de RAM e 6 GB de VRAM, 22 GB juntas. Os 61 GB do checkpoint não cabem nas duas.
+
+O treino usa só LoRA nos experts e no roteador. Os pesos base ficam congelados. Ajuste fino completo e treino do zero ficam de fora: o estado do Adam fica na ordem de 2–3× os 61 GB, acima dos cerca de 44 GB livres em disco (a RAM dessa máquina é 16 GB), e gravar esse estado desgasta o SSD.
+
+### Desenho
+
+Um único LSTM, o mesmo que lê só tokens, trabalha com dois horizontes e dois tamanhos de seleção.
+
+O horizonte longo `L₂` é de cerca de 3 tokens. Ele escolhe o conjunto grande que sobe do SSD para a RAM. O conjunto muda devagar: a cada passo há um teto de experts novos, e quem entra ocupa o lugar dos de menor score.
+
+O horizonte curto `L₁` é de cerca de 1–2 tokens. Dentro do conjunto morno, ele escolhe os 8 experts por camada que sobem da RAM para a VRAM. O 8 por camada é a esparsidade do checkpoint. Esta extensão não varre esse número. O nível curto escolhe só dentro do conjunto do nível longo. A troca RAM↔VRAM é a mais rápida, então este horizonte é o menos adiantado.
+
+A alternativa simples inicial renova a VRAM a cada `N₁` passos e a RAM a cada `N₂` passos. Os períodos são independentes: `N₂` não precisa ser múltiplo de `N₁`.
+
+### Princípios
+
+O LSTM não prevê o roteador original e não tem taxa de acerto. A loss de treino continua sendo a de linguagem, e só ela.
+
+O orçamento de experts novos por token é restrição da arquitetura. Ele fica fora da loss. Não há penalidade de troca em nenhum dos dois níveis. No experimento anterior, penalidade de troca levou a colapso ou a troca constante, mesmo com a loss de balanceamento.
+
+Adiantado é decidir cedo, com o passado. A decisão da posição `t+L` usa só os tokens de índice `≤ t`. A mesma regra vale no treino, no prefill e na geração.
+
+A escolha fecha antes da cópia. O assincronismo é só o tempo de trazer o peso. Se a cópia atrasar, o token espera, e a saída é a da escolha já feita.
+
+No treino, a regra dos dois níveis é uma máscara determinística, a mesma da inferência. O passo de treino não move memória para aprender.
+
+O lote paralelo forma a união dos experts de várias sequências, maior do que a de uma sequência só. A regra vale por sequência. O lote fica pequeno, ou o gradiente acumula, para essa união continuar fiel à máscara.
+
+O Pre-gated MoE adianta o gate a partir do estado interno da rede. Cada nível de memória veria um estado diferente e precisaria do próprio mecanismo. O LSTM deste desenho lê só tokens. A mesma recorrência emite os dois horizontes.
+
+### O que a medição de 07/11/2026 fixa
+
+Naquela máquina, o orçamento por token fica em cerca de 5–6 experts novos a partir do SSD (no piso, `5/384 ≈ 1,3%` dos 384 que o token executa: `48 * 8`) e cerca de 90 a partir da RAM. O cache morno, em cerca de 12–13 GB, comporta cerca de 1.400 dos 6.144 experts, ~22%. O `t_tok` de ~68 ms é limite superior de código ingênuo, batch 1, sem otimização. Um passo otimizado tende a ser mais curto, e o orçamento aperta. A conta, as bandas e as ressalvas estão na nota de medição.
