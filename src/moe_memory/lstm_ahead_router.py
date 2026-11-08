@@ -1,14 +1,16 @@
-"""ESQUELETO do roteador LSTM adiantado.
+"""Roteadores LSTM que leem só ids de token.
 
-Não é o roteador do experimento dos quatro braços. Não carrega OLMoE,
-não treina e não destila roteador. O desenho está em
-``docs/metodo-router-lstm-adiantado.md``.
+``LstmAheadRouter`` é o ESQUELETO de um horizonte, o desenho do OLMoE em
+``docs/metodo-router-lstm-adiantado.md``. Não carrega OLMoE, não treina
+e não destila roteador. No passo ``t`` as logits são as dos experts da
+posição ``t + lookahead``. O top-K só escolhe o que carregar. O peso
+mole é a probabilidade do LSTM naquele expert, sem renormalizar dentro
+do top-K.
 
-O LSTM lê só ids de token. O estado oculto do Transformer não entra na
-recorrência. No passo ``t`` as logits são as dos experts da posição
-``t + lookahead``, uma fatia por camada. O top-K só escolhe o que
-carregar. O peso mole é a probabilidade do LSTM naquele expert, sem
-renormalizar dentro do top-K.
+``TwoHorizonLstmRouter`` é a extensão de dois níveis (SSD, 07/11/2026).
+Um tronco, uma cabeça linear por camada, duas defasagens. A máscara
+morno/quente está em ``tier_mask.py``. Não move peso e não entra na
+loss dos quatro braços.
 
 ``HEAD_INIT_STD`` deixa a softmax perto da uniforme e, por ser maior
 que zero, o primeiro backward já alcança o LSTM. Não é cota de hardware.
@@ -209,3 +211,248 @@ def _checked_state(
         hidden = hidden.to(device=device)
         cell = cell.to(device=device)
     return hidden, cell
+
+
+@dataclass
+class TwoHorizonDecision:
+    """Scores alinhados à posição que vai consumir o expert.
+
+    ``raw_scores[:, t]`` depende só dos tokens de índice ``<= t``.
+    ``hot_scores[:, t]`` é o raw da posição ``t - l1`` (estado zero se
+    ``t < l1``). ``warm_scores[:, t]`` é o raw de ``t - l2``. Quem escolhe
+    o expert da posição ``u`` lê o score alinhado, não o raw.
+    """
+
+    raw_scores: torch.Tensor
+    warm_scores: torch.Tensor
+    hot_scores: torch.Tensor
+    l1: int
+    l2: int
+
+
+@dataclass
+class TwoHorizonState:
+    """Estado para o próximo passo de token.
+
+    ``h`` e ``c`` são o LSTM. ``raw_hist`` guarda os últimos scores crus,
+    os que a defasagem ainda vai usar. ``tier`` é o conjunto morno/quente
+    já aplicado; ``None`` se este estado saiu de ``forward`` e a máscara
+    ainda não rodou. Inferência em fluxo chama ``plan``, que preenche
+    ``tier``.
+    """
+
+    h: torch.Tensor
+    c: torch.Tensor
+    raw_hist: torch.Tensor
+    tier: "TierState | None" = None
+
+
+class TwoHorizonLstmRouter(nn.Module):
+    """Um LSTM, uma cabeça por camada, horizontes ``l1`` (quente) e ``l2`` (morno).
+
+    A cabeça da camada ``c`` lê o estado do tronco e emite ``E`` scores.
+    ``L1`` e ``L2`` não acrescentam parâmetro: são deslocamentos do mesmo
+    score. A decisão da posição ``t + L`` usa só tokens de índice ``<= t``.
+
+    ``k1`` é o top do quente, dentro do morno. ``k2`` é o tamanho do morno
+    por camada. ``b2`` é o teto global, por token e por sequência, de
+    experts novos no morno, somando as camadas. ``refresh_n1`` e
+    ``refresh_n2``, se não forem ``None``, seguram o quente e o morno
+    por esse número de tokens. O orçamento ``b2`` continua valendo no
+    passo em que o morno atualiza.
+
+    O peso mole da mistura é a softmax só sobre os experts quentes
+    daquele token (a massa some 1). Isso é o ``norm_topk_prob`` do
+    Qwen3, não a regra do esqueleto do OLMoE, que não renormaliza.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        n_layers: int,
+        n_experts: int,
+        l1: int,
+        l2: int,
+        k1: int,
+        k2: int,
+        b2: int,
+        embed_dim: int,
+        hidden_size: int,
+        refresh_n1: int | None = None,
+        refresh_n2: int | None = None,
+    ) -> None:
+        super().__init__()
+        if vocab_size < 1:
+            raise ValueError("vocab_size precisa ser >= 1")
+        if n_layers < 1:
+            raise ValueError("n_layers precisa ser >= 1")
+        if n_experts < 1:
+            raise ValueError("n_experts precisa ser >= 1")
+        if l1 < 1:
+            raise ValueError("l1 precisa ser >= 1")
+        if l2 < l1:
+            raise ValueError(f"l2={l2} é o horizonte longo e precisa ser >= l1={l1}")
+        if not 1 <= k1 <= k2 <= n_experts:
+            raise ValueError(f"precisa 1 <= k1={k1} <= k2={k2} <= n_experts={n_experts}")
+        if b2 < 1:
+            raise ValueError("b2 precisa ser >= 1")
+        if embed_dim < 1 or hidden_size < 1:
+            raise ValueError("embed_dim e hidden_size precisam ser >= 1")
+        _check_refresh("refresh_n1", refresh_n1)
+        _check_refresh("refresh_n2", refresh_n2)
+        self.vocab_size = vocab_size
+        self.n_layers = n_layers
+        self.n_experts = n_experts
+        self.l1 = l1
+        self.l2 = l2
+        self.k1 = k1
+        self.k2 = k2
+        self.b2 = b2
+        self.embed_dim = embed_dim
+        self.hidden_size = hidden_size
+        self.refresh_n1 = refresh_n1
+        self.refresh_n2 = refresh_n2
+        self.embed = nn.Embedding(vocab_size, embed_dim)
+        self.lstm = nn.LSTM(
+            input_size=embed_dim,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+        )
+        self.heads = nn.ModuleList(nn.Linear(hidden_size, n_experts) for _ in range(n_layers))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.embed.weight, std=0.02)
+        self.lstm.reset_parameters()
+        for head in self.heads:
+            nn.init.normal_(head.weight, std=HEAD_INIT_STD)
+            nn.init.zeros_(head.bias)
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        state: TwoHorizonState | None = None,
+    ) -> tuple[TwoHorizonDecision, TwoHorizonState]:
+        """``token_ids`` é ``[B, T]`` long. Não há hidden de Transformer."""
+
+        if token_ids.ndim != 2:
+            raise ValueError(f"token_ids precisa ser [B, T], recebido {tuple(token_ids.shape)}")
+        if token_ids.dtype != torch.long:
+            raise ValueError("token_ids precisa ser long")
+        batch, _seq = token_ids.shape
+        lstm_state = None if state is None else _checked_state(
+            (state.h, state.c),
+            batch=batch,
+            hidden_size=self.hidden_size,
+            device=token_ids.device,
+        )
+        hist = None if state is None else _checked_hist(state.raw_hist, batch=batch, router=self, device=token_ids.device)
+        embedded = self.embed(token_ids)
+        recurrent, new_lstm = self.lstm(embedded, lstm_state)
+        raw = self._project(recurrent)
+        initial = self._initial_scores(batch, token_ids.device, raw.dtype)
+        warm_scores = _align(raw, self.l2, initial, hist)
+        hot_scores = _align(raw, self.l1, initial, hist)
+        combined = raw if hist is None else torch.cat([hist, raw], dim=1)
+        keep = max(self.l1, self.l2)
+        raw_hist = combined[:, -keep:].detach()
+        hidden, cell = new_lstm
+        decision = TwoHorizonDecision(
+            raw_scores=raw,
+            warm_scores=warm_scores,
+            hot_scores=hot_scores,
+            l1=self.l1,
+            l2=self.l2,
+        )
+        # ``tier`` fica com ``plan``. ``forward`` só avança o LSTM.
+        new_state = TwoHorizonState(
+            h=hidden.detach(),
+            c=cell.detach(),
+            raw_hist=raw_hist,
+            tier=None,
+        )
+        return decision, new_state
+
+    def plan(
+        self,
+        token_ids: torch.Tensor,
+        state: TwoHorizonState | None = None,
+    ) -> tuple["TierPlan", TwoHorizonState]:
+        """Scores defasados e a máscara dos dois níveis, a mesma da inferência."""
+
+        from moe_memory.tier_mask import plan_from_scores
+
+        decision, new_state = self.forward(token_ids, state)
+        tier_in = None if state is None else state.tier
+        masks, tier_out = plan_from_scores(
+            decision.warm_scores,
+            decision.hot_scores,
+            k1=self.k1,
+            k2=self.k2,
+            b2=self.b2,
+            refresh_n1=self.refresh_n1,
+            refresh_n2=self.refresh_n2,
+            l1=self.l1,
+            l2=self.l2,
+            state=tier_in,
+        )
+        new_state.tier = tier_out
+        return masks, new_state
+
+    def _project(self, recurrent: torch.Tensor) -> torch.Tensor:
+        parts = [head(recurrent) for head in self.heads]
+        return torch.stack(parts, dim=2)
+
+    def _initial_scores(self, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        zeros = torch.zeros(batch, 1, self.hidden_size, device=device, dtype=dtype)
+        return self._project(zeros).squeeze(1)
+
+
+def _check_refresh(name: str, value: int | None) -> None:
+    if value is not None and value < 1:
+        raise ValueError(f"{name} precisa ser >= 1 ou None")
+
+
+def _checked_hist(
+    hist: torch.Tensor,
+    *,
+    batch: int,
+    router: TwoHorizonLstmRouter,
+    device: torch.device,
+) -> torch.Tensor:
+    if hist.ndim != 4:
+        raise ValueError(f"raw_hist precisa ser [B, H, camadas, E], recebido {tuple(hist.shape)}")
+    if hist.shape[0] != batch or hist.shape[2] != router.n_layers or hist.shape[3] != router.n_experts:
+        raise ValueError(
+            "raw_hist não casa com o lote ou com a grade de experts: "
+            f"{tuple(hist.shape)} vs batch={batch}, camadas={router.n_layers}, E={router.n_experts}"
+        )
+    if hist.shape[1] > max(router.l1, router.l2):
+        raise ValueError("raw_hist é mais longo que o horizonte")
+    if hist.device != device:
+        hist = hist.to(device=device)
+    return hist
+
+
+def _align(
+    raw: torch.Tensor,
+    horizon: int,
+    initial: torch.Tensor,
+    hist: torch.Tensor | None,
+) -> torch.Tensor:
+    """``out[:, i]`` é o raw de ``i - horizon``, ou o score do estado zero.
+
+    ``hist`` são os raw anteriores ao chunk, do mais antigo ao mais novo.
+    A posição ``t + horizon`` fica com o raw do passo ``t``, que só viu
+    tokens de índice ``<= t``.
+    """
+
+    if horizon < 1:
+        raise ValueError("horizonte precisa ser >= 1")
+    batch, seq, _layers, _experts = raw.shape
+    combined = raw if hist is None else torch.cat([hist, raw], dim=1)
+    seen = 0 if hist is None else hist.shape[1]
+    init = initial.unsqueeze(1).expand(batch, horizon, initial.shape[1], initial.shape[2])
+    padded = torch.cat([init, combined], dim=1)
+    return padded[:, seen : seen + seq]

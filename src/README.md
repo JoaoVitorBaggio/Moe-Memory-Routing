@@ -20,8 +20,13 @@ A contagem da arquitetura fechada é 47.939.328 parâmetros (~48 M): a embedding
 | `moe_memory/loss.py` | CE do próximo token, `C_mem` e o balanceamento do Switch. Treino: média ponderada dos top-2. Inferência: soma dos top-2. Essa diferença é do **custo**, não do hidden (“custo real de acesso”). |
 | `moe_memory/config.py` | Lê e valida o YAML. |
 | `moe_memory/smoke.py` | Um passo de treino. O atalho sintético não lê corpus. |
+| `moe_memory/lstm_ahead_router.py` | Esqueleto de um horizonte (OLMoE) e o LSTM de dois horizontes. Lê só ids de token. `L1`/`L2` são defasagens, não parâmetros. |
+| `moe_memory/tier_mask.py` | Máscara determinística morno/quente, a mesma no treino e na inferência. Não copia peso e não entra na loss. `prefetch` lista os ids por nível e por passo. |
+| `moe_memory/qwen3_adapter.py` | Troca o gate do Qwen3-MoE pela decisão do LSTM. LoRA nos experts, base congelada, loss só de linguagem. Sem offload. |
 
 `w(a,b) = |c(b) − c(a)|` não aparece no YAML: a loss deriva da tabela `c`.
+
+O LSTM de dois níveis e o adapter do Qwen3 não leem `configs/default.yaml` e não alteram os quatro braços. A cópia entre SSD, RAM e VRAM não está neste código: `TierPlan.prefetch` só devolve os ids.
 
 Homes físicos, quando o device é CUDA: morno = CPU pinned (sobe no forward se o top-2 escolheu); frio = memmap (sobe se foi escolhido ou se o LRU promoveu). No smoke de CPU os `nn.Parameter` continuam no device de compute. O procedimento da parede na 1060 está em [`docs/plano-de-hardware.md`](../docs/plano-de-hardware.md).
 
