@@ -35,11 +35,12 @@ def f32_hex(value: float) -> str:
 
 
 def host_prefix(tensor: torch.Tensor, n: int = 8) -> str:
-    """Oito bytes do buffer de host. Não lê a cópia da GPU."""
+    """Oito bytes copiados do buffer de host. Não segura o bloco nem a GPU."""
 
-    flat = tensor.detach().contiguous().view(torch.uint8)
+    flat = tensor.detach().reshape(-1).view(torch.uint8)
     take = min(n, int(flat.numel()))
-    return bytes(flat[:take].cpu().tolist()).hex()
+    chunk = flat[:take].clone()
+    return bytes(chunk.tolist()).hex()
 
 
 def module_sha(module: nn.Module) -> str:

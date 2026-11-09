@@ -142,6 +142,8 @@ O bench continua sem prompt. O token 0 só pontua o conjunto inicial. O KV come�
 
 No PC, uma corrida por vez, `MemoryMax=7G` e `MemorySwapMax=0`. O pareado não reescreve o JSON de um modo só; o `--out` é outro arquivo. Repetir é outro `--out`, depois que o processo anterior saiu.
 
+O pareado no mesmo processo fechava o primeiro runtime sem soltar os blocos do `SlotPool`. O quente e o morno se apontam (o callback de pronto), então o ciclo só caía no coletor. O segundo modo alocava outro pool com o primeiro ainda vivo. `close` agora solta os blocos e tira o callback antes de o lookahead construir o runtime. O traço guarda 8 bytes copiados, não uma vista do bloco. Cada fase imprime uma linha no stderr, com flush, e o JSON repete esses instantâneos. `tracked_pool_bytes` é a soma dos pools ainda não soltos. `ram_peak_bytes` continua `max(ru_maxrss, morno lógico + residente lógico)`: residente na GPU entra nessa soma mesmo fora do RSS. `memory.current` do cgroup inclui cache de página; não é o RSS. `VmPin` é mlock do kernel e pode não listar o pinned do CUDA.
+
 ```
 python3 scripts/bench_offload_decode.py \
     --store-dir models/qwen3-30b-a3b-store \

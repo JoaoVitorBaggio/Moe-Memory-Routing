@@ -155,12 +155,22 @@ class WarmTier:
             event.wait(timeout=0.05)
         raise TimeoutError("prefetch morno não terminou")
 
+    def remove_ready_callback(self, callback: Callable[[], None]) -> None:
+        try:
+            self._on_ready.remove(callback)
+        except ValueError:
+            return
+
     def close(self) -> None:
         with self._cv:
             self._stop = True
             self._cv.notify_all()
         for thread in self._threads:
             thread.join(timeout=5)
+        if any(thread.is_alive() for thread in self._threads):
+            return
+        self._on_ready.clear()
+        self.pool.release()
 
     def _request_locked(self, key: tuple[int, int], step: int) -> None:
         # O passo novo substitui o antigo. O min entre repetições já foi
