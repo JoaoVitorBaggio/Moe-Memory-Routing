@@ -52,12 +52,25 @@ def module_sha(module: nn.Module) -> str:
     return digest.hexdigest()
 
 
-def store_sha(path: Path) -> str:
-    """Tamanho mais os primeiros 4 KiB. Não relê o corpo de 54 GiB."""
+# O fingerprint do store é tamanho + este prefixo. Não é integridade do arquivo.
+STORE_PREFIX_BYTES = 4096
 
-    blob = path.read_bytes()[:4096]
+
+def store_sha(path: Path) -> str:
+    """Tamanho mais no máximo os primeiros 4 KiB.
+
+    ``Path.read_bytes`` lê até o EOF e só então fatia: num store de ~55 GiB
+    isso pede a RAM do arquivo inteiro. Aqui o ``read`` já nasce com teto.
+    Arquivo menor que 4 KiB entra inteiro. Byte além do prefixo não muda o hash.
+    """
+
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        blob = handle.read(STORE_PREFIX_BYTES)
+    if len(blob) > STORE_PREFIX_BYTES:
+        raise RuntimeError(f"prefixo do store passou de {STORE_PREFIX_BYTES} bytes")
     digest = hashlib.sha256()
-    digest.update(str(path.stat().st_size).encode())
+    digest.update(str(size).encode())
     digest.update(blob)
     return digest.hexdigest()
 

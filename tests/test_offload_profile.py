@@ -15,7 +15,14 @@ from moe_memory.offload.bench import run_bench, run_paired
 from moe_memory.offload.profile import DecodeProfile, percentile
 from moe_memory.offload.runtime import OffloadRuntime
 from moe_memory.offload.synthetic import write_synthetic_bundle
-from moe_memory.offload.trace import ExecutionTrace, TraceDivergence, compare_traces, module_sha
+from moe_memory.offload.trace import (
+    STORE_PREFIX_BYTES,
+    ExecutionTrace,
+    TraceDivergence,
+    compare_traces,
+    module_sha,
+    store_sha,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -329,6 +336,98 @@ def test_cuda_profile_resolves_events_without_device_sync(tmp_path: Path):
         assert elapsed > 0
     finally:
         torch.cuda.synchronize = original  # type: ignore[method-assign]
+
+
+def test_store_sha_reads_only_the_prefix_of_a_huge_logical_file():
+    """O store real tem ~55 GiB. Este teste não o materializa.
+
+    O objeto mente o tamanho e recusa ``read`` sem teto e ``read_bytes``.
+    Se o fingerprint voltar a ler o arquivo inteiro, a asserção dispara
+    sem alocar essa RAM.
+    """
+
+    payload = bytes([index % 251 for index in range(STORE_PREFIX_BYTES + 128)])
+    fake = _BoundedStore(payload, reported_size=55 * 1024**3)
+    digest = store_sha(fake)  # type: ignore[arg-type]
+    assert fake.read_args == [STORE_PREFIX_BYTES]
+    assert fake.bytes_requested == STORE_PREFIX_BYTES
+    assert fake.read_bytes_calls == 0
+    assert digest == _expected_store_sha(fake.reported_size, payload[:STORE_PREFIX_BYTES])
+
+
+def test_store_sha_on_a_real_file_ignores_bytes_past_the_prefix(tmp_path: Path):
+    path = tmp_path / "experts.moestore"
+    body = bytes([index % 251 for index in range(STORE_PREFIX_BYTES + 64)])
+    path.write_bytes(body)
+    original = store_sha(path)
+    assert original == _expected_store_sha(len(body), body[:STORE_PREFIX_BYTES])
+    mutated = bytearray(body)
+    mutated[STORE_PREFIX_BYTES + 3] ^= 0xFF
+    path.write_bytes(mutated)
+    assert store_sha(path) == original
+    mutated[0] ^= 0xFF
+    path.write_bytes(mutated)
+    assert store_sha(path) != original
+    short = tmp_path / "short.moestore"
+    short.write_bytes(b"abc")
+    assert store_sha(short) == _expected_store_sha(3, b"abc")
+
+
+def test_store_sha_does_not_call_path_read_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "experts.moestore"
+    path.write_bytes(b"prefixo-curto")
+
+    def boom(self: Path) -> bytes:
+        del self
+        raise AssertionError("Path.read_bytes lê o arquivo até o EOF")
+
+    monkeypatch.setattr(Path, "read_bytes", boom)
+    assert store_sha(path) == _expected_store_sha(len(b"prefixo-curto"), b"prefixo-curto")
+
+
+def _expected_store_sha(size: int, prefix: bytes) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    digest.update(str(size).encode())
+    digest.update(prefix)
+    return digest.hexdigest()
+
+
+class _BoundedStore:
+    """Arquivo lógico enorme. Só entrega o que ``read(n)`` pedir, com n >= 0."""
+
+    def __init__(self, payload: bytes, reported_size: int) -> None:
+        self.payload = payload
+        self.reported_size = reported_size
+        self.read_args: list[int] = []
+        self.bytes_requested = 0
+        self.read_bytes_calls = 0
+
+    def stat(self):
+        return type("Stat", (), {"st_size": self.reported_size})()
+
+    def open(self, mode: str = "rb"):
+        if "b" not in mode:
+            raise AssertionError(mode)
+        return self
+
+    def read(self, n: int = -1) -> bytes:
+        self.read_args.append(n)
+        if n is None or n < 0:
+            raise AssertionError("read sem teto materializaria o store")
+        self.bytes_requested += n
+        return self.payload[:n]
+
+    def read_bytes(self) -> bytes:
+        self.read_bytes_calls += 1
+        raise AssertionError("read_bytes lê o arquivo até o EOF")
+
+    def __enter__(self) -> "_BoundedStore":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
 
 
 def _router(**overrides: int) -> TwoHorizonLstmRouter:
