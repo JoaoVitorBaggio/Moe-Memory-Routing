@@ -122,6 +122,35 @@ Depois desse carregamento toda camada tem `k1` experts quentes. O passo de decod
 
 A máscara de treino usa a mesma função, `initial_set` em `src/moe_memory/tier_mask.py`, chamada por `TwoHorizonLstmRouter.plan` no começo de cada sequência. O passo de treino continua sem mover byte. Inferência sem prompt e o `plan` do treino semeiam o mesmo conjunto e, dali em diante, aplicam o mesmo `b2`.
 
-O bench liga o conjunto inicial no lookahead e no on-demand. Os dois executam a mesma quantidade de experts por token, então tokens/s compara o mesmo trabalho. `--no-warm-start` volta ao morno vazio: o `b2` enche o conjunto durante o decode, e uma camada pode executar zero experts nos primeiros tokens.
+O bench liga o conjunto inicial no lookahead e no on-demand. Os dois podem executar a mesma quantidade de experts por token. A quantidade não diz qual expert rodou. `--no-warm-start` volta ao morno vazio: o `b2` enche o conjunto durante o decode, e uma camada pode executar zero experts nos primeiros tokens.
 
 O prompt alimenta o roteador. O cache de chave e valor do Qwen3 continua começando no primeiro token decodificado; esta seção não faz o prefill da atenção.
+
+### Instrumentação e comparação pareada
+
+O `elapsed_s` do bench é a parede de `decode()`, do instante anterior ao warm-start até o fim do último token. Entram o warm-start, o enqueue do prefetch e o loop. Ficam de fora a construção do runtime e o `load_resident` (`resident_load_s`). `prefetch_enqueue_s` é null no on-demand; no lookahead é só o tempo de enfileirar, não o fim da cópia. `tokens_per_s` divide por `elapsed_s`, então o warm-start está no denominador. `tokens_per_s_excluding_warm_start` tira só o warm-start; o prefetch e o loop continuam. `stall_warm_s` é a thread de decode parada em `warm.ensure`. Não é o tempo de `read_into` no worker.
+
+`--profile` liga a coleta por token (parede da thread: roteador, enqueue do plano, forward, stalls, atenção e `apply_experts` na CPU) e, na GPU, `cuda.Event` no stream que enfileira o trabalho. A atenção e o expert na GPU não incluem a espera do ensure. A resolução é um `stream.synchronize` por stream depois que `elapsed_s` já foi fechado. Não há `torch.cuda.synchronize` por token nem por camada. Somas do worker de SSD e dos events não são parcelas da parede: as threads e o stream de cópia se sobrepõem ao compute. Com mais de uma thread, a soma dos reads não é tempo de parede. Passou do teto (`--profile-max-tokens`, padrão 512), o decode segue e o relatório marca truncado. Desligado, esse objeto não existe.
+
+O que isso não prova: a causa de uma diferença de tok/s. Um cgroup perto do teto de memória é observação (`memory.current`, se existir), não causa. Números antigos de uma placa não ganham diagnóstico aqui.
+
+O modo simples do bench não chama `torch.manual_seed` antes do LSTM. O `--seed` só sorteia os ids dos tokens, num `Generator` local. Duas corridas contra o store real, no mesmo processo ou em processos diferentes, não têm o mesmo peso. O `--dry-run` é a exceção estreita: o gerador do bundle sintético semeia o RNG global antes de construir o roteador. Bytes de SSD diferentes entre corridas simples não separam agenda de carga.
+
+`--paired` roda on-demand e depois lookahead, em sequência, no mesmo processo, com o mesmo `state_dict`, os mesmos tokens, os mesmos tetos e o mesmo conjunto inicial. Cada modo usa o runtime de verdade: o prefetch não vira oráculo e `b2`, `k1` e `k2` não afrouxam. O fingerprint cobre tetos, pesos, prefixo do store, tokens, conjunto inicial e as chamadas que o forward fez (camada, expert, peso mole, 8 bytes do buffer de host). Não entra modo, byte de SSD nem tempo. Se a execução divergir, o JSON guarda o ponto e o processo sai com erro. Traço truncado não certifica. O prefixo de host não é hash da cópia na GPU, e o hash do store é tamanho mais 4 KiB, não os 54 GiB.
+
+O bench continua sem prompt. O token 0 só pontua o conjunto inicial. O KV começa no primeiro token decodificado.
+
+No PC, uma corrida por vez, `MemoryMax=7G` e `MemorySwapMax=0`. O pareado não reescreve o JSON de um modo só; o `--out` é outro arquivo. Repetir é outro `--out`, depois que o processo anterior saiu.
+
+```
+python3 scripts/bench_offload_decode.py \
+    --store-dir models/qwen3-30b-a3b-store \
+    --paired --profile --trace \
+    --tokens 128 --seed 0 \
+    --k1 4 --k2 6 --b2 5 --l1 1 --l2 3 \
+    --warm-slots 320 --hot-slack 0 --warm-threads 2 \
+    --vram-budget-gb 5.5 --device cuda \
+    --out outputs/paired-128-seed0-a.json
+```
+
+A segunda repetição usa `--out outputs/paired-128-seed0-b.json` e os mesmos argumentos. Este texto não traz tok/s medido nessa comparação: ela ainda não rodou na 1060.

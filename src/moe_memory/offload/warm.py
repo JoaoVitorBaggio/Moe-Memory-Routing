@@ -25,6 +25,7 @@ class WarmTier:
         stats: OffloadStats | None = None,
         n_threads: int = 1,
         pin: bool | None = None,
+        observer=None,
     ) -> None:
         if n_threads < 1:
             raise ValueError("n_threads precisa ser >= 1")
@@ -36,8 +37,10 @@ class WarmTier:
             device=torch.device("cpu"),
             pin=True if pin is None else pin,
         )
+        self.observer = observer
         self.read_order: list[tuple[int, int]] = []
         self._wanted: dict[tuple[int, int], int] = {}
+        self._asked_at: dict[tuple[int, int], float] = {}
         self._events: dict[tuple[int, int], threading.Event] = {}
         self._inflight: set[tuple[int, int]] = set()
         self._cancel: set[tuple[int, int]] = set()
@@ -171,9 +174,12 @@ class WarmTier:
             self._events[key] = event
         if key in self.pool and key not in self._inflight:
             event.set()
+        elif self.observer is not None and key not in self._asked_at:
+            self._asked_at[key] = _now()
 
     def _cancel_locked(self, key: tuple[int, int]) -> None:
         self._wanted.pop(key, None)
+        self._asked_at.pop(key, None)
         if key in self._inflight or self._holds.get(key, 0) > 0:
             self._cancel.add(key)
             return
@@ -254,10 +260,16 @@ class WarmTier:
                 if key is None:
                     self._cv.wait()
                     continue
+                asked = self._asked_at.pop(key, None) if self.observer is not None else None
+            io_started = _now() if self.observer is not None else 0.0
             try:
                 dest = self.pool.tensor(key)
                 self.store.read_into(key[0], key[1], dest)
                 nbytes = int(self.store.header.raw_nbytes)
+                if self.observer is not None:
+                    io_s = _now() - io_started
+                    queue_s = None if asked is None else io_started - asked
+                    self.observer.note_ssd_read(queue_s, io_s, nbytes)
             except Exception as exc:
                 with self._cv:
                     self._error = exc
