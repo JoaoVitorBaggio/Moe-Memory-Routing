@@ -28,6 +28,7 @@ class HotTier:
         dtype: torch.dtype,
         device: torch.device,
         stats: OffloadStats | None = None,
+        observer=None,
     ) -> None:
         if n_slots < 1:
             raise ValueError("o quente precisa de ao menos uma vaga")
@@ -36,6 +37,7 @@ class HotTier:
         self.dtype = dtype
         self.device = torch.device(device)
         self.stats = stats if stats is not None else warm.stats
+        self.observer = observer
         self.pool = SlotPool(n_slots, layout.block_nbytes, device=self.device, pin=False)
         self.stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
         self._wanted: dict[tuple[int, int], int] = {}
@@ -206,7 +208,10 @@ class HotTier:
                 host = self.warm.tensor(key).detach()
                 dest = self.pool.tensor(key)
                 if self.stream is None:
+                    copy_started = _now() if self.observer is not None else 0.0
                     dest.copy_(host)
+                    if self.observer is not None:
+                        self.observer.note_h2d_cpu(_now() - copy_started, int(host.nbytes))
                     with self._cv:
                         self._launched.discard(key)
                         if key in self._cancel or key not in self._wanted:
@@ -217,10 +222,16 @@ class HotTier:
                             self._events[key].set()
                         self._cv.notify_all()
                 else:
+                    timing = self.observer is not None
+                    start = torch.cuda.Event(enable_timing=True) if timing else None
+                    event = torch.cuda.Event(enable_timing=timing)
                     with torch.cuda.stream(self.stream):
+                        if start is not None:
+                            start.record(self.stream)
                         dest.copy_(host, non_blocking=True)
-                        event = torch.cuda.Event()
                         event.record(self.stream)
+                    if start is not None and self.observer is not None:
+                        self.observer.note_h2d_gpu(self.stream, start, event, int(host.nbytes))
                     with self._cv:
                         self._launched.discard(key)
                         self._cuda[key] = event

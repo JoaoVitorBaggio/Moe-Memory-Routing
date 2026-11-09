@@ -174,8 +174,13 @@ def forward_token(
     token_id: int,
     position: int,
     before_moe,
+    on_span=None,
 ) -> tuple[torch.Tensor, int]:
-    """Um token. ``before_moe(camada)`` devolve os experts quentes e pode bloquear."""
+    """Um token. ``before_moe(camada)`` devolve os experts quentes e pode bloquear.
+
+    ``on_span(nome, "begin"|"end")`` é opt-in. O intervalo ``expert`` cobre
+    só ``apply_experts``; a espera do ensure fica em ``before_moe``.
+    """
 
     spec = weights.spec
     if not 0 <= token_id < spec.vocab_size:
@@ -184,10 +189,18 @@ def forward_token(
     executed = 0
     for index, layer in enumerate(weights.layers):
         normed = rms_norm(hidden, layer.input_norm, spec.rms_eps)
+        if on_span is not None:
+            on_span("attention", "begin")
         hidden = hidden + _attention(layer, normed, cache, index, position, spec)
+        if on_span is not None:
+            on_span("attention", "end")
         calls = before_moe(index)
         executed += len(calls)
+        if on_span is not None:
+            on_span("expert", "begin")
         hidden = hidden + apply_experts(rms_norm(hidden, layer.post_norm, spec.rms_eps), calls)
+        if on_span is not None:
+            on_span("expert", "end")
     logits = F.linear(rms_norm(hidden, weights.final_norm, spec.rms_eps), weights.lm_head)
     return logits.view(1, -1), executed
 

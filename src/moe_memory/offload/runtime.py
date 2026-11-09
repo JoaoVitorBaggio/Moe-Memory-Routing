@@ -21,10 +21,12 @@ import torch
 from moe_memory.levels import HOT, WARM
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter, TwoHorizonState
 from moe_memory.offload.hot import HotTier
+from moe_memory.offload.profile import DecodeProfile, cgroup_memory_current
 from moe_memory.offload.qwen import KvCache, QwenWeights, forward_token, load_resident, load_spec
 from moe_memory.offload.schedule import lookahead_plan
 from moe_memory.offload.stats import OffloadStats
 from moe_memory.offload.store import ExpertStore
+from moe_memory.offload.trace import ExecutionTrace, f32_hex, host_prefix
 from moe_memory.offload.warm import WarmTier
 from moe_memory.tier_mask import TierPlan, TierState
 
@@ -42,6 +44,8 @@ class OffloadRuntime:
         n_warm_threads: int = 1,
         direct: bool = True,
         warm_start: bool = True,
+        profile: DecodeProfile | None = None,
+        trace: ExecutionTrace | None = None,
     ) -> None:
         if warm_slots < 1:
             raise ValueError("warm_slots precisa ser >= 1")
@@ -49,6 +53,8 @@ class OffloadRuntime:
             raise ValueError("hot_slack precisa ser >= 0")
         self.lookahead = lookahead
         self.warm_start = warm_start
+        self.profile = profile
+        self.trace = trace
         self.router = router
         self.device = torch.device("cpu") if device is None else torch.device(device)
         self.stats = OffloadStats()
@@ -70,8 +76,16 @@ class OffloadRuntime:
             raise ValueError("config.json não casa com o roteador")
         if self.spec.hidden_size != header.hidden or self.spec.moe_intermediate != header.intermediate:
             raise ValueError("config.json não casa com o bloco do expert")
+        load_started = _now()
         self.weights: QwenWeights = load_resident(store_dir / "resident.bin", self.spec, self.device)
-        self.warm = WarmTier(self.store, warm_slots, stats=self.stats, n_threads=n_warm_threads)
+        self.stats.resident_load_s = _now() - load_started
+        self.warm = WarmTier(
+            self.store,
+            warm_slots,
+            stats=self.stats,
+            n_threads=n_warm_threads,
+            observer=profile,
+        )
         hot_slots = router.n_layers * router.k1 + hot_slack
         self.hot = HotTier(
             self.warm,
@@ -80,6 +94,7 @@ class OffloadRuntime:
             dtype=self.weights.embed.dtype,
             device=self.device,
             stats=self.stats,
+            observer=profile,
         )
         self.hot_slots = hot_slots
         self.warm_slots = warm_slots
@@ -111,20 +126,33 @@ class OffloadRuntime:
         self.stats.experts_executed_per_token = []
         self.stats.warm_start_s = 0.0
         self.stats.warm_start_bytes = 0
+        self.stats.prefetch_enqueue_s = None
+        self.stats.decode_loop_s = None
+        if self.profile is not None:
+            self.profile.cgroup_memory_current_bytes_start = cgroup_memory_current()
         started = _now()
+        loop_started: float | None = None
         try:
             with torch.no_grad():
                 if self.warm_start:
                     self._warm_start(prompt_ids)
                 if self.lookahead:
+                    prefetch_started = _now()
                     self._prefetch_initial()
+                    self.stats.prefetch_enqueue_s = _now() - prefetch_started
+                loop_started = _now()
                 for position, token in enumerate(token_ids):
                     self._step(position, int(token))
         finally:
             self.stats.tokens = len(token_ids)
+            if loop_started is not None:
+                self.stats.decode_loop_s = _now() - loop_started
             self.stats.elapsed_s = _now() - started
             self.stats.ram_peak_bytes = max(_rss_bytes(), self.warm.pool.nbytes + self.weights.nbytes())
             self.stats.vram_peak_bytes = _vram_bytes(self.device, self.hot.pool.nbytes)
+            if self.profile is not None:
+                self.profile.cgroup_memory_current_bytes_end = cgroup_memory_current()
+                self.profile.resolve()
         return self.stats
 
     def close(self) -> None:
@@ -133,25 +161,45 @@ class OffloadRuntime:
         self.store.close()
 
     def _step(self, position: int, token: int) -> torch.Tensor:
+        record = self.profile is not None and self.profile.accepting_token()
+        token_started = _now() if record else 0.0
         ids = torch.tensor([[token]], dtype=torch.long)
+        router_started = _now() if record else 0.0
         plan, self.state = self.router.plan(ids, self.state, warm_start=self.warm_start)
+        router_wall = (_now() - router_started) if record else 0.0
         self._plan = plan
         self.plans.append(plan)
+        schedule_started = _now() if record else 0.0
         self._install(plan)
+        schedule_wall = (_now() - schedule_started) if record else 0.0
         per_layer: list[int] = []
+        self._step_calls = []
+        stall_warm_before = self.stats.stall_warm_s
+        stall_hot_before = self.stats.stall_hot_s
 
         def provide(layer: int):
             calls = self._experts(plan, layer)
             per_layer.append(len(calls))
             return calls
 
+        def on_span(kind: str, phase: str) -> None:
+            if self.profile is None or not record:
+                return
+            if phase == "begin":
+                self.profile.begin(kind)
+            else:
+                self.profile.end(kind, position)
+
+        forward_started = _now() if record else 0.0
         logits, executed = forward_token(
             self.weights,
             self.cache,
             token,
             position,
             provide,
+            on_span=on_span if self.profile is not None else None,
         )
+        forward_wall = (_now() - forward_started) if record else 0.0
         if self.warm_start and any(count < self.router.k1 for count in per_layer):
             raise RuntimeError(
                 "camada executou menos de k1 experts depois do conjunto inicial: "
@@ -160,7 +208,30 @@ class OffloadRuntime:
         self.executed_per_layer.append(per_layer)
         self.stats.experts_executed += executed
         self.stats.experts_executed_per_token.append(executed)
+        if self.trace is not None:
+            self.trace.add_step(self._step_calls)
         self.last_logits = logits.detach()
+        if record and self.profile is not None:
+            attention_cpu, expert_cpu = self.profile.consume_cpu()
+            token_wall = _now() - token_started
+            stall_warm = self.stats.stall_warm_s - stall_warm_before
+            stall_hot = self.stats.stall_hot_s - stall_hot_before
+            accounted = router_wall + schedule_wall + forward_wall
+            self.profile.add_token(
+                {
+                    "router_wall_s": router_wall,
+                    "schedule_enqueue_wall_s": schedule_wall,
+                    "forward_wall_s": forward_wall,
+                    "stall_warm_wall_s": stall_warm,
+                    "stall_hot_wall_s": stall_hot,
+                    "attention_cpu_wall_s": attention_cpu,
+                    "expert_cpu_wall_s": expert_cpu,
+                    "token_wall_s": token_wall,
+                    "unaccounted_wall_s": token_wall - accounted,
+                    "attention_gpu_s": None,
+                    "expert_gpu_s": None,
+                }
+            )
         return logits
 
     def _experts(self, plan: TierPlan, layer: int):
@@ -176,6 +247,10 @@ class OffloadRuntime:
             gate, up, down = self.hot.views(key)
             coeff = plan.soft_weights[0, 0, layer, slot]
             calls.append((gate, up, down, coeff))
+            if self.trace is not None:
+                self._step_calls.append(
+                    (layer, expert, f32_hex(float(coeff)), host_prefix(self.warm.tensor(key)))
+                )
         return calls
 
     def _warm_start(self, prompt_ids: list[int] | None) -> None:
@@ -198,6 +273,8 @@ class OffloadRuntime:
                 raise RuntimeError("bootstrap não devolveu o conjunto inicial")
             tier = self.state.tier
         self._stage_initial(tier)
+        if self.trace is not None:
+            self.trace.set_initial(_keys_from_mask(tier.hot[0]))
         self.stats.warm_start_s = _now() - started
         self.stats.warm_start_bytes = self.stats.ssd_bytes - before
 

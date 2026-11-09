@@ -21,7 +21,9 @@ from pathlib import Path
 import torch
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
+from moe_memory.offload.profile import DecodeProfile
 from moe_memory.offload.runtime import OffloadRuntime
+from moe_memory.offload.trace import ExecutionTrace, TraceDivergence, compare_traces, module_sha, store_sha
 from moe_memory.offload.space import (
     REFERENCE_CHECKPOINT_BYTES,
     REFERENCE_FREE_BYTES,
@@ -29,6 +31,20 @@ from moe_memory.offload.space import (
 )
 from moe_memory.offload.store import ExpertStore
 from moe_memory.offload.synthetic import write_synthetic_bundle
+
+MEMORY_RUN_NOTE = (
+    "Uma corrida por vez. No PC, MemoryMax=7G e MemorySwapMax=0. "
+    "Não dispare lookahead e on-demand em paralelo. O modo pareado roda "
+    "os dois em sequência, no mesmo processo, com os mesmos pesos."
+)
+
+CANNOT_PROVE = (
+    "O perfil não aponta a causa da diferença de tok/s. "
+    "elapsed_s inclui warm-start e o enqueue do prefetch e exclui load_resident. "
+    "Stall não é o read do worker. Somas de SSD e de events CUDA não são parcelas da parede. "
+    "Corridas simples não semeiam o LSTM: o mesmo --seed não repete o peso entre processos. "
+    "O pareado repete a execução; bytes copiados ainda podem diferir por prefetch e despejo.",
+)
 
 DISK_NOTE = (
     "O checkpoint em bf16 fica em torno de 61 GB e, na máquina de 07/11/2026, "
@@ -57,6 +73,10 @@ def run_bench(
     vram_budget_bytes: int | None = None,
     router_dim: int = 32,
     warm_start: bool = True,
+    profile: bool = False,
+    trace: bool = False,
+    profile_max_tokens: int = 512,
+    seed_router: bool = False,
 ) -> dict:
     if tokens < 1:
         raise ValueError("tokens precisa ser >= 1")
@@ -92,6 +112,10 @@ def run_bench(
             vram_budget_bytes=vram_budget_bytes,
             router_dim=router_dim,
             warm_start=warm_start,
+            profile=profile,
+            trace=trace,
+            profile_max_tokens=profile_max_tokens,
+            seed_router=seed_router,
         )
     finally:
         if owns_tmp is not None:
@@ -118,6 +142,12 @@ def _run(
     vram_budget_bytes: int | None,
     router_dim: int,
     warm_start: bool,
+    profile: bool = False,
+    trace: bool = False,
+    profile_max_tokens: int = 512,
+    seed_router: bool = False,
+    router_state: dict | None = None,
+    write_json: bool = True,
 ) -> dict:
     preview = ExpertStore.open(store_dir / "experts.moestore", direct=False)
     try:
@@ -162,6 +192,13 @@ def _run(
         )
     if vram_budget_bytes is not None and vram_estimate > vram_budget_bytes:
         raise ValueError(vram_warning or f"VRAM estimada {vram_estimate} passa de {vram_budget_bytes}")
+    if trace and tokens > profile_max_tokens:
+        raise ValueError(
+            f"traço de {tokens} tokens passa do teto {profile_max_tokens}; "
+            "suba --profile-max-tokens. Traço truncado não certifica."
+        )
+    if seed_router:
+        torch.manual_seed(seed)
     router = TwoHorizonLstmRouter(
         vocab_size=int(spec_vocab),
         n_layers=n_layers,
@@ -174,8 +211,37 @@ def _run(
         embed_dim=router_dim,
         hidden_size=router_dim,
     )
+    if router_state is not None:
+        router.load_state_dict(router_state)
+        router_init = "state_dict"
+    elif seed_router:
+        router_init = "manual_seed"
+    else:
+        router_init = "global_rng"
+    limits = {
+        "k1": k1,
+        "k2": k2,
+        "b2": b2,
+        "l1": l1,
+        "l2": l2,
+        "warm_slots": slots,
+        "hot_slots": hot_slots,
+        "warm_start": warm_start,
+        "n_layers": n_layers,
+        "n_experts": n_experts,
+    }
     generator = torch.Generator().manual_seed(seed)
     token_ids = torch.randint(0, int(spec_vocab), (tokens,), generator=generator).tolist()
+    execution = None
+    if trace:
+        execution = ExecutionTrace(
+            limits=limits,
+            tokens=token_ids,
+            router_sha=module_sha(router),
+            store_sha256=store_sha(store_dir / "experts.moestore"),
+            max_tokens=profile_max_tokens,
+        )
+    observer = DecodeProfile(device=dev, max_tokens=profile_max_tokens) if profile else None
     with OffloadRuntime(
         store_dir,
         router,
@@ -186,6 +252,8 @@ def _run(
         n_warm_threads=n_warm_threads,
         direct=not dry_run,
         warm_start=warm_start,
+        profile=observer,
+        trace=execution,
     ) as runtime:
         stats = runtime.decode(token_ids)
         direct = runtime.store.direct
@@ -214,11 +282,162 @@ def _run(
             "disk_note": DISK_NOTE,
             "reference_checkpoint_bytes": REFERENCE_CHECKPOINT_BYTES,
             "reference_free_bytes": REFERENCE_FREE_BYTES,
+            "prompt_ids": None,
+            "attention_cache": (
+                "começa no primeiro token decodificado; o bench não faz prefill. "
+                "Sem prompt, o conjunto inicial usa o token 0 só no roteador."
+            ),
+            "router_init": router_init,
+            "profile": observer.report() if observer is not None else None,
+            "trace": execution.public() if execution is not None else None,
         }
     )
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if execution is not None:
+        payload["_trace"] = execution
+    if seed_router or router_state is not None:
+        payload["_router_state"] = {name: tensor.detach().cpu().clone() for name, tensor in router.state_dict().items()}
+    if write_json:
+        _write_public(out_path, payload)
     return payload
+
+
+def run_paired(
+    out_path: Path,
+    **kwargs,
+) -> dict:
+    """Roda on-demand e depois lookahead com o mesmo peso, token e teto.
+
+    Não é replay: cada modo usa o runtime de verdade. Se a execução divergir,
+    o JSON ainda é gravado e a função levanta ``TraceDivergence``.
+    """
+
+    tokens = int(kwargs.get("tokens", 4))
+    max_tokens = int(kwargs.get("profile_max_tokens", 512))
+    if tokens > max_tokens:
+        raise ValueError(
+            f"pareado de {tokens} tokens passa do teto {max_tokens}; "
+            "suba profile_max_tokens. A comparação não certifica traço truncado."
+        )
+    dry_run = bool(kwargs.get("dry_run", False))
+    store_dir = kwargs.get("store_dir")
+    seed = int(kwargs.get("seed", 0))
+    if dry_run and store_dir is None:
+        tmp = tempfile.TemporaryDirectory(prefix="offload-paired-")
+        store_path = Path(tmp.name)
+        write_synthetic_bundle(store_path, seed=seed)
+        owns_tmp = tmp
+    else:
+        if store_dir is None:
+            raise ValueError("store_dir é obrigatório fora do dry-run")
+        store_path = Path(store_dir)
+        owns_tmp = None
+    shared = {
+        "tokens": 4,
+        "seed": seed,
+        "l1": 1,
+        "l2": 2,
+        "k1": 1,
+        "k2": None,
+        "b2": 1,
+        "warm_slots": None,
+        "hot_slack": 0,
+        "n_warm_threads": 1,
+        "device": "cpu",
+        "vram_budget_bytes": None,
+        "router_dim": 32,
+        "warm_start": True,
+        "profile": False,
+        "profile_max_tokens": max_tokens,
+    }
+    for key, value in kwargs.items():
+        if key in shared:
+            shared[key] = value
+    shared["trace"] = True
+    try:
+        demand = _run(
+            out_path,
+            store_path,
+            **_run_kwargs(shared),
+            dry_run=dry_run,
+            lookahead=False,
+            write_json=False,
+            seed_router=True,
+        )
+        ahead = _run(
+            out_path,
+            store_path,
+            **_run_kwargs(shared),
+            dry_run=dry_run,
+            lookahead=True,
+            write_json=False,
+            router_state=demand["_router_state"],
+            seed_router=False,
+        )
+        left = demand.pop("_trace")
+        right = ahead.pop("_trace")
+        demand.pop("_router_state", None)
+        ahead.pop("_router_state", None)
+        try:
+            fingerprint = compare_traces(left, right)
+            match = True
+            detail = None
+            message = None
+        except TraceDivergence as exc:
+            fingerprint = None
+            match = False
+            detail = exc.detail
+            message = str(exc)
+        payload = {
+            "kind": "paired",
+            "execution_match": match,
+            "fingerprint": fingerprint,
+            "divergence": detail,
+            "divergence_message": message,
+            "seed": seed,
+            "router_seeded": True,
+            "order": ["on-demand", "lookahead"],
+            "sequential": True,
+            "memory_run_note": MEMORY_RUN_NOTE,
+            "cannot_prove": CANNOT_PROVE,
+            "runs": {"on-demand": demand, "lookahead": ahead},
+        }
+        _write_public(out_path, payload)
+        if not match:
+            raise TraceDivergence(message or "execução divergiu", detail or {})
+        return payload
+    finally:
+        if owns_tmp is not None:
+            owns_tmp.cleanup()
+
+
+def _run_kwargs(shared: dict) -> dict:
+    allowed = {
+        "lookahead",
+        "tokens",
+        "seed",
+        "l1",
+        "l2",
+        "k1",
+        "k2",
+        "b2",
+        "warm_slots",
+        "hot_slack",
+        "n_warm_threads",
+        "device",
+        "vram_budget_bytes",
+        "router_dim",
+        "warm_start",
+        "profile",
+        "trace",
+        "profile_max_tokens",
+    }
+    return {key: value for key, value in shared.items() if key in allowed}
+
+
+def _write_public(path: Path, payload: dict) -> None:
+    public = {key: value for key, value in payload.items() if not str(key).startswith("_")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(public, indent=2), encoding="utf-8")
 
 
 def _device(name: str) -> torch.device:
