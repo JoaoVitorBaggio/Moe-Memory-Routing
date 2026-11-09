@@ -2,7 +2,9 @@
 
 O bloco esparso deixa de consultar o roteador original. A escolha vem de
 ``TwoHorizonLstmRouter.plan``, a mesma máscara do treino e da inferência.
-Não há cópia SSD/RAM: o ``TierPlan`` lista quem entraria em cada nível.
+Cada sequência começa com o conjunto inicial cheio (``k1`` por camada,
+fora do ``b2``). Não há cópia SSD/RAM: o ``TierPlan`` lista quem
+entraria em cada nível.
 
 A loss deste caminho é a entropia cruzada do próximo token. Não há termo
 de troca. Os pesos base ficam congelados; treinam o LSTM e a LoRA dos

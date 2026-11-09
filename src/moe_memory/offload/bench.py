@@ -5,6 +5,11 @@ No modo real, o pool morno padrão pede ~12 GiB. A VRAM da 1060 não
 segura a rede residente, os 384 experts e uma folga grande ao mesmo
 tempo: ``hot_slack`` 0 é o padrão, e o script recusa se a conta passar
 de ``vram_budget_bytes``.
+
+``warm_start`` (padrão) carrega ``k1`` experts por camada antes do
+primeiro token, nos dois modos, fora do ``b2``. Assim
+``experts_executed_per_token`` compara a mesma carga. ``warm_start``
+falso é o morno vazio.
 """
 
 from __future__ import annotations
@@ -51,6 +56,7 @@ def run_bench(
     device: str = "cpu",
     vram_budget_bytes: int | None = None,
     router_dim: int = 32,
+    warm_start: bool = True,
 ) -> dict:
     if tokens < 1:
         raise ValueError("tokens precisa ser >= 1")
@@ -85,6 +91,7 @@ def run_bench(
             device=device,
             vram_budget_bytes=vram_budget_bytes,
             router_dim=router_dim,
+            warm_start=warm_start,
         )
     finally:
         if owns_tmp is not None:
@@ -110,6 +117,7 @@ def _run(
     device: str,
     vram_budget_bytes: int | None,
     router_dim: int,
+    warm_start: bool,
 ) -> dict:
     preview = ExpertStore.open(store_dir / "experts.moestore", direct=False)
     try:
@@ -177,6 +185,7 @@ def _run(
         device=dev,
         n_warm_threads=n_warm_threads,
         direct=not dry_run,
+        warm_start=warm_start,
     ) as runtime:
         stats = runtime.decode(token_ids)
         direct = runtime.store.direct
@@ -184,6 +193,7 @@ def _run(
     payload.update(
         {
             "mode": "lookahead" if lookahead else "on-demand",
+            "warm_start": warm_start,
             "dry_run": dry_run,
             "device": str(dev),
             "direct_io": direct,

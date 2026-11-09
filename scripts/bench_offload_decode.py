@@ -2,8 +2,11 @@
 """Decode batch 1 do Qwen3 com experts no store. Roteador sem treino serve.
 
 Grava JSON em ``outputs/`` com tokens/s, stall por nível, bytes lidos do
-SSD, pico de RAM e de VRAM e misses. ``--mode on-demand`` não adianta a
-cópia; ``lookahead`` usa L2 no SSD e L1 na VRAM.
+SSD, pico de RAM e de VRAM, misses, ``experts_executed`` por token,
+``warm_start_s`` e ``warm_start_bytes``. ``--mode on-demand`` não adianta
+a cópia; ``lookahead`` usa L2 no SSD e L1 na VRAM. Os dois modos, por
+padrão, carregam o conjunto inicial (``k1`` experts por camada) antes
+do primeiro token, fora do ``b2``. ``--no-warm-start`` deixa o morno vazio.
 
 ``--dry-run`` monta um modelo minúsculo e não lê ``models/qwen3-30b-a3b``.
 
@@ -64,6 +67,11 @@ def main() -> None:
         help="se a conta de residentes + vagas quentes passar disto, não aloca. Sem a flag, só avisa.",
     )
     parser.add_argument("--router-dim", type=int, default=64)
+    parser.add_argument(
+        "--no-warm-start",
+        action="store_true",
+        help="morno vazio: o b2 enche o conjunto durante o decode. O padrão carrega k1 experts por camada antes do primeiro token.",
+    )
     args = parser.parse_args()
     print(DISK_NOTE)
     if args.dry_run and args.k1 == 8 and args.k2 is None and args.b2 == 5 and args.l2 == 3:
@@ -92,13 +100,17 @@ def main() -> None:
             device=args.device,
             vram_budget_bytes=None if args.vram_budget_gb is None else int(args.vram_budget_gb * 1e9),
             router_dim=args.router_dim,
+            warm_start=not args.no_warm_start,
         )
     except (ValueError, FileNotFoundError, OSError) as exc:
         raise SystemExit(str(exc)) from exc
     if payload.get("vram_warning"):
         print(payload["vram_warning"])
     print(
-        f"mode={payload['mode']} tokens/s={payload['tokens_per_s']:.3f} "
+        f"mode={payload['mode']} warm_start={payload['warm_start']} "
+        f"tokens/s={payload['tokens_per_s']:.3f} "
+        f"experts_executed={payload['experts_executed']} "
+        f"warm_start_s={payload['warm_start_s']:.4f} warm_start_bytes={payload['warm_start_bytes']} "
         f"stall_warm_s={payload['stall_warm_s']:.4f} stall_hot_s={payload['stall_hot_s']:.4f} "
         f"ssd_bytes={payload['ssd_bytes']} warm_misses={payload['warm_misses']} "
         f"hot_misses={payload['hot_misses']} json={args.out}"

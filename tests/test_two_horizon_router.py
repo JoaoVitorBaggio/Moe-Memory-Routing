@@ -126,6 +126,48 @@ def test_soft_weights_are_softmax_over_the_hot_set():
     assert torch.allclose(plan.soft_weights.sum(dim=-1)[active], torch.ones_like(plan.soft_weights.sum(-1)[active]))
 
 
+def test_sequence_starts_full_and_stepwise_plan_matches():
+    torch.manual_seed(1)
+    router = _router(l1=1, l2=3, b2=2, k1=2, k2=4)
+    tokens = torch.randint(0, 16, (2, 7))
+    full, _ = router.plan(tokens)
+    assert int(full.hot_mask.sum(-1).min().item()) >= router.k1
+    assert int(full.n_new_warm.sum(-1).max().item()) <= router.b2
+    seed = router.initial_tier(batch=tokens.shape[0], device=tokens.device)
+    assert torch.all(seed.warm <= full.warm_mask[:, 0])
+    assert int(seed.hot.sum(-1).min().item()) >= router.k1
+    state = None
+    warm = []
+    hot = []
+    for step in range(tokens.shape[1]):
+        piece, state = router.plan(tokens[:, step : step + 1], state)
+        warm.append(piece.warm_mask)
+        hot.append(piece.hot_mask)
+        assert int(piece.hot_mask.sum(-1).min().item()) >= router.k1
+    assert torch.equal(torch.cat(warm, dim=1), full.warm_mask)
+    assert torch.equal(torch.cat(hot, dim=1), full.hot_mask)
+
+    prompt = torch.randint(0, 16, (2, 4))
+    decode = torch.randint(0, 16, (2, 5))
+    primed = router.bootstrap(prompt)
+    assert primed.tier is not None and primed.tier.step == 0
+    assert int(primed.tier.hot.sum(-1).min().item()) >= router.k1
+    with torch.no_grad():
+        decision, _ = router.forward(prompt)
+    from moe_memory.tier_mask import initial_set
+
+    expect = initial_set(decision.raw_scores[:, -1], router.k1)
+    assert torch.equal(primed.tier.hot, expect.hot)
+    one_shot, _ = router.plan(decode, router.bootstrap(prompt))
+    state = router.bootstrap(prompt)
+    parts = []
+    for step in range(decode.shape[1]):
+        piece, state = router.plan(decode[:, step : step + 1], state)
+        parts.append(piece.hot_mask)
+    assert torch.equal(torch.cat(parts, dim=1), one_shot.hot_mask)
+    assert int(one_shot.n_new_warm[0, 0].sum().item()) <= router.b2
+
+
 def test_constructor_rejects_a_bad_horizon_or_budget():
     with pytest.raises(ValueError):
         _router(l1=0)

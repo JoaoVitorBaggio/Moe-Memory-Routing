@@ -14,7 +14,7 @@ from dataclasses import dataclass
 import torch
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter, TwoHorizonState
-from moe_memory.tier_mask import TierPlan, TierState, plan_from_scores
+from moe_memory.tier_mask import TierPlan, TierState, initial_set, plan_from_scores
 
 
 @dataclass(frozen=True)
@@ -24,8 +24,18 @@ class LookaheadWindow:
     hot_steps: int
 
 
-def lookahead_plan(router: TwoHorizonLstmRouter, state: TwoHorizonState | None) -> LookaheadWindow:
-    """Janela já determinada. Não avança o estado do roteador."""
+def lookahead_plan(
+    router: TwoHorizonLstmRouter,
+    state: TwoHorizonState | None,
+    *,
+    warm_start: bool = True,
+) -> LookaheadWindow:
+    """Janela já determinada. Não avança o estado do roteador.
+
+    Sem tier e com ``warm_start``, a janela nasce no mesmo conjunto
+    inicial do BOS que ``router.plan``. ``warm_start=False`` continua
+    do morno vazio.
+    """
 
     batch = 1 if state is None else int(state.raw_hist.shape[0])
     device = _device(router, state)
@@ -41,7 +51,7 @@ def lookahead_plan(router: TwoHorizonLstmRouter, state: TwoHorizonState | None) 
             hot[:, delta] = _raw_at(router, state, position - router.l1, initial)
         else:
             hot[:, delta] = 0
-    tier = _tier(router, state, batch, device)
+    tier = _tier(router, state, batch, device, dtype, warm_start=warm_start)
     plan, _future = plan_from_scores(
         warm,
         hot,
@@ -64,33 +74,51 @@ def _initial_scores(router: TwoHorizonLstmRouter, batch: int, device: torch.devi
 
 
 def _raw_at(
-    router: TwoHorizonLstmRouter,
+    _router: TwoHorizonLstmRouter,
     state: TwoHorizonState | None,
     index: int,
     initial: torch.Tensor,
 ) -> torch.Tensor:
-    if index < 0:
-        return initial
+    """Score cru já emitido. Antes do histórico vale o estado zero.
+
+    O prompt deixa raw no histórico com ``tier.step`` ainda 0. Esses
+    índices são negativos e entram na janela do primeiro token decodificado.
+    """
+
     if state is None or state.tier is None:
+        if index < 0:
+            return initial
         raise RuntimeError(f"score cru {index} pedido antes de qualquer token")
     hist = state.raw_hist
     executed = int(state.tier.step)
-    oldest = executed - hist.shape[1]
-    if index < oldest or index >= executed:
+    oldest = executed - int(hist.shape[1])
+    if index >= executed:
         raise RuntimeError(f"score cru {index} fora do histórico {oldest}..{executed - 1}")
+    if index < oldest:
+        return initial
     return hist[:, index - oldest]
 
 
-def _tier(router: TwoHorizonLstmRouter, state: TwoHorizonState | None, batch: int, device: torch.device) -> TierState | None:
-    if state is None or state.tier is None:
-        if state is None:
-            return None
-        return TierState(
-            warm=torch.zeros(batch, router.n_layers, router.n_experts, dtype=torch.bool, device=device),
-            hot=torch.zeros(batch, router.n_layers, router.n_experts, dtype=torch.bool, device=device),
-            step=0,
-        )
-    return state.tier
+def _tier(
+    router: TwoHorizonLstmRouter,
+    state: TwoHorizonState | None,
+    batch: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    warm_start: bool,
+) -> TierState | None:
+    if state is not None and state.tier is not None:
+        return state.tier
+    if warm_start:
+        return initial_set(router.bos_scores(batch, device, dtype), router.k1)
+    if state is None:
+        return None
+    return TierState(
+        warm=torch.zeros(batch, router.n_layers, router.n_experts, dtype=torch.bool, device=device),
+        hot=torch.zeros(batch, router.n_layers, router.n_experts, dtype=torch.bool, device=device),
+        step=0,
+    )
 
 
 def _device(router: TwoHorizonLstmRouter, state: TwoHorizonState | None) -> torch.device:

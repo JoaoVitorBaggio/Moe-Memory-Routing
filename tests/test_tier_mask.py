@@ -6,6 +6,7 @@ import torch
 from moe_memory.levels import COLD, HOT, WARM
 from moe_memory.tier_mask import (
     b2_from_token_time,
+    initial_set,
     k2_from_ram_budget,
     plan_from_scores,
     swiglu_expert_nbytes,
@@ -160,6 +161,31 @@ def test_budget_helpers_follow_the_measurement_arithmetic():
         k2_from_ram_budget(-1, expert, 48)
     with pytest.raises(ValueError):
         plan_from_scores(torch.zeros(1, 1, 1, 2), torch.zeros(1, 1, 1, 2), k1=2, k2=1, b2=1)
+
+
+def test_initial_set_fills_every_layer_and_b2_does_not_count_it():
+    torch.manual_seed(0)
+    scores = torch.randn(2, 5, 8)
+    state = initial_set(scores, k1=2)
+    assert state.step == 0
+    assert torch.equal(state.warm, state.hot)
+    assert int(state.hot.sum(-1).min().item()) == 2
+    assert int(state.hot.sum(-1).max().item()) == 2
+    tied = torch.zeros(1, 3, 4)
+    tied_state = initial_set(tied, k1=2)
+    assert torch.equal(
+        tied_state.hot[0, 1],
+        torch.tensor([True, True, False, False]),
+    )
+    seq = torch.randn(2, 6, 5, 8)
+    plan, _ = plan_from_scores(seq, seq + 0.3, k1=2, k2=4, b2=1, state=state)
+    assert int(plan.n_new_warm.sum(-1).max().item()) <= 1
+    assert int(plan.hot_mask.sum(-1).min().item()) >= 2
+    assert torch.all(state.warm <= plan.warm_mask[:, 0])
+    still = state.warm & plan.warm_mask[:, 0]
+    assert not bool((still & plan.entered_warm[:, 0]).any().item())
+    with pytest.raises(ValueError):
+        initial_set(torch.zeros(1, 1, 2), k1=3)
 
 
 def test_cold_is_not_a_prefetch_target():

@@ -356,6 +356,7 @@ def test_on_demand_stalls_and_lookahead_can_arrive_first(tmp_path: Path):
         hot_slack=1,
         direct=False,
         n_warm_threads=1,
+        warm_start=False,
     )
     try:
         on_demand.warm.store = SlowStore(on_demand.store, 0.08)
@@ -376,6 +377,7 @@ def test_on_demand_stalls_and_lookahead_can_arrive_first(tmp_path: Path):
         hot_slack=2,
         direct=False,
         n_warm_threads=1,
+        warm_start=False,
     )
     try:
         ahead._prefetch_initial()
@@ -442,6 +444,121 @@ def test_decode_logits_are_finite_and_dry_run_json_has_the_counters(tmp_path: Pa
         assert key in saved
     assert "61" in payload["disk_note"] and "44" in payload["disk_note"]
     assert saved["tokens"] == 3
+
+
+def test_warm_start_executes_every_layer_and_matches_the_mask(tmp_path: Path):
+    bundle = write_bundle(tmp_path / "model", n_layers=4, n_experts=4)
+    spec = dict(
+        vocab_size=64,
+        n_layers=4,
+        n_experts=4,
+        l1=1,
+        l2=2,
+        k1=1,
+        k2=2,
+        b2=1,
+        embed_dim=16,
+        hidden_size=16,
+    )
+    torch.manual_seed(0)
+    router = TwoHorizonLstmRouter(**spec)
+    tokens = [3, 1, 4, 2]
+    reference, _ = router.plan(torch.tensor([tokens]))
+    assert int(reference.hot_mask.sum(-1).min().item()) >= router.k1
+    with OffloadRuntime(
+        bundle,
+        router,
+        lookahead=False,
+        warm_slots=8,
+        hot_slack=0,
+        direct=False,
+        n_warm_threads=1,
+        warm_start=True,
+    ) as runtime:
+        runtime.decode(tokens)
+        assert runtime.stats.warm_start_bytes == router.n_layers * router.k1 * runtime.store.header.raw_nbytes
+        assert runtime.stats.warm_start_s >= 0.0
+        assert runtime.stats.experts_executed_per_token == [router.n_layers * router.k1] * len(tokens)
+        assert runtime.stats.experts_executed == sum(runtime.stats.experts_executed_per_token)
+        assert runtime.executed_per_layer
+        for row in runtime.executed_per_layer:
+            assert len(row) == router.n_layers
+            assert min(row) >= router.k1
+            assert 0 not in row
+        for step, plan in enumerate(runtime.plans):
+            assert torch.equal(plan.hot_index, reference.hot_index[:, step : step + 1])
+            assert torch.equal(plan.hot_valid, reference.hot_valid[:, step : step + 1])
+            assert torch.equal(plan.warm_mask, reference.warm_mask[:, step : step + 1])
+
+    torch.manual_seed(1)
+    prompted = TwoHorizonLstmRouter(**spec)
+    prompt = [5, 6, 7]
+    decode_ids = [2, 3]
+    primed = prompted.bootstrap(torch.tensor(prompt))
+    reference_prompt, _ = prompted.plan(torch.tensor([decode_ids]), primed)
+    with OffloadRuntime(
+        bundle,
+        prompted,
+        lookahead=True,
+        warm_slots=8,
+        hot_slack=0,
+        direct=False,
+        n_warm_threads=1,
+    ) as runtime:
+        runtime.decode(decode_ids, prompt_ids=prompt)
+        for row in runtime.executed_per_layer:
+            assert min(row) >= prompted.k1
+        for step, plan in enumerate(runtime.plans):
+            assert torch.equal(plan.hot_mask, reference_prompt.hot_mask[:, step : step + 1])
+            assert torch.equal(plan.warm_mask, reference_prompt.warm_mask[:, step : step + 1])
+
+    torch.manual_seed(2)
+    bare = TwoHorizonLstmRouter(**spec)
+    with OffloadRuntime(
+        bundle,
+        bare,
+        lookahead=False,
+        warm_slots=8,
+        hot_slack=1,
+        direct=False,
+        n_warm_threads=1,
+        warm_start=False,
+    ) as runtime:
+        runtime.decode([8])
+        flat = [count for row in runtime.executed_per_layer for count in row]
+        assert 0 in flat
+        assert runtime.stats.warm_start_bytes == 0
+        assert runtime.stats.warm_start_s == 0.0
+
+
+def test_bench_modes_execute_the_same_experts_per_token(tmp_path: Path):
+    common = dict(
+        dry_run=True,
+        tokens=4,
+        seed=3,
+        l1=1,
+        l2=2,
+        k1=1,
+        k2=2,
+        b2=1,
+        warm_slots=8,
+        hot_slack=0,
+        device="cpu",
+        router_dim=16,
+    )
+    ahead = run_bench(tmp_path / "ahead.json", lookahead=True, **common)
+    demand = run_bench(tmp_path / "demand.json", lookahead=False, **common)
+    assert ahead["warm_start"] is True and demand["warm_start"] is True
+    assert ahead["experts_executed_per_token"] == demand["experts_executed_per_token"]
+    assert ahead["experts_executed_per_token"] == [ahead["n_layers"] * ahead["k1"]] * ahead["tokens"]
+    assert ahead["experts_executed"] == demand["experts_executed"]
+    assert ahead["warm_start_bytes"] == demand["warm_start_bytes"]
+    assert ahead["warm_start_bytes"] > 0
+    assert "warm_start_s" in ahead and ahead["warm_start_s"] >= 0.0
+    old = run_bench(tmp_path / "old.json", lookahead=True, warm_start=False, **common)
+    assert old["warm_start"] is False
+    assert old["warm_start_bytes"] == 0
+    assert old["experts_executed_per_token"] != ahead["experts_executed_per_token"]
 
 
 def test_bench_script_dry_run(tmp_path: Path):

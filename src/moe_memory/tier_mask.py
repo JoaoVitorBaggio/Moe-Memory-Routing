@@ -5,8 +5,11 @@ SSD) e os números de viabilidade em ``docs/medicoes-hw-fedora-qwen3.md``.
 Este módulo não copia peso, não abre arquivo e não soma penalidade de
 troca. A loss de quem chama continua sendo só a de linguagem.
 
-Por sequência, o morno começa vazio e cabe ``k2`` experts em cada camada.
-Em cada token entram no máximo ``b2`` experts novos, somando as camadas.
+``initial_set`` abre a sequência: ``k1`` experts por camada, no morno e
+no quente, escolhidos pelo score do LSTM (prompt ou BOS). Essa entrada
+não gasta ``b2``. ``plan_from_scores`` segue do estado que receber —
+vazio, se ninguém passou o conjunto — e cabe ``k2`` por camada. Em cada
+token entram no máximo ``b2`` experts novos, somando as camadas.
 Quem entra no conjunto já cheio ocupa o lugar do de menor score, e só
 se o score do novo for melhor. Vaga vazia tem prioridade sobre troca.
 O quente é o top-``k1`` dentro do morno, pelo score do horizonte curto.
@@ -148,6 +151,38 @@ def b2_from_token_time(t_tok_seconds: float, seconds_per_new_expert: float) -> i
     if t_tok_seconds <= 0 or seconds_per_new_expert <= 0:
         raise ValueError("t_tok e o tempo por expert precisam ser > 0")
     return int(t_tok_seconds // seconds_per_new_expert)
+
+
+def initial_set(scores: torch.Tensor, k1: int) -> TierState:
+    """Top-``k1`` de cada camada, no morno e no quente, fora do teto ``b2``.
+
+    ``scores`` é ``[B, camadas, E]``: o score cru do LSTM no último token
+    do prompt, ou no BOS quando não há prompt. O ``step`` fica 0. Quem
+    chama passa este estado a ``plan_from_scores``; os experts daqui já
+    estão em ``before`` e não entram em ``n_new_warm``.
+    """
+
+    if scores.ndim != 3:
+        raise ValueError(
+            f"scores do conjunto inicial precisam ser [B, camadas, E], recebido {tuple(scores.shape)}"
+        )
+    if not scores.is_floating_point():
+        raise ValueError("scores do conjunto inicial precisam ser ponto flutuante")
+    batch, layers, experts = scores.shape
+    if min(batch, layers, experts) < 1:
+        raise ValueError("lote, camadas e experts precisam ser >= 1")
+    if not 1 <= k1 <= experts:
+        raise ValueError(f"k1={k1} precisa satisfazer 1 <= k1 <= E={experts}")
+    fixed = scores.detach()
+    warm = torch.zeros(batch, layers, experts, dtype=torch.bool, device=fixed.device)
+    everyone = torch.ones(experts, dtype=torch.bool, device=fixed.device)
+    for item in range(batch):
+        for layer in range(layers):
+            picked, valid = _topk_indices(fixed[item, layer], everyone, k1)
+            if not bool(valid.all().item()):
+                raise RuntimeError(f"camada {layer} não fechou k1={k1} experts no conjunto inicial")
+            warm[item, layer, picked] = True
+    return TierState(warm=warm, hot=warm.clone(), step=0)
 
 
 def plan_from_scores(

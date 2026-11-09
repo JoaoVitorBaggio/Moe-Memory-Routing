@@ -140,6 +140,33 @@ def test_gradient_reaches_router_and_lora_only(backend: str):
         assert model.router.embed.weight.grad.abs().sum() > 0
 
 
+def test_training_mask_matches_inference_and_starts_full():
+    torch.manual_seed(0)
+    model = _model("mock", lora_impl="local")
+    tokens = torch.randint(0, 48, (2, 6))
+    trained = model(tokens).plan
+    assert int(trained.hot_mask.sum(-1).min().item()) >= model.router.k1
+    assert int(trained.n_new_warm.sum(-1).max().item()) <= model.router.b2
+    state = None
+    warm = []
+    hot = []
+    weights = []
+    for step in range(tokens.shape[1]):
+        piece, state = model.router.plan(tokens[:, step : step + 1], state)
+        warm.append(piece.warm_mask)
+        hot.append(piece.hot_mask)
+        weights.append(piece.soft_weights)
+    assert torch.equal(torch.cat(warm, dim=1), trained.warm_mask)
+    assert torch.equal(torch.cat(hot, dim=1), trained.hot_mask)
+    assert torch.allclose(torch.cat(weights, dim=1), trained.soft_weights, atol=1e-5)
+    # b2 menor que camadas×k1: sem o conjunto inicial alguma camada fica com 0.
+    small = _router(2, 8, b2=1, k1=2, k2=4, l1=1, l2=2)
+    empty, _ = small.plan(tokens[:1, :4], warm_start=False)
+    assert int(empty.hot_mask[0, 0].sum(-1).min().item()) == 0
+    filled, _ = small.plan(tokens[:1, :4])
+    assert int(filled.hot_mask.sum(-1).min().item()) >= small.k1
+
+
 def test_loss_is_plain_next_token_cross_entropy():
     model = _model("mock", lora_impl="local")
     tokens = torch.randint(1, 48, (2, 6))

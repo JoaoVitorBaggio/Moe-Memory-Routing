@@ -84,7 +84,19 @@ class HotTier:
                     self._events[key].set()
                 self._cv.notify_all()
         else:
-            event.wait()
+            # O sync pode trocar o Event desta chave. Esperar o objeto
+            # antigo para sempre perde o set do novo.
+            while True:
+                if event.wait(timeout=0.05):
+                    break
+                with self._cv:
+                    self._raise_if_error()
+                    current = self._events.get(key)
+                    if current is None or key not in self._wanted:
+                        raise KeyError(f"expert {key} não foi pedido ao quente")
+                    if current.is_set():
+                        break
+                    event = current
         with self._cv:
             self._raise_if_error()
             if key not in self.pool or not self._events[key].is_set():
@@ -129,8 +141,10 @@ class HotTier:
             self._cv.notify_all()
 
     def _request_locked(self, key: tuple[int, int], step: int) -> None:
-        previous = self._wanted.get(key)
-        self._wanted[key] = step if previous is None else min(previous, step)
+        # O passo novo substitui o antigo. O min entre repetições já foi
+        # feito em ``sync``. Segurar o passo velho deixa chave urgente
+        # demais e, com a VRAM cheia, o token espera para sempre.
+        self._wanted[key] = step
         self._cancel.discard(key)
         if key not in self._events:
             self._events[key] = threading.Event()
@@ -158,13 +172,16 @@ class HotTier:
             victims = [
                 key
                 for key in self.pool.occupied()
-                if key not in self._launched and self._wanted.get(key, -1) > self._wanted[urgent]
+                if key not in self._launched and self._wanted.get(key, 10**9) > self._wanted[urgent]
             ]
             if not victims:
                 return
-            victim = max(victims, key=lambda key: (self._wanted[key], key))
+            victim = max(victims, key=lambda key: (self._wanted.get(key, 10**9), key))
             self.pool.evict(victim)
-            self._events[victim] = threading.Event()
+            if victim in self._wanted:
+                self._events[victim] = threading.Event()
+            else:
+                self._events.pop(victim, None)
 
     def _worker(self) -> None:
         while True:
@@ -234,10 +251,33 @@ class HotTier:
                 if key not in self._wanted or self._events[key].is_set() or key in self._launched or key in self._cuda:
                     continue
                 if self.pool.reserve(key) is None:
-                    return None
+                    self._evict_for_locked(key)
+                    if self.pool.reserve(key) is None:
+                        return None
                 self._launched.add(key)
                 return key
         return None
+
+    def _evict_for_locked(self, urgent: tuple[int, int]) -> None:
+        """Solta um residente menos urgente para a chave que vai executar."""
+
+        urgent_step = self._wanted.get(urgent, 0)
+        victims = [
+            key
+            for key in self.pool.occupied()
+            if key not in self._launched
+            and key not in self._cuda
+            and key != urgent
+            and self._wanted.get(key, 10**9) > urgent_step
+        ]
+        if not victims:
+            return
+        victim = max(victims, key=lambda key: (self._wanted.get(key, 10**9), key))
+        self.pool.evict(victim)
+        if victim in self._wanted:
+            self._events[victim] = threading.Event()
+        else:
+            self._events.pop(victim, None)
 
     def _poll_cuda(self) -> None:
         if not self._cuda:
