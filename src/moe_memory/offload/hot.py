@@ -52,12 +52,16 @@ class HotTier:
         self._thread = threading.Thread(target=self._worker, name="hot-copy", daemon=True)
         self._thread.start()
 
-    def sync(self, ranked: list[tuple[int, tuple[int, int]]]) -> None:
+    def sync(self, ranked: list[tuple[int, tuple[int, int]]], acct: dict | None = None) -> None:
         wanted: dict[tuple[int, int], int] = {}
         for step, key in ranked:
             previous = wanted.get(key)
             wanted[key] = step if previous is None else min(previous, step)
+        wait_started = _now() if acct is not None else 0.0
         with self._cv:
+            if acct is not None:
+                acct["lock_wait_s"] = _now() - wait_started
+                held = _now()
             self._raise_if_error()
             for key in list(self._wanted):
                 if key not in wanted:
@@ -66,6 +70,8 @@ class HotTier:
                 self._request_locked(key, step)
             self._rebalance_locked()
             self._cv.notify_all()
+            if acct is not None:
+                acct["locked_s"] = _now() - held
 
     def ensure(self, key: tuple[int, int]) -> None:
         with self._cv:

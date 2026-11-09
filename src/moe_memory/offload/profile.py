@@ -22,6 +22,58 @@ from pathlib import Path
 import torch
 
 
+def thread_cpu_seconds() -> float | None:
+    """CPU da thread chamadora. ``None`` se a plataforma não tiver ``thread_time``.
+
+    Não é parede e não entra na soma de ``elapsed_s``.
+    """
+
+    fn = getattr(time, "thread_time", None)
+    if fn is None:
+        return None
+    try:
+        return float(fn())
+    except (OSError, ValueError):
+        return None
+
+
+class HostSpan:
+    """Parede e CPU da thread em volta de um trecho. Não sincroniza a GPU."""
+
+    def __init__(self) -> None:
+        self.wall_s = 0.0
+        self.thread_cpu_s: float | None = None
+        self._wall = 0.0
+        self._cpu: float | None = None
+
+    def __enter__(self) -> "HostSpan":
+        self._wall = time.perf_counter()
+        self._cpu = thread_cpu_seconds()
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        self.wall_s = time.perf_counter() - self._wall
+        end = thread_cpu_seconds()
+        if self._cpu is None or end is None:
+            self.thread_cpu_s = None
+        else:
+            self.thread_cpu_s = end - self._cpu
+        return False
+
+
+def stream_key(stream: object) -> int:
+    """Identidade do stream CUDA, não do objeto Python.
+
+    ``current_stream()`` devolve um wrapper novo a cada chamada. Usar
+    ``id`` conta um synchronize por span.
+    """
+
+    handle = getattr(stream, "cuda_stream", None)
+    if handle is None:
+        return id(stream)
+    return int(handle)
+
+
 def percentile(values: list[float], pct: float) -> float | None:
     """Posto mais próximo. ``p50`` de ``[1, 2, 3, 4]`` é 2; ``p95`` é 4.
 
@@ -191,12 +243,12 @@ class DecodeProfile:
         identities: set[int] = set()
         for item in self._compute_spans:
             stream = item[4]
-            ident = id(stream)
+            ident = stream_key(stream)
             if ident not in identities:
                 identities.add(ident)
                 cuda_streams.append(stream)
         for stream, _start, _end in h2d_spans:
-            ident = id(stream)
+            ident = stream_key(stream)
             if ident not in identities:
                 identities.add(ident)
                 cuda_streams.append(stream)
@@ -269,7 +321,37 @@ class DecodeProfile:
                 "unaccounted_wall_s": summarize(column("unaccounted_wall_s")),
                 "attention_gpu_s": summarize(column("attention_gpu_s")) if gpu_supported else None,
                 "expert_gpu_s": summarize(column("expert_gpu_s")) if gpu_supported else None,
+                "schedule_ids_wall_s": summarize(column("schedule_ids_wall_s")),
+                "schedule_lookahead_plan_wall_s": summarize(column("schedule_lookahead_plan_wall_s")),
+                "schedule_lookahead_plan_thread_cpu_s": summarize(column("schedule_lookahead_plan_thread_cpu_s")),
+                "schedule_rank_wall_s": summarize(column("schedule_rank_wall_s")),
+                "schedule_hot_sync_wall_s": summarize(column("schedule_hot_sync_wall_s")),
+                "schedule_hot_sync_lock_wait_s": summarize(column("schedule_hot_sync_lock_wait_s")),
+                "schedule_hot_sync_locked_s": summarize(column("schedule_hot_sync_locked_s")),
+                "schedule_warm_sync_wall_s": summarize(column("schedule_warm_sync_wall_s")),
+                "schedule_warm_sync_lock_wait_s": summarize(column("schedule_warm_sync_lock_wait_s")),
+                "schedule_warm_sync_locked_s": summarize(column("schedule_warm_sync_locked_s")),
+                "schedule_warm_callback_wall_s": summarize(column("schedule_warm_callback_wall_s")),
+                "schedule_enqueue_thread_cpu_s": summarize(column("schedule_enqueue_thread_cpu_s")),
+                "schedule_unaccounted_wall_s": summarize(column("schedule_unaccounted_wall_s")),
             },
+            "schedule_note": (
+                "Tudo isto é a thread de decode dentro de _install. "
+                "schedule_enqueue_wall_s é a parede do conjunto. As partes "
+                "ids, lookahead_plan, rank, hot_sync e warm_sync são sequenciais "
+                "nessa thread e aproximam essa parede; o que sobra é "
+                "schedule_unaccounted_wall_s. lock_wait e locked estão dentro "
+                "da parede do sync correspondente e não se somam de novo. "
+                "callback está dentro da parede do warm_sync. thread_cpu é "
+                "time.thread_time e não se soma à parede. null em "
+                "lookahead_plan ou rank significa que o modo não chamou a "
+                "função, não que durou zero. A parede pode absorver espera de "
+                "lock. Não há cuda.Event.synchronize nem torch.cuda.synchronize "
+                "dentro de _install. O plano fica no device do LSTM; o bench "
+                "deixa o LSTM na CPU. Se a parede for muito maior que a CPU da "
+                "thread, a thread não estava executando; isso ainda não separa "
+                "lock de um spin de driver, e nesta máquina de teste não há CUDA."
+            ),
             "ssd_worker": {
                 "clock": "perf_counter no worker, em volta de read_into",
                 "additive_to_elapsed": False,
