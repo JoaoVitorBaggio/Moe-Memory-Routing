@@ -6,6 +6,25 @@ import threading
 
 import torch
 
+_live_lock = threading.Lock()
+_live_nbytes = 0
+
+
+def live_nbytes() -> int:
+    """Bytes dos ``SlotPool`` que ainda não foram soltos.
+
+    É a conta dos blocos deste processo, não o RSS nem o cgroup.
+    """
+
+    with _live_lock:
+        return _live_nbytes
+
+
+def _account(delta: int) -> None:
+    global _live_nbytes
+    with _live_lock:
+        _live_nbytes += delta
+
 
 class SlotPool:
     """``n_slots`` blocos do mesmo tamanho. A chave é ``(camada, expert)``."""
@@ -29,6 +48,22 @@ class SlotPool:
         self.key_of: list[tuple[int, int] | None] = [None] * n_slots
         self.free: list[int] = list(range(n_slots))
         self._lock = threading.Lock()
+        self._released = False
+        _account(self.nbytes)
+
+    def release(self) -> None:
+        """Solta os blocos agora. Não espera o coletor cíclico."""
+
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            nbytes = self.n_slots * self.block_nbytes
+            self.blocks.clear()
+            self.slot_of.clear()
+            self.key_of = []
+            self.free.clear()
+        _account(-nbytes)
 
     @property
     def nbytes(self) -> int:

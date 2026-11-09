@@ -137,6 +137,10 @@ class HotTier:
             self._stop = True
             self._cv.notify_all()
         self._thread.join(timeout=5)
+        self.warm.remove_ready_callback(self._notify)
+        if self._thread.is_alive():
+            return
+        self.pool.release()
 
     def _notify(self) -> None:
         with self._cv:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import weakref
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,8 @@ import torch
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
 from moe_memory.offload.bench import run_bench, run_paired
+from moe_memory.offload.format import ExpertLayout
+from moe_memory.offload.pool import live_nbytes
 from moe_memory.offload.profile import DecodeProfile, percentile
 from moe_memory.offload.runtime import OffloadRuntime
 from moe_memory.offload.synthetic import write_synthetic_bundle
@@ -292,6 +295,8 @@ def test_bench_script_paired_dry_run_writes_a_new_file(tmp_path: Path):
     )
     assert completed.returncode == 0, completed.stderr
     assert "MemoryMax=7G" in completed.stdout
+    assert "phase=before-lookahead" in completed.stderr
+    assert "tracked_pool_bytes=" in completed.stderr
     body = json.loads(out.read_text(encoding="utf-8"))
     assert body["execution_match"] is True
     assert body["runs"]["lookahead"]["mode"] == "lookahead"
@@ -336,6 +341,84 @@ def test_cuda_profile_resolves_events_without_device_sync(tmp_path: Path):
         assert elapsed > 0
     finally:
         torch.cuda.synchronize = original  # type: ignore[method-assign]
+
+
+def test_qwen_warm_pool_arithmetic_is_one_copy_not_two():
+    layout = ExpertLayout.from_dims(2048, 768, 2)
+    assert layout.block_nbytes == 9_437_184
+    one = 320 * layout.block_nbytes
+    assert one == 3_019_898_880
+    assert 2 * one == 6_039_797_760
+
+
+def test_close_drops_the_pool_before_the_next_runtime(tmp_path: Path):
+    bundle = write_synthetic_bundle(tmp_path / "model", n_layers=2, n_experts=4, seed=7)
+    torch.manual_seed(0)
+    base = live_nbytes()
+    with OffloadRuntime(
+        bundle,
+        _router(),
+        lookahead=False,
+        warm_slots=8,
+        hot_slack=0,
+        direct=False,
+        warm_start=True,
+    ) as first:
+        block = first.warm.pool.blocks[0]
+        held = weakref.ref(block)
+        del block
+        first.decode([1, 2, 3])
+        one = live_nbytes() - base
+        assert one > 0
+    assert held() is None
+    assert live_nbytes() == base
+    with OffloadRuntime(
+        bundle,
+        _router(),
+        lookahead=True,
+        warm_slots=8,
+        hot_slack=0,
+        direct=False,
+        warm_start=True,
+    ) as second:
+        second.decode([1, 2, 3])
+        assert live_nbytes() - base == one
+    assert live_nbytes() == base
+
+
+def test_paired_128_dry_run_releases_pools_between_modes(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    common = dict(
+        dry_run=True,
+        tokens=128,
+        seed=0,
+        l1=1,
+        l2=2,
+        k1=1,
+        k2=2,
+        b2=1,
+        warm_slots=8,
+        hot_slack=0,
+        device="cpu",
+        router_dim=16,
+        n_warm_threads=1,
+        profile_max_tokens=128,
+    )
+    control = run_paired(tmp_path / "control.json", profile=False, **common)
+    traced = run_paired(tmp_path / "profile.json", profile=True, **common)
+    err = capsys.readouterr().err
+    assert "phase=before-lookahead" in err
+    assert "phase=on-demand-before-runtime" in err
+    assert "phase=lookahead-warm-allocated" in err
+    for payload, label in ((control, "control"), (traced, "profile")):
+        assert payload["execution_match"] is True, label
+        assert payload["pool_overlap"]["second_pool_starts_with_first_still_live"] is False
+        assert payload["pool_overlap"]["on_demand_pool_bytes_still_live"] == 0
+        assert payload["runs"]["on-demand"]["experts_executed_per_token"] == [2] * 128
+        assert payload["measurement_host"] == "synthetic-dry-run"
+        assert "Não é igual ao RSS" in payload["memory_accounting"]["cgroup_memory_current_bytes"]
+    assert control["runs"]["on-demand"]["profile"] is None
+    assert traced["runs"]["lookahead"]["profile"]["enabled"] is True
+    assert traced["runs"]["on-demand"]["trace"]["fingerprint"] == traced["runs"]["lookahead"]["trace"]["fingerprint"]
 
 
 def test_store_sha_reads_only_the_prefix_of_a_huge_logical_file():

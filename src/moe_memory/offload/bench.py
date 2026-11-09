@@ -21,6 +21,7 @@ from pathlib import Path
 import torch
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
+from moe_memory.offload.phase import emit_phase
 from moe_memory.offload.profile import DecodeProfile
 from moe_memory.offload.runtime import OffloadRuntime
 from moe_memory.offload.trace import ExecutionTrace, TraceDivergence, compare_traces, module_sha, store_sha
@@ -31,6 +32,28 @@ from moe_memory.offload.space import (
 )
 from moe_memory.offload.store import ExpertStore
 from moe_memory.offload.synthetic import write_synthetic_bundle
+
+MEMORY_ACCOUNTING = {
+    "ru_maxrss_bytes": "Pico de RSS do processo (getrusage ru_maxrss). Não é o uso neste instante.",
+    "vm_rss_bytes": "RSS atual, VmRSS de /proc/self/status. Inclui página de arquivo residente no processo.",
+    "vm_hwm_bytes": "Pico de RSS, VmHWM.",
+    "vm_pin_bytes": (
+        "VmPin do kernel (mlock). A memória pinned do CUDA pode não aparecer aqui; "
+        "ela entra no RSS e, em geral, no memory.current."
+    ),
+    "cgroup_memory_current_bytes": (
+        "memory.current do cgroup v2, se o arquivo existir. Inclui cache de página "
+        "e memória de kernel cobrados do cgroup. Não é igual ao RSS."
+    ),
+    "tracked_pool_bytes": (
+        "Soma dos SlotPool cujo release ainda não rodou. Não inclui o residente, "
+        "o cache de página nem bloco de GPU fora desses pools."
+    ),
+    "ram_peak_bytes": (
+        "max(ru_maxrss no fim do decode, bytes lógicos do pool morno + residente). "
+        "O residente na GPU entra nessa soma mesmo sem estar no RSS do host."
+    ),
+}
 
 MEMORY_RUN_NOTE = (
     "Uma corrida por vez. No PC, MemoryMax=7G e MemorySwapMax=0. "
@@ -148,6 +171,7 @@ def _run(
     seed_router: bool = False,
     router_state: dict | None = None,
     write_json: bool = True,
+    phases: list | None = None,
 ) -> dict:
     preview = ExpertStore.open(store_dir / "experts.moestore", direct=False)
     try:
@@ -180,6 +204,11 @@ def _run(
         raise ValueError(f"k2×camadas={k2 * n_layers} passa das {slots} vagas mornas")
     hot_slots = n_layers * k1 + hot_slack
     dev = _device(device)
+    label = "lookahead" if lookahead else "on-demand"
+    run_phases: list[dict] = []
+
+    def mark(name: str) -> None:
+        run_phases.append(emit_phase(f"{label}-{name}"))
     resident_file = (store_dir / "resident.bin").stat().st_size
     vram_estimate = resident_file + hot_slots * block
     vram_warning = ""
@@ -218,6 +247,7 @@ def _run(
         router_init = "manual_seed"
     else:
         router_init = "global_rng"
+    mark("router-ready")
     limits = {
         "k1": k1,
         "k2": k2,
@@ -242,6 +272,8 @@ def _run(
             max_tokens=profile_max_tokens,
         )
     observer = DecodeProfile(device=dev, max_tokens=profile_max_tokens) if profile else None
+    mark("trace-ready" if execution is not None else "trace-skipped")
+    mark("before-runtime")
     with OffloadRuntime(
         store_dir,
         router,
@@ -254,9 +286,11 @@ def _run(
         warm_start=warm_start,
         profile=observer,
         trace=execution,
+        phase=lambda step: mark(step),
     ) as runtime:
         stats = runtime.decode(token_ids)
         direct = runtime.store.direct
+    mark("after-close")
     payload = stats.as_dict()
     payload.update(
         {
@@ -290,8 +324,12 @@ def _run(
             "router_init": router_init,
             "profile": observer.report() if observer is not None else None,
             "trace": execution.public() if execution is not None else None,
+            "memory_phases": run_phases,
+            "memory_accounting": MEMORY_ACCOUNTING,
         }
     )
+    if phases is not None:
+        phases.extend(run_phases)
     if execution is not None:
         payload["_trace"] = execution
     if seed_router or router_state is not None:
@@ -353,7 +391,13 @@ def run_paired(
         if key in shared:
             shared[key] = value
     shared["trace"] = True
+    boundary: list[dict] = []
+
+    def mark(name: str) -> None:
+        boundary.append(emit_phase(name))
+
     try:
+        mark("paired-start")
         demand = _run(
             out_path,
             store_path,
@@ -363,6 +407,8 @@ def run_paired(
             write_json=False,
             seed_router=True,
         )
+        mark("after-on-demand")
+        mark("before-lookahead")
         ahead = _run(
             out_path,
             store_path,
@@ -373,6 +419,7 @@ def run_paired(
             router_state=demand["_router_state"],
             seed_router=False,
         )
+        mark("after-lookahead")
         left = demand.pop("_trace")
         right = ahead.pop("_trace")
         demand.pop("_router_state", None)
@@ -398,9 +445,20 @@ def run_paired(
             "order": ["on-demand", "lookahead"],
             "sequential": True,
             "memory_run_note": MEMORY_RUN_NOTE,
+            "measurement_host": (
+                "synthetic-dry-run"
+                if dry_run
+                else "processo local; não é medição da GTX 1060"
+            ),
             "cannot_prove": CANNOT_PROVE,
+            "memory_phases": boundary,
+            "memory_accounting": MEMORY_ACCOUNTING,
+            "pool_overlap": _pool_overlap(boundary),
             "runs": {"on-demand": demand, "lookahead": ahead},
         }
+        mark("before-json")
+        _write_public(out_path, payload)
+        mark("after-json")
         _write_public(out_path, payload)
         if not match:
             raise TraceDivergence(message or "execução divergiu", detail or {})
@@ -408,6 +466,27 @@ def run_paired(
     finally:
         if owns_tmp is not None:
             owns_tmp.cleanup()
+
+
+def _pool_overlap(phases: list[dict]) -> dict:
+    by_name = {str(row["phase"]): row for row in phases}
+    start = by_name.get("paired-start")
+    after = by_name.get("after-on-demand")
+    before = by_name.get("before-lookahead")
+    if start is None or after is None or before is None:
+        return {"known": False}
+    base = int(start["tracked_pool_bytes"])
+    left = int(after["tracked_pool_bytes"])
+    right = int(before["tracked_pool_bytes"])
+    retained = left - base
+    return {
+        "known": True,
+        "tracked_pool_bytes_at_start": base,
+        "tracked_pool_bytes_after_on_demand": left,
+        "tracked_pool_bytes_before_lookahead": right,
+        "on_demand_pool_bytes_still_live": retained,
+        "second_pool_starts_with_first_still_live": retained > 0 or right > base,
+    }
 
 
 def _run_kwargs(shared: dict) -> dict:

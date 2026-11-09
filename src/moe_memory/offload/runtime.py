@@ -46,6 +46,7 @@ class OffloadRuntime:
         warm_start: bool = True,
         profile: DecodeProfile | None = None,
         trace: ExecutionTrace | None = None,
+        phase=None,
     ) -> None:
         if warm_slots < 1:
             raise ValueError("warm_slots precisa ser >= 1")
@@ -55,11 +56,13 @@ class OffloadRuntime:
         self.warm_start = warm_start
         self.profile = profile
         self.trace = trace
+        self._phase = phase
         self.router = router
         self.device = torch.device("cpu") if device is None else torch.device(device)
         self.stats = OffloadStats()
         store_dir = Path(store_dir)
         self.store = ExpertStore.open(store_dir / "experts.moestore", direct=direct)
+        self._mark("store-opened")
         header = self.store.header
         if header.n_layers != router.n_layers or header.n_experts != router.n_experts:
             raise ValueError(
@@ -79,6 +82,7 @@ class OffloadRuntime:
         load_started = _now()
         self.weights: QwenWeights = load_resident(store_dir / "resident.bin", self.spec, self.device)
         self.stats.resident_load_s = _now() - load_started
+        self._mark("resident-loaded")
         self.warm = WarmTier(
             self.store,
             warm_slots,
@@ -86,6 +90,7 @@ class OffloadRuntime:
             n_threads=n_warm_threads,
             observer=profile,
         )
+        self._mark("warm-allocated")
         hot_slots = router.n_layers * router.k1 + hot_slack
         self.hot = HotTier(
             self.warm,
@@ -96,6 +101,7 @@ class OffloadRuntime:
             stats=self.stats,
             observer=profile,
         )
+        self._mark("hot-allocated")
         self.hot_slots = hot_slots
         self.warm_slots = warm_slots
         self.state: TwoHorizonState | None = None
@@ -159,6 +165,17 @@ class OffloadRuntime:
         self.hot.close()
         self.warm.close()
         self.store.close()
+        self.weights = None  # type: ignore[assignment]
+        self.plans.clear()
+        self.cache = None  # type: ignore[assignment]
+        self._plan = None
+        self.state = None
+        self.last_logits = None
+        self._mark("released")
+
+    def _mark(self, name: str) -> None:
+        if self._phase is not None:
+            self._phase(name)
 
     def _step(self, position: int, token: int) -> torch.Tensor:
         record = self.profile is not None and self.profile.accepting_token()
