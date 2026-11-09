@@ -13,6 +13,9 @@ token entram no máximo ``b2`` experts novos, somando as camadas.
 Quem entra no conjunto já cheio ocupa o lugar do de menor score, e só
 se o score do novo for melhor. Vaga vazia tem prioridade sobre troca.
 O quente é o top-``k1`` dentro do morno, pelo score do horizonte curto.
+Scores finitos seguem essa regra numa seleção vetorial. NaN e ``±inf``
+continuam no argsort estável anterior: a margem ``inf - inf`` não tem
+ordem, e o laço antigo guarda o primeiro candidato.
 
 ``refresh_n1`` e ``refresh_n2``, quando não são ``None``, seguram o
 conjunto: ele só é reavaliado a cada N tokens, contados desde o começo
@@ -312,11 +315,70 @@ def _checked_state(
     return state.warm.to(device=device), state.hot.to(device=device), state.step
 
 
+def _has_nonfinite(scores: torch.Tensor) -> bool:
+    return bool((~torch.isfinite(scores)).any().item())
+
+
 def _admit_batch(warm: torch.Tensor, scores: torch.Tensor, k2: int, b2: int) -> torch.Tensor:
-    return torch.stack(
-        [_admit_one(warm[item], scores[item], k2, b2) for item in range(warm.shape[0])],
-        dim=0,
-    )
+    if b2 == 0:
+        return warm.clone()
+    if _has_nonfinite(scores):
+        return torch.stack(
+            [_admit_one(warm[item], scores[item], k2, b2) for item in range(warm.shape[0])],
+            dim=0,
+        )
+    return _admit_finite(warm, scores, k2, b2)
+
+
+def _admit_finite(warm: torch.Tensor, scores: torch.Tensor, k2: int, b2: int) -> torch.Tensor:
+    """Mesma admissão de ``_admit_one`` para scores finitos, nas camadas de uma vez.
+
+    Classe 0 é vaga vazia e ganha de qualquer troca. Dentro da classe, o
+    maior score em float64, depois a menor camada. Classe 1 ordena pela
+    margem em float64 e o mesmo desempate. O pior residente, em empate,
+    é o maior índice.
+    """
+
+    current = warm.clone()
+    batch, _layers, experts = current.shape
+    rows = torch.arange(batch, device=current.device)
+    for _admission in range(b2):
+        member = current
+        has_outsider = (~member).any(dim=-1)
+        has_room = member.sum(dim=-1) < k2
+        out_vis = scores.masked_fill(member, float("-inf"))
+        max_out = out_vis.amax(dim=-1, keepdim=True)
+        cand = ((~member) & (scores == max_out)).to(torch.long).argmax(dim=-1)
+        in_vis = scores.masked_fill(~member, float("inf"))
+        min_in = in_vis.amin(dim=-1, keepdim=True)
+        worst = member & (scores == min_in)
+        victim = experts - 1 - worst.flip(-1).to(torch.long).argmax(dim=-1)
+        cand_s = scores.gather(-1, cand.unsqueeze(-1)).squeeze(-1).double()
+        vict_s = scores.gather(-1, victim.unsqueeze(-1)).squeeze(-1).double()
+        outranks = (cand_s > vict_s) | ((cand_s == vict_s) & (cand < victim))
+        empty_ok = has_outsider & has_room
+        swap_ok = has_outsider & ~has_room & outranks
+        use_empty = empty_ok.any(dim=-1)
+        use_swap = ~use_empty & swap_ok.any(dim=-1)
+        active = use_empty | use_swap
+        if not bool(active.any().item()):
+            break
+        score_key = cand_s.masked_fill(~empty_ok, float("-inf"))
+        best_score = score_key.amax(dim=-1, keepdim=True)
+        layer_empty = (empty_ok & (cand_s == best_score)).to(torch.long).argmax(dim=-1)
+        margin = cand_s - vict_s
+        margin_key = margin.masked_fill(~swap_ok, float("-inf"))
+        best_margin = margin_key.amax(dim=-1, keepdim=True)
+        layer_swap = (swap_ok & (margin == best_margin)).to(torch.long).argmax(dim=-1)
+        layer = torch.where(use_empty, layer_empty, layer_swap)
+        chosen_cand = cand[rows, layer]
+        chosen_victim = victim[rows, layer]
+        picked = rows[active]
+        current[picked, layer[active], chosen_cand[active]] = True
+        swapping = rows[use_swap]
+        if swapping.numel():
+            current[swapping, layer[use_swap], chosen_victim[use_swap]] = False
+    return current
 
 
 def _admit_one(warm: torch.Tensor, scores: torch.Tensor, k2: int, b2: int) -> torch.Tensor:
@@ -358,10 +420,16 @@ def _admit_one(warm: torch.Tensor, scores: torch.Tensor, k2: int, b2: int) -> to
 
 
 def _fresh_hot_batch(warm: torch.Tensor, scores: torch.Tensor, k1: int) -> torch.Tensor:
-    return torch.stack(
-        [_fresh_hot_one(warm[item], scores[item], k1) for item in range(warm.shape[0])],
-        dim=0,
-    )
+    if _has_nonfinite(scores):
+        return torch.stack(
+            [_fresh_hot_one(warm[item], scores[item], k1) for item in range(warm.shape[0])],
+            dim=0,
+        )
+    chosen, valid = _masked_topk(scores, warm, k1)
+    hot = torch.zeros_like(warm)
+    for slot in range(k1):
+        hot = hot | _scatter_mask(hot, chosen[..., slot], valid[..., slot])
+    return hot
 
 
 def _fresh_hot_one(warm: torch.Tensor, scores: torch.Tensor, k1: int) -> torch.Tensor:
@@ -380,13 +448,24 @@ def _hold_hot_batch(
     scores: torch.Tensor,
     k1: int,
 ) -> torch.Tensor:
-    return torch.stack(
-        [
-            _hold_hot_one(previous[item], warm[item], scores[item], k1)
-            for item in range(warm.shape[0])
-        ],
-        dim=0,
-    )
+    if _has_nonfinite(scores):
+        return torch.stack(
+            [
+                _hold_hot_one(previous[item], warm[item], scores[item], k1)
+                for item in range(warm.shape[0])
+            ],
+            dim=0,
+        )
+    hot = previous & warm
+    need = (warm.sum(dim=-1).clamp(max=k1) - hot.sum(dim=-1)).clamp(min=0)
+    if not bool((need > 0).any().item()):
+        return hot
+    max_need = int(need.max().item())
+    chosen, valid = _masked_topk(scores, warm & ~hot, max_need)
+    for slot in range(max_need):
+        take = valid[..., slot] & (need > slot)
+        hot = hot | _scatter_mask(hot, chosen[..., slot], take)
+    return hot
 
 
 def _hold_hot_one(
@@ -413,13 +492,15 @@ def _hold_hot_one(
 
 
 def _index_batch(hot: torch.Tensor, scores: torch.Tensor, k1: int) -> tuple[torch.Tensor, torch.Tensor]:
-    indices = []
-    valids = []
-    for item in range(hot.shape[0]):
-        index, valid = _index_one(hot[item], scores[item], k1)
-        indices.append(index)
-        valids.append(valid)
-    return torch.stack(indices, dim=0), torch.stack(valids, dim=0)
+    if _has_nonfinite(scores):
+        indices = []
+        valids = []
+        for item in range(hot.shape[0]):
+            index, valid = _index_one(hot[item], scores[item], k1)
+            indices.append(index)
+            valids.append(valid)
+        return torch.stack(indices, dim=0), torch.stack(valids, dim=0)
+    return _masked_topk(scores, hot, k1)
 
 
 def _index_one(hot: torch.Tensor, scores: torch.Tensor, k1: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -432,9 +513,42 @@ def _index_one(hot: torch.Tensor, scores: torch.Tensor, k1: int) -> tuple[torch.
     return index, valid
 
 
+def _scatter_mask(like: torch.Tensor, index: torch.Tensor, take: torch.Tensor) -> torch.Tensor:
+    placed = torch.zeros_like(like)
+    return placed.scatter(-1, index.unsqueeze(-1), take.unsqueeze(-1))
+
+
+def _masked_topk(scores: torch.Tensor, mask: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Maiores scores, empate no menor índice. Vaga sem candidato fica 0.
+
+    Só scores finitos. ``±inf`` e NaN ficam no argsort estável.
+    """
+
+    work = mask.clone()
+    chosen = []
+    valid = []
+    for _slot in range(k):
+        vis = scores.masked_fill(~work, float("-inf"))
+        best = vis.amax(dim=-1, keepdim=True)
+        is_best = work & (scores == best)
+        has = work.any(dim=-1)
+        idx = is_best.to(torch.long).argmax(dim=-1)
+        chosen.append(torch.where(has, idx, torch.zeros_like(idx)))
+        valid.append(has)
+        work.scatter_(-1, idx.unsqueeze(-1), False)
+    return torch.stack(chosen, dim=-1), torch.stack(valid, dim=-1)
+
+
 def _topk_indices(scores: torch.Tensor, mask: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Maior score primeiro. Empate fica com o menor índice. Inválido vira 0."""
 
+    if _has_nonfinite(scores):
+        return _topk_indices_scalar(scores, mask, k)
+    chosen, valid = _masked_topk(scores.unsqueeze(0), mask.unsqueeze(0), k)
+    return chosen[0], valid[0]
+
+
+def _topk_indices_scalar(scores: torch.Tensor, mask: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     visible = torch.where(mask, scores, torch.full_like(scores, float("-inf")))
     order = torch.argsort(-visible, stable=True)
     chosen = order[:k]
