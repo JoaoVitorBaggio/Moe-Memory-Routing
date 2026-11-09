@@ -21,7 +21,7 @@ import torch
 from moe_memory.levels import HOT, WARM
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter, TwoHorizonState
 from moe_memory.offload.hot import HotTier
-from moe_memory.offload.profile import DecodeProfile, cgroup_memory_current
+from moe_memory.offload.profile import DecodeProfile, HostSpan, cgroup_memory_current
 from moe_memory.offload.qwen import KvCache, QwenWeights, forward_token, load_resident, load_spec
 from moe_memory.offload.schedule import lookahead_plan
 from moe_memory.offload.stats import OffloadStats
@@ -186,9 +186,17 @@ class OffloadRuntime:
         router_wall = (_now() - router_started) if record else 0.0
         self._plan = plan
         self.plans.append(plan)
-        schedule_started = _now() if record else 0.0
-        self._install(plan)
-        schedule_wall = (_now() - schedule_started) if record else 0.0
+        if record:
+            schedule_span = HostSpan()
+            with schedule_span:
+                schedule_parts = self._install(plan, record=True)
+            schedule_wall = schedule_span.wall_s
+            schedule_cpu = schedule_span.thread_cpu_s
+        else:
+            self._install(plan, record=False)
+            schedule_wall = 0.0
+            schedule_cpu = None
+            schedule_parts = None
         per_layer: list[int] = []
         self._step_calls = []
         stall_warm_before = self.stats.stall_warm_s
@@ -234,10 +242,14 @@ class OffloadRuntime:
             stall_warm = self.stats.stall_warm_s - stall_warm_before
             stall_hot = self.stats.stall_hot_s - stall_hot_before
             accounted = router_wall + schedule_wall + forward_wall
+            pieces = None if schedule_parts is None else schedule_parts.get("schedule_pieces_wall_s")
             self.profile.add_token(
                 {
                     "router_wall_s": router_wall,
                     "schedule_enqueue_wall_s": schedule_wall,
+                    "schedule_enqueue_thread_cpu_s": schedule_cpu,
+                    "schedule_unaccounted_wall_s": None if pieces is None else schedule_wall - pieces,
+                    **(schedule_parts or {}),
                     "forward_wall_s": forward_wall,
                     "stall_warm_wall_s": stall_warm,
                     "stall_hot_wall_s": stall_hot,
@@ -321,22 +333,77 @@ class OffloadRuntime:
         ranked.extend((0, key) for key in sources)
         self.warm.sync(ranked)
 
-    def _install(self, plan: TierPlan) -> None:
-        current_hot = list(plan.resident_ids(0, 0, HOT))
-        current_warm = list(plan.resident_ids(0, 0, WARM))
-        future_hot: list[tuple[int, tuple[int, int]]] = []
-        future_warm: list[tuple[int, tuple[int, int]]] = []
+    def _install(self, plan: TierPlan, *, record: bool = False) -> dict | None:
+        if not record:
+            current_hot = list(plan.resident_ids(0, 0, HOT))
+            current_warm = list(plan.resident_ids(0, 0, WARM))
+            future_hot: list[tuple[int, tuple[int, int]]] = []
+            future_warm: list[tuple[int, tuple[int, int]]] = []
+            if self.lookahead and self.state is not None:
+                window = lookahead_plan(self.router, self.state, warm_start=self.warm_start)
+                future_hot = _ranked(window, hot=True, step_bias=1)
+                future_warm = _ranked(window, hot=False, step_bias=1)
+            hot_ranked = [(0, key) for key in current_hot] + future_hot
+            self.hot.sync(hot_ranked)
+            sources = self.hot.pending_sources()
+            warm_ranked = (
+                [(0, key) for key in current_warm]
+                + [(0, key) for key in sources]
+                + future_warm
+            )
+            self.warm.sync(warm_ranked)
+            return None
+        with HostSpan() as ids_span:
+            current_hot = list(plan.resident_ids(0, 0, HOT))
+            current_warm = list(plan.resident_ids(0, 0, WARM))
+        future_hot = []
+        future_warm = []
+        plan_span: HostSpan | None = None
+        rank_span: HostSpan | None = None
         if self.lookahead and self.state is not None:
-            window = lookahead_plan(self.router, self.state, warm_start=self.warm_start)
-            future_hot = _ranked(window, hot=True, step_bias=1)
-            future_warm = _ranked(window, hot=False, step_bias=1)
-        self.hot.sync([(0, key) for key in current_hot] + future_hot)
+            with HostSpan() as plan_span:
+                window = lookahead_plan(self.router, self.state, warm_start=self.warm_start)
+            with HostSpan() as rank_span:
+                future_hot = _ranked(window, hot=True, step_bias=1)
+                future_warm = _ranked(window, hot=False, step_bias=1)
+        hot_ranked = [(0, key) for key in current_hot] + future_hot
+        hot_acct: dict[str, float] = {}
+        with HostSpan() as hot_span:
+            self.hot.sync(hot_ranked, hot_acct)
         sources = self.hot.pending_sources()
-        self.warm.sync(
+        warm_ranked = (
             [(0, key) for key in current_warm]
             + [(0, key) for key in sources]
             + future_warm
         )
+        warm_acct: dict[str, float] = {}
+        with HostSpan() as warm_span:
+            self.warm.sync(warm_ranked, warm_acct)
+        pieces = (
+            ids_span.wall_s
+            + (0.0 if plan_span is None else plan_span.wall_s)
+            + (0.0 if rank_span is None else rank_span.wall_s)
+            + hot_span.wall_s
+            + warm_span.wall_s
+        )
+        return {
+            "schedule_ids_wall_s": ids_span.wall_s,
+            "schedule_ids_thread_cpu_s": ids_span.thread_cpu_s,
+            "schedule_lookahead_plan_wall_s": None if plan_span is None else plan_span.wall_s,
+            "schedule_lookahead_plan_thread_cpu_s": None if plan_span is None else plan_span.thread_cpu_s,
+            "schedule_rank_wall_s": None if rank_span is None else rank_span.wall_s,
+            "schedule_rank_thread_cpu_s": None if rank_span is None else rank_span.thread_cpu_s,
+            "schedule_hot_sync_wall_s": hot_span.wall_s,
+            "schedule_hot_sync_lock_wait_s": hot_acct.get("lock_wait_s"),
+            "schedule_hot_sync_locked_s": hot_acct.get("locked_s"),
+            "schedule_warm_sync_wall_s": warm_span.wall_s,
+            "schedule_warm_sync_lock_wait_s": warm_acct.get("lock_wait_s"),
+            "schedule_warm_sync_locked_s": warm_acct.get("locked_s"),
+            "schedule_warm_callback_wall_s": warm_acct.get("callback_s"),
+            "schedule_hot_keys": len(hot_ranked),
+            "schedule_warm_keys": len(warm_ranked),
+            "schedule_pieces_wall_s": pieces,
+        }
 
 
 def _keys_from_mask(mask: torch.Tensor) -> list[tuple[int, int]]:

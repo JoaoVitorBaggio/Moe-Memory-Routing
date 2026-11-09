@@ -58,7 +58,7 @@ class WarmTier:
     def add_ready_callback(self, callback: Callable[[], None]) -> None:
         self._on_ready.append(callback)
 
-    def sync(self, ranked: list[tuple[int, tuple[int, int]]]) -> None:
+    def sync(self, ranked: list[tuple[int, tuple[int, int]]], acct: dict | None = None) -> None:
         """O conjunto pedido passa a ser exatamente ``ranked``. Passo menor é mais urgente."""
 
         wanted: dict[tuple[int, int], int] = {}
@@ -66,7 +66,11 @@ class WarmTier:
             previous = wanted.get(key)
             wanted[key] = step if previous is None else min(previous, step)
         fire = False
+        wait_started = _now() if acct is not None else 0.0
         with self._cv:
+            if acct is not None:
+                acct["lock_wait_s"] = _now() - wait_started
+                held = _now()
             self._raise_if_error()
             for key in list(self._wanted):
                 if key not in wanted:
@@ -76,8 +80,15 @@ class WarmTier:
             self._rebalance_locked()
             fire = any(event.is_set() for event in self._events.values())
             self._cv.notify_all()
+            if acct is not None:
+                acct["locked_s"] = _now() - held
         if fire:
-            self._fire()
+            if acct is None:
+                self._fire()
+            else:
+                callback_started = _now()
+                self._fire()
+                acct["callback_s"] = _now() - callback_started
 
     def ensure(self, key: tuple[int, int]) -> None:
         """Espera o bloco. Se não estava pronto, conta miss e o tempo de espera."""

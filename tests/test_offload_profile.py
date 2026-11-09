@@ -15,7 +15,7 @@ from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
 from moe_memory.offload.bench import run_bench, run_paired
 from moe_memory.offload.format import ExpertLayout
 from moe_memory.offload.pool import live_nbytes
-from moe_memory.offload.profile import DecodeProfile, percentile
+from moe_memory.offload.profile import DecodeProfile, percentile, stream_key, thread_cpu_seconds
 from moe_memory.offload.runtime import OffloadRuntime
 from moe_memory.offload.synthetic import write_synthetic_bundle
 from moe_memory.offload.trace import (
@@ -28,6 +28,59 @@ from moe_memory.offload.trace import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_stream_key_ignores_a_new_python_wrapper():
+    class _Stream:
+        def __init__(self, handle: int) -> None:
+            self.cuda_stream = handle
+
+    assert stream_key(_Stream(7)) == stream_key(_Stream(7)) == 7
+    assert stream_key(_Stream(8)) == 8
+    assert stream_key(object()) != stream_key(object())
+
+
+def test_schedule_enqueue_splits_lookahead_plan_from_sync(tmp_path: Path):
+    bundle = write_synthetic_bundle(tmp_path / "model", n_layers=2, n_experts=4, seed=8)
+    torch.manual_seed(0)
+
+    def once(lookahead: bool) -> dict:
+        profile = DecodeProfile(device=torch.device("cpu"), max_tokens=8)
+        with OffloadRuntime(
+            bundle,
+            _router(),
+            lookahead=lookahead,
+            warm_slots=8,
+            hot_slack=0,
+            direct=False,
+            profile=profile,
+        ) as runtime:
+            runtime.decode([1, 2, 3, 4])
+        return profile.report()
+
+    on_demand = once(False)
+    ahead = once(True)
+    demand_row = on_demand["per_token"][0]
+    ahead_row = ahead["per_token"][0]
+    assert demand_row["schedule_lookahead_plan_wall_s"] is None
+    assert demand_row["schedule_lookahead_plan_thread_cpu_s"] is None
+    assert demand_row["schedule_rank_wall_s"] is None
+    assert on_demand["summary"]["schedule_lookahead_plan_wall_s"] is None
+    assert demand_row["schedule_hot_sync_lock_wait_s"] <= demand_row["schedule_hot_sync_wall_s"] + 1e-6
+    assert demand_row["schedule_warm_sync_lock_wait_s"] <= demand_row["schedule_warm_sync_wall_s"] + 1e-6
+    assert demand_row["schedule_hot_sync_locked_s"] <= demand_row["schedule_hot_sync_wall_s"] + 1e-6
+    pieces = demand_row["schedule_pieces_wall_s"]
+    assert abs(
+        demand_row["schedule_enqueue_wall_s"] - pieces - demand_row["schedule_unaccounted_wall_s"]
+    ) < 1e-6
+    assert ahead_row["schedule_lookahead_plan_wall_s"] is not None
+    assert ahead_row["schedule_lookahead_plan_wall_s"] >= 0.0
+    assert ahead["summary"]["schedule_lookahead_plan_wall_s"]["n"] == 4
+    assert ahead_row["schedule_hot_keys"] >= demand_row["schedule_hot_keys"]
+    if thread_cpu_seconds() is not None:
+        assert ahead_row["schedule_lookahead_plan_thread_cpu_s"] is not None
+        assert ahead_row["schedule_enqueue_thread_cpu_s"] is not None
+    assert "não se soma" in ahead["schedule_note"]
 
 
 def test_percentile_uses_nearest_rank_and_empty_is_null():

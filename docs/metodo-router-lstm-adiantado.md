@@ -142,6 +142,8 @@ O bench continua sem prompt. O token 0 só pontua o conjunto inicial. O KV come�
 
 No PC, uma corrida por vez, `MemoryMax=7G` e `MemorySwapMax=0`. O pareado não reescreve o JSON de um modo só; o `--out` é outro arquivo. Repetir é outro `--out`, depois que o processo anterior saiu.
 
+`schedule_enqueue_wall_s` é a parede da thread de decode dentro de `_install`, não a cópia. No lookahead essa função também chama `lookahead_plan` (`plan_from_scores` da janela `L2`) e monta a lista futura; no on-demand esses dois trechos não rodam e o campo fica null, não zero. O perfil ligado parte essa parede em ids, plano da janela, rank, `hot.sync` e `warm.sync`, com a espera do lock e o tempo segurando o lock separados da parede do sync. `thread_cpu` é `time.thread_time` e não se soma à parede. Não há synchronize de CUDA dentro de `_install`. O plano fica no device do LSTM, e o bench deixa o LSTM na CPU. Parede muito maior que a CPU da thread indica que a thread não executava; isso ainda não separa lock de um spin de driver, e não foi medido na 1060. A resolução dos events deduplica pelo handle `cuda_stream`: `current_stream()` devolve um wrapper novo por chamada, e contar `id` do objeto sincronizava uma vez por span.
+
 O pareado no mesmo processo fechava o primeiro runtime sem soltar os blocos do `SlotPool`. O quente e o morno se apontam (o callback de pronto), então o ciclo só caía no coletor. O segundo modo alocava outro pool com o primeiro ainda vivo. `close` agora solta os blocos e tira o callback antes de o lookahead construir o runtime. O traço guarda 8 bytes copiados, não uma vista do bloco. Cada fase imprime uma linha no stderr, com flush, e o JSON repete esses instantâneos. `tracked_pool_bytes` é a soma dos pools ainda não soltos. `ram_peak_bytes` continua `max(ru_maxrss, morno lógico + residente lógico)`: residente na GPU entra nessa soma mesmo fora do RSS. `memory.current` do cgroup inclui cache de página; não é o RSS. `VmPin` é mlock do kernel e pode não listar o pinned do CUDA.
 
 ```
@@ -155,4 +157,4 @@ python3 scripts/bench_offload_decode.py \
     --out outputs/paired-128-seed0-a.json
 ```
 
-A segunda repetição usa `--out outputs/paired-128-seed0-b.json` e os mesmos argumentos. Este texto não traz tok/s medido nessa comparação: ela ainda não rodou na 1060.
+A corrida de 09/11/2026 na 1060 usou essa forma, com `MemoryMax=9G` e `MemorySwapMax=0`, e `--out` em `outputs/paired-128t-seed0-pr27-9g-*.json`. A próxima, para partir `schedule_enqueue`, repete os mesmos argumentos com outro arquivo, por exemplo `outputs/paired-128t-seed0-schedule-a.json`. Comparar com o controle sem `--profile`. Não somar GPU, H2D nem SSD na parede. O campo `schedule_lookahead_plan_wall_s` só existe no lookahead.
