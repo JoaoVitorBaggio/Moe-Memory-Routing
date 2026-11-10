@@ -13,6 +13,8 @@ executa bf16.
 from __future__ import annotations
 
 import hashlib
+import json
+import resource
 from pathlib import Path
 
 import torch
@@ -29,13 +31,12 @@ from moe_memory.offload.qwen import (
     rms_norm,
 )
 from moe_memory.offload.store import ExpertStore, torch_dtype
-from moe_memory.qwen3_adapter import language_model_loss
 
-# Teto aprovado. O smoke recusa antes, para sobrar folga de página e de alocador.
-CGROUP_BYTES = 9_663_676_416
+# Folga de lançamento, não o limite do cgroup. O limite real sai de memory.max.
 LAUNCH_CEILING_BYTES = 8 * 1024**3
 VRAM_BUDGET_BYTES = int(5.5 * 1024**3)
 OVERHEAD_BYTES = 512 * 1024**2
+LM_HEAD_CHUNK = 4096
 
 
 def pascal_bf16_cuda_ok(capability: tuple[int, int] | None, bf16_supported: bool) -> bool:
@@ -61,6 +62,52 @@ def refuse_cuda_bf16(device: torch.device, resident_dtype: torch.dtype) -> None:
         )
 
 
+def read_cgroup_memory_max(paths: list[Path] | None = None) -> int | None:
+    """Limite de memória do cgroup deste processo. ``None`` se for ilimitado ou ilegível."""
+
+    for path in _cgroup_memory_paths() if paths is None else paths:
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8").strip()
+        if not text or text == "max":
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            continue
+        if value <= 0 or value >= 1 << 62:
+            return None
+        return value
+    return None
+
+
+def _cgroup_memory_paths() -> list[Path]:
+    found: list[Path] = []
+    proc = Path("/proc/self/cgroup")
+    if proc.is_file():
+        for line in proc.read_text(encoding="utf-8").splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+                found.append(Path("/sys/fs/cgroup") / parts[2].lstrip("/") / "memory.max")
+    found.append(Path("/sys/fs/cgroup/memory.max"))
+    found.append(Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"))
+    return found
+
+
+def rss_bytes() -> int | None:
+    status = Path("/proc/self/status")
+    if not status.is_file():
+        return None
+    for line in status.read_text(encoding="utf-8").splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1]) * 1024
+    return None
+
+
+def ru_maxrss_bytes() -> int:
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+
+
 def estimate_bytes(
     *,
     resident_bytes: int,
@@ -74,8 +121,18 @@ def estimate_bytes(
     k1: int,
     lstm_embed: int,
     lstm_hidden: int,
-) -> dict[str, int]:
-    """Teto do processo, não medição. Experts de uma camada, não o store inteiro."""
+    n_heads: int | None = None,
+    n_kv_heads: int | None = None,
+    head_dim: int | None = None,
+    cgroup_bytes: int | None = None,
+    read_cgroup: bool = True,
+) -> dict[str, int | None]:
+    """Teto do anon com a cabeça e o expert em pedaços. Não inclui o store inteiro.
+
+    ``resident_page_cache_if_kept`` é o cache do arquivo se ninguém pedir
+    ``DONTNEED``. Não entra na soma. ``cgroup_bytes`` vem do processo, ou
+    do teste.
+    """
 
     if min(resident_bytes, vocab, hidden, intermediate, n_layers, n_experts, rank, seq_len, k1) < 1:
         raise ValueError("estimativa com dimensão < 1")
@@ -87,23 +144,36 @@ def estimate_bytes(
         + 8 * lstm_hidden
         + n_layers * (lstm_hidden * n_experts + n_experts)
     )
-    lstm = lstm_params * 12
-    per_expert = 3 * hidden * intermediate * 4
-    distinct = min(n_experts, k1 * seq_len)
-    experts = distinct * per_expert
-    head = vocab * hidden * 4
-    pieces = {
+    one_expert = 3 * hidden * intermediate * 4
+    if n_heads is None or n_kv_heads is None or head_dim is None:
+        attention = 0
+    else:
+        q = n_heads * head_dim * hidden * 4
+        kv = n_kv_heads * head_dim * hidden * 4
+        attention = q + 2 * kv + hidden * n_heads * head_dim * 4
+    head = min(vocab, LM_HEAD_CHUNK) * hidden * 4
+    if cgroup_bytes is None and read_cgroup:
+        cgroup_bytes = read_cgroup_memory_max()
+    pieces: dict[str, int | None] = {
         "resident_bytes": resident_bytes,
         "lora_fp32_bytes": lora,
+        "lora_grad_bytes": lora,
         "adam_lora_bytes": lora * 2,
-        "lstm_with_adam_bytes": lstm,
-        "expert_peak_fp32_bytes": experts,
+        "lstm_with_adam_bytes": lstm_params * 12,
+        "lstm_grad_bytes": lstm_params * 4,
+        "expert_fp32_bytes": one_expert,
+        "attention_fp32_bytes": attention,
         "lm_head_fp32_bytes": head,
         "overhead_bytes": OVERHEAD_BYTES,
+        "resident_page_cache_if_kept": resident_bytes,
+        "file_cache_bytes": 0,
+        "seq_len": seq_len,
+        "k1": k1,
     }
-    pieces["total_bytes"] = sum(pieces.values())
+    skipped = {"resident_page_cache_if_kept", "seq_len", "k1"}
+    pieces["total_bytes"] = sum(value for key, value in pieces.items() if key not in skipped and value is not None)
     pieces["launch_ceiling_bytes"] = LAUNCH_CEILING_BYTES
-    pieces["cgroup_bytes"] = CGROUP_BYTES
+    pieces["cgroup_bytes"] = cgroup_bytes
     pieces["vram_budget_bytes"] = VRAM_BUDGET_BYTES
     return pieces
 
@@ -171,6 +241,9 @@ class OffloadLanguageModel(nn.Module):
         self.router = router
         self.lora = ExpertLoRA(spec.n_layers, spec.n_experts, spec.hidden_size, spec.moe_intermediate, rank, alpha)
         self.store_dtype = torch_dtype(store.header.dtype_code)
+        self.memory_log = False
+        self.expert_live = 0
+        self.expert_live_max = 0
         for tensor in _resident_tensors(weights):
             tensor.requires_grad_(False)
 
@@ -181,8 +254,10 @@ class OffloadLanguageModel(nn.Module):
             raise ValueError("a janela precisa de ao menos 2 tokens")
         plan, _state = self.router.plan(token_ids)
         hidden = self._embed(token_ids)
+        self._phase("embed")
         spec = self.weights.spec
         for layer_index in range(spec.n_layers):
+            self._phase(f"layer-{layer_index}")
             coeffs = plan.soft_weights[:, :, layer_index, :]
             index = plan.hot_index[:, :, layer_index, :]
             valid = plan.hot_valid[:, :, layer_index, :]
@@ -195,9 +270,15 @@ class OffloadLanguageModel(nn.Module):
                 torch.tensor(layer_index, device=hidden.device),
                 use_reentrant=False,
             )
+        self._phase(f"layers-done-{spec.n_layers}")
         normed = rms_norm(hidden, _as(self.weights.final_norm, hidden), spec.rms_eps)
-        logits = F.linear(normed, _as(self.weights.lm_head, hidden))
-        return logits, plan
+        loss = _chunked_cross_entropy(
+            normed[:, :-1].reshape(-1, normed.shape[-1]),
+            self.weights.lm_head,
+            token_ids[:, 1:].reshape(-1),
+        )
+        self._phase("loss")
+        return loss, plan
 
     def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         rows = self.weights.embed.index_select(0, token_ids.reshape(-1))
@@ -215,35 +296,35 @@ class OffloadLanguageModel(nn.Module):
 
     def _moe(self, hidden, layer_index, index, valid, coeffs):
         flat = hidden[0]
-        pieces = []
-        rows = []
-        cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        out = flat.new_zeros(flat.shape)
+        groups: dict[int, list[tuple[int, int]]] = {}
         seq, slots = index.shape[1], index.shape[2]
         for token in range(seq):
             for slot in range(slots):
                 if not bool(valid[0, token, slot].item()):
                     continue
                 expert = int(index[0, token, slot].item())
-                if expert not in cache:
-                    cache[expert] = self._read(layer_index, expert)
-                gate, up, down = cache[expert]
-                current = flat[token : token + 1]
-                projected_gate = F.linear(current, gate) + self.lora.scale * _delta(
-                    current, self.lora.gate_A[layer_index, expert], self.lora.gate_B[layer_index, expert]
-                )
-                projected_up = F.linear(current, up) + self.lora.scale * _delta(
-                    current, self.lora.up_A[layer_index, expert], self.lora.up_B[layer_index, expert]
-                )
-                mid = F.silu(projected_gate) * projected_up
-                down_y = F.linear(mid, down) + self.lora.scale * _delta(
-                    mid, self.lora.down_A[layer_index, expert], self.lora.down_B[layer_index, expert]
-                )
-                pieces.append(down_y[0] * coeffs[0, token, slot])
-                rows.append(token)
-        out = flat.new_zeros(flat.shape)
-        if pieces:
-            out = out.index_add(0, torch.tensor(rows, device=flat.device), torch.stack(pieces, dim=0))
+                groups.setdefault(expert, []).append((token, slot))
+        for expert, members in groups.items():
+            rows = torch.tensor([token for token, _slot in members], device=flat.device)
+            current = flat.index_select(0, rows)
+            coeff = torch.stack([coeffs[0, token, slot] for token, slot in members])
+            mixed = _apply_expert(self, current, coeff, layer_index, expert)
+            out = out.index_add(0, rows, mixed)
         return out.unsqueeze(0)
+
+    def _phase(self, name: str) -> None:
+        if not self.memory_log:
+            return
+        print(
+            json.dumps({"phase": name, "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
+            flush=True,
+        )
+
+    def _note_expert(self, delta: int) -> None:
+        self.expert_live += delta
+        if self.expert_live > self.expert_live_max:
+            self.expert_live_max = self.expert_live
 
     def _read(self, layer: int, expert: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         gate_b, up_b, down_b = self.store.payload(layer, expert)
@@ -258,11 +339,13 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     model.router.train()
     model.lora.train()
     optimizer.zero_grad(set_to_none=True)
-    logits, plan = model.forward_window(token_ids)
-    loss = language_model_loss(logits, token_ids)
+    model._phase("forward")
+    loss, plan = model.forward_window(token_ids)
     if not bool(torch.isfinite(loss).item()):
         raise RuntimeError("loss de linguagem não é finita")
+    model._phase("backward")
     loss.backward()
+    model._phase("optimizer")
     report = grad_report(model)
     if not report["grads_finite"]:
         raise RuntimeError("há gradiente não finito")
@@ -368,6 +451,161 @@ def _as(weight: torch.Tensor | None, ref: torch.Tensor) -> torch.Tensor | None:
     if weight.dtype == ref.dtype and weight.device == ref.device:
         return weight
     return weight.to(dtype=ref.dtype, device=ref.device)
+
+
+def _apply_expert(model: OffloadLanguageModel, hidden, coeff, layer: int, expert: int) -> torch.Tensor:
+    _EXPERT_STATE["model"] = model
+    _EXPERT_STATE["layer"] = layer
+    _EXPERT_STATE["expert"] = expert
+    lora = model.lora
+    return _ExpertFn.apply(
+        hidden,
+        coeff,
+        lora.gate_A[layer, expert],
+        lora.gate_B[layer, expert],
+        lora.up_A[layer, expert],
+        lora.up_B[layer, expert],
+        lora.down_A[layer, expert],
+        lora.down_B[layer, expert],
+    )
+
+
+class _ExpertFn(torch.autograd.Function):
+    """Um expert de cada vez. O peso base não fica no grafo."""
+
+    @staticmethod
+    def forward(ctx, hidden, coeff, gate_a, gate_b, up_a, up_b, down_a, down_b):
+        model = _EXPERT_STATE["model"]
+        layer = _EXPERT_STATE["layer"]
+        expert = _EXPERT_STATE["expert"]
+        ctx.model = model
+        ctx.layer = layer
+        ctx.expert = expert
+        ctx.scale = model.lora.scale
+        gate, up, down = model._read(layer, expert)
+        model._note_expert(1)
+        try:
+            with torch.no_grad():
+                projected = _swiglu(hidden, gate, up, down, gate_a, gate_b, up_a, up_b, down_a, down_b, ctx.scale)
+                out = projected * coeff.unsqueeze(-1)
+        finally:
+            model._note_expert(-1)
+            del gate, up, down
+        ctx.save_for_backward(hidden, coeff, gate_a, gate_b, up_a, up_b, down_a, down_b)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        hidden, coeff, gate_a, gate_b, up_a, up_b, down_a, down_b = ctx.saved_tensors
+        model = ctx.model
+        with torch.enable_grad():
+            inputs = [
+                hidden.detach().requires_grad_(True),
+                coeff.detach().requires_grad_(True),
+                gate_a.detach().requires_grad_(True),
+                gate_b.detach().requires_grad_(True),
+                up_a.detach().requires_grad_(True),
+                up_b.detach().requires_grad_(True),
+                down_a.detach().requires_grad_(True),
+                down_b.detach().requires_grad_(True),
+            ]
+            gate, up, down = model._read(ctx.layer, ctx.expert)
+            model._note_expert(1)
+            try:
+                projected = _swiglu(inputs[0], gate, up, down, *inputs[2:], ctx.scale)
+                out = projected * inputs[1].unsqueeze(-1)
+                grads = torch.autograd.grad(out, inputs, grad_out)
+            finally:
+                model._note_expert(-1)
+                del gate, up, down
+        return grads
+
+
+_EXPERT_STATE: dict = {}
+
+
+def _swiglu(hidden, gate, up, down, gate_a, gate_b, up_a, up_b, down_a, down_b, scale):
+    projected_gate = F.linear(hidden, gate) + scale * _delta(hidden, gate_a, gate_b)
+    projected_up = F.linear(hidden, up) + scale * _delta(hidden, up_a, up_b)
+    mid = F.silu(projected_gate) * projected_up
+    return F.linear(mid, down) + scale * _delta(mid, down_a, down_b)
+
+
+def _chunked_cross_entropy(hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    return _ChunkedCrossEntropy.apply(hidden, weight, targets)
+
+
+class _ChunkedCrossEntropy(torch.autograd.Function):
+    """CE do próximo token sem materializar a cabeça inteira em float32."""
+
+    @staticmethod
+    def forward(ctx, hidden, weight, targets):
+        ctx.save_for_backward(hidden, weight, targets)
+        ctx.chunk = LM_HEAD_CHUNK
+        with torch.no_grad():
+            loss = _ce_value(hidden, weight, targets, LM_HEAD_CHUNK)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        hidden, weight, targets = ctx.saved_tensors
+        grad_hidden = _ce_grad_hidden(hidden, weight, targets, ctx.chunk, grad_loss)
+        return grad_hidden, None, None
+
+
+def _ce_value(hidden, weight, targets, chunk: int) -> torch.Tensor:
+    rows = hidden.shape[0]
+    running_max = hidden.new_full((rows,), float("-inf"))
+    vocab = weight.shape[0]
+    for start in range(0, vocab, chunk):
+        logits = F.linear(hidden, weight[start : start + chunk].to(dtype=hidden.dtype))
+        running_max = torch.maximum(running_max, logits.detach().max(dim=-1).values)
+    sum_exp = hidden.new_zeros(rows)
+    target_logit = hidden.new_zeros(rows)
+    index = torch.arange(rows, device=hidden.device)
+    for start in range(0, vocab, chunk):
+        block = weight[start : start + chunk].to(dtype=hidden.dtype)
+        logits = F.linear(hidden, block)
+        sum_exp = sum_exp + (logits - running_max.unsqueeze(-1)).exp().sum(dim=-1)
+        chosen = (targets >= start) & (targets < start + block.shape[0])
+        local = (targets - start).clamp(0, block.shape[0] - 1)
+        picked = logits[index, local]
+        target_logit = torch.where(chosen, picked, target_logit)
+    nll = running_max + sum_exp.log() - target_logit
+    return nll.mean()
+
+
+def _ce_grad_hidden(hidden, weight, targets, chunk: int, grad_loss) -> torch.Tensor:
+    hidden = hidden.detach()
+    rows = hidden.shape[0]
+    with torch.no_grad():
+        running_max = hidden.new_full((rows,), float("-inf"))
+        vocab = weight.shape[0]
+        for start in range(0, vocab, chunk):
+            block = weight[start : start + chunk].to(dtype=hidden.dtype)
+            logits = F.linear(hidden, block)
+            running_max = torch.maximum(running_max, logits.max(dim=-1).values)
+            del block, logits
+        sum_exp = hidden.new_zeros(rows)
+        for start in range(0, vocab, chunk):
+            block = weight[start : start + chunk].to(dtype=hidden.dtype)
+            logits = F.linear(hidden, block)
+            sum_exp = sum_exp + (logits - running_max.unsqueeze(-1)).exp().sum(dim=-1)
+            del block, logits
+        log_z = running_max + sum_exp.log()
+        grad = hidden.new_zeros(hidden.shape)
+        scale = grad_loss.to(dtype=hidden.dtype) / rows
+        for start in range(0, vocab, chunk):
+            block = weight[start : start + chunk].to(dtype=hidden.dtype)
+            logits = F.linear(hidden, block)
+            probs = (logits - log_z.unsqueeze(-1)).exp()
+            chosen = (targets >= start) & (targets < start + block.shape[0])
+            if bool(chosen.any().item()):
+                local = targets[chosen] - start
+                probs[chosen, local] = probs[chosen, local] - 1
+            grad = grad + probs.matmul(block) * scale
+            del block, logits, probs
+    return grad
 
 
 def _matrix(raw: bytes, dtype: torch.dtype, shape: tuple[int, int]) -> torch.Tensor:

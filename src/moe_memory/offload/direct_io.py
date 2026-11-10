@@ -49,6 +49,20 @@ class BlockFile:
             raise OSError(f"leitura curta em {self.path}: {len(got)} de {size} em {offset}")
         return got
 
+    def advise_dontneed(self, offset: int, size: int) -> None:
+        """Solta o cache de página deste trecho. O byte já copiado não depende dele."""
+
+        if self.fd < 0 or size <= 0:
+            return
+        advise = getattr(os, "posix_fadvise", None)
+        flag = getattr(os, "POSIX_FADV_DONTNEED", None)
+        if advise is None or flag is None:
+            return
+        try:
+            advise(self.fd, offset, size, flag)
+        except OSError:
+            return
+
     def read_into(self, offset: int, dest_ptr: int, size: int, *, dest_aligned: bool) -> None:
         """Lê para um buffer já alocado. ``dest_ptr`` é ``data_ptr`` do tensor."""
 

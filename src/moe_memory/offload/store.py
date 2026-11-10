@@ -86,7 +86,9 @@ class ExpertStore:
 
     def read_block(self, layer: int, expert: int) -> bytes:
         entry = self._entry(layer, expert)
-        return self._file.read_at(entry.offset, self.header.block_nbytes)
+        blob = self._file.read_at(entry.offset, self.header.block_nbytes)
+        self._file.advise_dontneed(entry.offset, self.header.block_nbytes)
+        return blob
 
     def read_into(self, layer: int, expert: int, dest: torch.Tensor) -> None:
         """Copia o bloco para um tensor ``uint8`` de ``block_nbytes``."""
@@ -103,9 +105,10 @@ class ExpertStore:
         aligned = ptr % self.header.align == 0
         if self._file.direct and aligned:
             self._file.read_into(entry.offset, ptr, size, dest_aligned=True)
-            return
-        blob = self._file.read_at(entry.offset, size)
-        dest.copy_(torch.frombuffer(bytearray(blob), dtype=torch.uint8))
+        else:
+            blob = self._file.read_at(entry.offset, size)
+            dest.copy_(torch.frombuffer(bytearray(blob), dtype=torch.uint8))
+        self._file.advise_dontneed(entry.offset, size)
 
     def payload(self, layer: int, expert: int) -> tuple[bytes, bytes, bytes]:
         entry = self._entry(layer, expert)
@@ -374,6 +377,14 @@ class ResidentReader:
             raise ValueError("lixo depois do último tensor residente")
 
     def close(self) -> None:
+        fd = self._fh.fileno()
+        advise = getattr(os, "posix_fadvise", None)
+        flag = getattr(os, "POSIX_FADV_DONTNEED", None)
+        if advise is not None and flag is not None and fd >= 0:
+            try:
+                advise(fd, 0, 0, flag)
+            except OSError:
+                pass
         self._fh.close()
 
     def __enter__(self) -> ResidentReader:
