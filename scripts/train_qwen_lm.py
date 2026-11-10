@@ -58,16 +58,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--estimate-only", action="store_true")
+    parser.add_argument("--check-tokenizer", action="store_true")
     args = parser.parse_args(argv)
     if args.steps < 1 or args.seq_len < 2:
         parser.error("steps >= 1 e seq-len >= 2")
-    if args.device != "cpu":
+    if not args.check_tokenizer and args.device != "cpu":
         parser.error("este smoke é CPU. A 1060 não executa o residente bf16.")
     return args
 
 
+def _load_tokenizer(model_dir: Path, expected_vocab: int | None = None):
+    try:
+        tokenizer = load_qwen_tokenizer(model_dir)
+    except ValueError as exc:
+        raise SystemExit(f"tokenizador recusado: {exc}") from exc
+    config_vocab = expected_vocab
+    config_path = model_dir / "config.json"
+    if config_vocab is None and config_path.is_file():
+        config_vocab = _config_vocab(config_path)
+    if config_vocab is not None and tokenizer.vocab_size > config_vocab:
+        raise SystemExit(
+            f"maior id do tokenizador é {tokenizer.vocab_size - 1} e o vocab do config é {config_vocab}. "
+            "Não remapeio ids."
+        )
+    return tokenizer, config_vocab
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.check_tokenizer:
+        tokenizer, config_vocab = _load_tokenizer(args.model_dir)
+        print(json.dumps(_tokenizer_report(tokenizer, config_vocab), ensure_ascii=False, indent=2))
+        return 0
     store_path = args.store_dir / "experts.moestore"
     resident_path = args.store_dir / "resident.bin"
     config_path = args.model_dir / "config.json"
@@ -122,12 +144,8 @@ def main(argv: list[str] | None = None) -> int:
         }
         torch.manual_seed(args.seed)
         refuse_cuda_bf16(torch.device(args.device), spec.dtype)
+        tokenizer, _config_vocab_size = _load_tokenizer(args.model_dir, spec.vocab_size)
         weights = load_resident(resident_path, spec, torch.device("cpu"))
-        tokenizer = load_qwen_tokenizer(args.model_dir)
-        if tokenizer.vocab_size != spec.vocab_size:
-            raise SystemExit(
-                f"tokenizador tem {tokenizer.vocab_size} ids e o config tem {spec.vocab_size}"
-            )
         router = TwoHorizonLstmRouter(
             vocab_size=spec.vocab_size,
             n_layers=spec.n_layers,
@@ -230,6 +248,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         store.close()
+
+
+def _tokenizer_report(tokenizer, config_vocab: int | None) -> dict:
+    probes = {
+        "Hello": tokenizer.encode("Hello"),
+        "pt": tokenizer.encode("Olá, o João não vai à praça."),
+        "nfd_nao": tokenizer.encode("Na\u0303o"),
+        "space": tokenizer.encode(" "),
+        "blank_line": tokenizer.encode("\n\n"),
+        "eos_piece": tokenizer.encode("<|im_end|>"),
+    }
+    return {
+        "vocab_size": tokenizer.vocab_size,
+        "max_id": tokenizer.vocab_size - 1,
+        "eos_id": tokenizer.eos_id,
+        "config_vocab": config_vocab,
+        "fits_config": config_vocab is None or tokenizer.vocab_size <= config_vocab,
+        "probes": probes,
+        "note": "ids do BPE e dos added tokens. Não carrega store nem residente.",
+    }
 
 
 def _config_vocab(path: Path) -> int:

@@ -181,3 +181,11 @@ python3 scripts/train_qwen_lm.py \
 ```
 
 `--estimate-only` imprime a conta e não aloca o residente. Para `--seq-len 8`, rank 4 e LSTM 64, com o residente de 3082214946 bytes, a conta fecha em cerca de 7,5 GiB. Não é RSS medido. Isso não é corrida longa nem medida de qualidade. A entropia que o JSON guarda é diagnóstico, não termo de loss.
+
+O smoke curto de 10/11 parou no tokenizador, antes da loss. Os 26 especiais do Qwen estão em `added_tokens`, com ids 151643–151668, e não são chaves de `model.vocab`. A auditoria exigia que fossem e recusava o arquivo. O id de cada um continua o do arquivo. O `vocab_size` do config é 151936: as linhas 151669–151935 da embedding ficam sem token, e o script só recusa se algum id não cabe. Isso se confere sem abrir o store:
+
+```
+python3 scripts/train_qwen_lm.py --check-tokenizer --model-dir models/qwen3-30b-a3b
+```
+
+A igualdade de ids foi medida contra a biblioteca `tokenizers` no `tokenizer.json` da máquina, SHA256 `aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4`. Codificar e decodificar o mesmo texto não prova esse id. `tokenizers` não entra no comando da 1060; o loader de lá segue no `tiktoken`.

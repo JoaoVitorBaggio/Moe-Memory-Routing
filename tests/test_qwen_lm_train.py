@@ -224,7 +224,7 @@ def test_qwen_bpe_refuses_a_broken_merge_and_encodes_bytes(tmp_path: Path):
     assert encoded
     assert all(0 <= token < tokenizer.vocab_size for token in encoded)
     _toy_tokenizer(tmp_path / "bad", bad_merge=True)
-    with pytest.raises(ValueError, match="merge 0"):
+    with pytest.raises(ValueError, match="buraco no BPE"):
         load_qwen_tokenizer(tmp_path / "bad")
 
 
