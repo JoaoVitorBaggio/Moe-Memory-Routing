@@ -160,3 +160,24 @@ python3 scripts/bench_offload_decode.py \
 ```
 
 A corrida de 09/11/2026 na 1060 usou essa forma, com `MemoryMax=9G` e `MemorySwapMax=0`, e `--out` em `outputs/paired-128t-seed0-pr27-9g-*.json`. A medição seguinte, se você autorizar, repete o pareado de 128 tokens com perfil e compara `schedule_lookahead_plan_wall_s` e `schedule_lookahead_plan_thread_cpu_s` com essa corrida. Não soma GPU, H2D nem SSD na parede, e não trata o microbench da máscara como ganho de tok/s. O controle teve pouca espera de SSD e de hot, então acelerar o plano não promete que o lookahead passe o on-demand.
+
+## Smoke de loss de linguagem
+
+O decode com pool não treina: o logit sai com `detach` e a vaga do expert é reaproveitada. O passo de linguagem mora em `scripts/train_qwen_lm.py`. Ele lê o store sem o pool, aplica LoRA local nas três projeções e faz a entropia cruzada do próximo token. Treinam o LSTM e a LoRA. O store e o residente não entram no otimizador. Não há `peft`, não há tokenizador GPT-2 e não há download de shard.
+
+A GTX 1060 é sm_61 e não executa bf16. O smoke fica na CPU, em float32, com o residente bf16 no lugar. O teto de lançamento do script é 8 GiB, abaixo dos 9663676416 do cgroup, para sobrar folga. A VRAM de 5,5 GiB não entra porque a GPU não recebe o residente. A saída vai para `outputs/qwen-lm-smoke/`, não para os checkpoints antigos do WikiText com GPT-2.
+
+```
+python3 scripts/train_qwen_lm.py \
+    --store-dir models/qwen3-30b-a3b-store \
+    --model-dir models/qwen3-30b-a3b \
+    --cache-dir data/cache \
+    --steps 2 --seq-len 8 --seed 0 \
+    --k1 4 --k2 6 --b2 5 --l1 1 --l2 3 \
+    --lora-rank 4 --lora-alpha 8 \
+    --lstm-embed 64 --lstm-hidden 64 \
+    --lr 1e-4 --device cpu \
+    --out outputs/qwen-lm-smoke
+```
+
+`--estimate-only` imprime a conta e não aloca o residente. Para `--seq-len 8`, rank 4 e LSTM 64, com o residente de 3082214946 bytes, a conta fecha em cerca de 7,5 GiB. Não é RSS medido. Isso não é corrida longa nem medida de qualidade. A entropia que o JSON guarda é diagnóstico, não termo de loss.
