@@ -13,7 +13,6 @@ import torch
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
 from moe_memory.offload.lm_train import (
     LAUNCH_CEILING_BYTES,
-    CGROUP_BYTES,
     OffloadLanguageModel,
     estimate_bytes,
     fingerprint,
@@ -99,8 +98,9 @@ def test_pascal_does_not_run_bf16():
     assert pascal_bf16_cuda_ok(None, True) is False
 
 
-def test_real_shape_estimate_stays_under_the_cgroup():
+def test_real_shape_estimate_fits_under_9gib_and_reads_the_given_cgroup():
     resident = 3_082_214_946
+    nine = 9_663_676_416
     estimate = estimate_bytes(
         resident_bytes=resident,
         vocab=151_936,
@@ -113,11 +113,21 @@ def test_real_shape_estimate_stays_under_the_cgroup():
         k1=4,
         lstm_embed=64,
         lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=nine,
+        read_cgroup=False,
     )
+    assert estimate["cgroup_bytes"] == nine
+    assert estimate["lora_grad_bytes"] == estimate["lora_fp32_bytes"]
+    assert estimate["expert_fp32_bytes"] == 3 * 2048 * 768 * 4
+    assert estimate["lm_head_fp32_bytes"] < resident
+    assert estimate["lm_head_fp32_bytes"] == 4096 * 2048 * 4
+    assert estimate["file_cache_bytes"] == 0
     assert estimate["total_bytes"] < LAUNCH_CEILING_BYTES
-    assert estimate["total_bytes"] < CGROUP_BYTES
+    assert estimate["total_bytes"] < nine
     assert estimate["resident_bytes"] == resident
-    assert estimate["vram_budget_bytes"] == int(5.5 * 1024**3)
 
 
 def test_one_token_attention_matches_decode_and_is_causal(tmp_path: Path):

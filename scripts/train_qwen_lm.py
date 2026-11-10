@@ -27,6 +27,8 @@ from moe_memory.offload.lm_train import (
     estimate_bytes,
     fingerprint,
     lm_step,
+    rss_bytes,
+    ru_maxrss_bytes,
     load_trainable,
     refuse_cuda_bf16,
     save_checkpoint,
@@ -59,6 +61,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--estimate-only", action="store_true")
     parser.add_argument("--check-tokenizer", action="store_true")
+    parser.add_argument("--memory-log", action="store_true")
     args = parser.parse_args(argv)
     if args.steps < 1 or args.seq_len < 2:
         parser.error("steps >= 1 e seq-len >= 2")
@@ -121,13 +124,18 @@ def main(argv: list[str] | None = None) -> int:
             k1=args.k1,
             lstm_embed=args.lstm_embed,
             lstm_hidden=args.lstm_hidden,
+            n_heads=spec.n_heads,
+            n_kv_heads=spec.n_kv_heads,
+            head_dim=spec.head_dim,
         )
+        cgroup = estimate["cgroup_bytes"]
+        fits = estimate["total_bytes"] <= LAUNCH_CEILING_BYTES and (cgroup is None or estimate["total_bytes"] <= cgroup)
         summary = {
             "kind": "qwen-lm-lora-lstm-smoke",
             "device": "cpu",
             "compute_dtype": "float32",
             "estimate": estimate,
-            "fits_launch_ceiling": estimate["total_bytes"] <= LAUNCH_CEILING_BYTES,
+            "fits_launch_ceiling": fits,
             "gpu": "não usada; residente bf16 e capability 6.1 não executam bf16",
         }
         print(json.dumps(summary, indent=2))
@@ -159,6 +167,12 @@ def main(argv: list[str] | None = None) -> int:
             hidden_size=args.lstm_hidden,
         )
         model = OffloadLanguageModel(weights, router, store, rank=args.lora_rank, alpha=args.lora_alpha)
+        model.memory_log = args.memory_log
+        if args.memory_log:
+            print(
+                json.dumps({"phase": "resident-loaded", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
+                flush=True,
+            )
         optimizer = torch.optim.AdamW(
             [parameter for parameter in model.parameters() if parameter.requires_grad],
             lr=args.lr,
@@ -196,10 +210,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         with torch.no_grad():
-            valid_logits, _plan = model.forward_window(torch.tensor(valid, dtype=torch.long).view(1, -1))
-            from moe_memory.qwen3_adapter import language_model_loss
-
-            valid_loss = float(language_model_loss(valid_logits, torch.tensor(valid, dtype=torch.long).view(1, -1)))
+            valid_loss_t, _plan = model.forward_window(torch.tensor(valid, dtype=torch.long).view(1, -1))
+            valid_loss = float(valid_loss_t)
         args.out.mkdir(parents=True, exist_ok=True)
         checkpoint = args.out / "checkpoint.pt"
         save_checkpoint(

@@ -189,3 +189,5 @@ python3 scripts/train_qwen_lm.py --check-tokenizer --model-dir models/qwen3-30b-
 ```
 
 A igualdade de ids foi medida contra a biblioteca `tokenizers` no `tokenizer.json` da máquina, SHA256 `aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4`. Codificar e decodificar o mesmo texto não prova esse id. `tokenizers` não entra no comando da 1060; o loader de lá segue no `tiktoken`.
+
+O teto de 7,53 GiB deixava de fora o gradiente da LoRA, a cabeça inteira em float32 e o cache de página do residente. A cabeça agora entra em fatias de 4096 linhas, cada expert em float32 vive um de cada vez, e a leitura pede `DONTNEED` para o cache. `cgroup_bytes` sai de `memory.max`, não de uma constante. `--memory-log` imprime o RSS por fase. A conta nova fica abaixo de 8 GiB; a validação continua com `MemoryMax=9663676416` e `MemorySwapMax=0`.
