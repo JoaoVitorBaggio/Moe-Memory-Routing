@@ -34,6 +34,7 @@ from moe_memory.offload.lm_train import (
     rss_bytes,
     ru_maxrss_bytes,
     make_optimizer,
+    profile_lm_step,
     refuse_cuda_bf16,
     release_step_memory,
     save_checkpoint,
@@ -68,6 +69,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--check-tokenizer", action="store_true")
     parser.add_argument("--memory-log", action="store_true")
     parser.add_argument("--time-log", action="store_true")
+    parser.add_argument("--profile-step", type=int, default=None)
+    parser.add_argument("--profile-stack", action="store_true")
+    parser.add_argument("--profile-trace", action="store_true")
     parser.add_argument("--expert-cache-sim", default="32,64,128")
     parser.add_argument("--valid-forward", action="store_true")
     args = parser.parse_args(argv)
@@ -75,6 +79,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("steps >= 1 e seq-len >= 2")
     if not args.check_tokenizer and args.device != "cpu":
         parser.error("este smoke é CPU. A 1060 não executa o residente bf16.")
+    if args.profile_step is None and (args.profile_stack or args.profile_trace):
+        parser.error("--profile-stack e --profile-trace pedem --profile-step")
+    if args.profile_step is not None and not 1 <= args.profile_step <= args.steps:
+        parser.error("--profile-step precisa ser um passo entre 1 e --steps")
     return args
 
 
@@ -214,7 +222,15 @@ def main(argv: list[str] | None = None) -> int:
         rows = []
         for step, window in enumerate(windows, start=1):
             tokens = torch.tensor(window, dtype=torch.long).view(1, -1)
-            row = lm_step(model, optimizer, tokens)
+            if args.profile_step == step:
+                with profile_lm_step(
+                    args.out / f"profile-step-{step}",
+                    with_stack=args.profile_stack,
+                    with_trace=args.profile_trace,
+                ):
+                    row = lm_step(model, optimizer, tokens)
+            else:
+                row = lm_step(model, optimizer, tokens)
             row["step"] = step
             rows.append(row)
             print(json.dumps(row), flush=True)

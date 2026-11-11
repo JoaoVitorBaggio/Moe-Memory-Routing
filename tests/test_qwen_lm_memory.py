@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import torch
 import torch.nn.functional as F
 
@@ -76,6 +78,30 @@ def test_time_log_partitions_the_step_and_simulates_the_lru(tmp_path):
     assert simulate_expert_lru(reads, 1)["hits"] == 1
     assert simulate_expert_lru(reads, 2)["hits"] == 2
     assert simulate_expert_lru(reads, 2)["avoided_bytes"] == 20
+
+
+def test_profile_step_writes_tables_without_a_trace(tmp_path):
+    from moe_memory.offload.lm_train import lm_step, make_optimizer, profile_lm_step
+
+    model, store, _directory = _model(tmp_path)
+    try:
+        tokens = torch.tensor([[1, 2, 3, 4]])
+        out = tmp_path / "profile-step-1"
+        with profile_lm_step(out, with_stack=False, with_trace=False):
+            stats = lm_step(model, make_optimizer(model, 1e-3), tokens)
+        assert stats["grads_finite"] is True
+        assert (out / "profile_ops_top50.txt").is_file()
+        assert (out / "profile_shapes_top30.txt").is_file()
+        assert not (out / "profile_trace.json").exists()
+        summary = json.loads((out / "profile_regions.json").read_text(encoding="utf-8"))
+        assert summary["profile_memory"] is False
+        assert summary["with_stack"] is False
+        assert summary["calls"]["total"] > 0
+        assert "router_plan" in summary["regions"]
+        assert summary["regions"]["router_plan"]["count"] >= 1
+        assert any(name.startswith("expert_compute_") for name in summary["regions"])
+    finally:
+        store.close()
 
 
 def test_cgroup_parser_accepts_a_number_and_max(tmp_path):
