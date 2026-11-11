@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import torch
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
+from moe_memory.offload.lm_gpu import host_compute_threads
 from moe_memory.offload.lm_train import (
     LAUNCH_CEILING_BYTES,
     OffloadLanguageModel,
@@ -66,6 +67,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device-compute", default="cpu")
+    parser.add_argument("--vram-budget-gb", type=float, default=5.0)
     parser.add_argument("--estimate-only", action="store_true")
     parser.add_argument("--check-tokenizer", action="store_true")
     parser.add_argument("--memory-log", action="store_true")
@@ -92,7 +95,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--expert-cache e --expert-cache-bytes precisam ser >= 0")
     if args.expert_prefetch_layers < 0 or args.expert_prefetch_bytes < 0:
         parser.error("--expert-prefetch-layers e --expert-prefetch-bytes precisam ser >= 0")
+    if args.device_compute not in ("cpu", "cuda"):
+        parser.error("--device-compute é cpu ou cuda")
+    if args.vram_budget_gb <= 0:
+        parser.error("--vram-budget-gb precisa ser > 0")
     return args
+
+
+def _cuda_compute_is_bf16() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    capability = torch.cuda.get_device_capability()
+    return capability[0] >= 8 and bool(torch.cuda.is_bf16_supported())
 
 
 def _load_tokenizer(model_dir: Path, expected_vocab: int | None = None):
@@ -158,22 +172,33 @@ def main(argv: list[str] | None = None) -> int:
             expert_prefetch_layers=args.expert_prefetch_layers,
             expert_prefetch_bytes=args.expert_prefetch_bytes,
             k2=args.k2,
+            compute_cuda=args.device_compute == "cuda",
+            compute_elem=2 if _cuda_compute_is_bf16() else 4,
         )
         cgroup = estimate["cgroup_bytes"]
         fits_cgroup = cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
         fits = launch_allowed(estimate)
+        vram_budget = int(args.vram_budget_gb * 1024**3)
+        fits_vram = args.device_compute == "cpu" or int(estimate["vram_bytes"]) <= vram_budget
         summary = {
             "kind": "qwen-lm-lora-lstm-smoke",
             "device": "cpu",
-            "compute_dtype": "float32",
+            "compute_device": args.device_compute,
+            "compute_dtype": "bfloat16" if args.device_compute == "cuda" and _cuda_compute_is_bf16() else "float32",
             "estimate": estimate,
             "fits_launch_ceiling": fits,
             "fits_cgroup_estimate": fits_cgroup,
+            "fits_vram": fits_vram,
+            "vram_budget_bytes": vram_budget,
             "expert_cache_slots": args.expert_cache,
             "expert_cache_max_bytes": args.expert_cache_bytes,
             "expert_prefetch_layers": args.expert_prefetch_layers,
             "expert_prefetch_bytes": args.expert_prefetch_bytes,
-            "gpu": "não usada; residente bf16 e capability 6.1 não executam bf16",
+            "gpu": (
+                "uma camada por vez; Pascal fica em fp32"
+                if args.device_compute == "cuda"
+                else "não usada; residente bf16 e capability 6.1 não executam bf16"
+            ),
         }
         print(json.dumps(summary, indent=2))
         if args.estimate_only:
@@ -182,6 +207,11 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(
                 f"estimativa {estimate['total_bytes']} bytes passa de {LAUNCH_CEILING_BYTES}. "
                 "Não inicio o passo. O teto do cgroup continua 9663676416."
+            )
+        if not fits_vram:
+            raise SystemExit(
+                f"VRAM estimada {estimate['vram_bytes']} bytes passa de {vram_budget}. "
+                "Não carrego o modelo inteiro na GPU."
             )
         before = {
             "store": fingerprint(store_path),
@@ -208,6 +238,9 @@ def main(argv: list[str] | None = None) -> int:
         model = OffloadLanguageModel(weights, router, store, rank=args.lora_rank, alpha=args.lora_alpha)
         model.set_expert_cache(args.expert_cache, args.expert_cache_bytes)
         model.set_expert_prefetch(args.expert_prefetch_layers, args.expert_prefetch_bytes)
+        if args.device_compute == "cuda":
+            torch.set_num_threads(host_compute_threads(os.cpu_count() or 1, True))
+            model.set_compute_device(torch.device("cuda"), vram_budget)
         model.memory_log = args.memory_log
         model.time_log = args.time_log
         if args.time_log:
