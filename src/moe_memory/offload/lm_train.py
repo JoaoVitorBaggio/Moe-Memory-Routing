@@ -15,6 +15,8 @@ materializar um zero do tensor compartilhado inteiro a cada expert.
 
 ``--expert-cache N`` guarda o bf16 recém-lido do store, antes do
 float32. Não entra no grafo. Zero é o caminho de hoje.
+``--expert-prefetch-layers D`` lê, numa thread, as próximas camadas
+enquanto a CPU computa a corrente. Zero desliga.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import gc
 import hashlib
 import json
 import resource
+import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -143,12 +146,29 @@ def ru_maxrss_bytes() -> int:
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
 
 
+def _expert_block_bf16(hidden: int, intermediate: int) -> int:
+    return 3 * hidden * intermediate * 2
+
+
+def _expert_prefetch_bytes(hidden: int, intermediate: int, layers: int, k2: int, max_bytes: int) -> int:
+    """Teto do buffer de prefetch. Não é a cópia float32 nem o LRU."""
+
+    if layers < 0 or k2 < 0 or max_bytes < 0:
+        raise ValueError("prefetch precisa ser >= 0")
+    if layers == 0:
+        return 0
+    auto = layers * max(k2, 1) * _expert_block_bf16(hidden, intermediate)
+    if max_bytes == 0:
+        return auto
+    return min(auto, max_bytes)
+
+
 def _expert_cache_bytes(hidden: int, intermediate: int, slots: int, max_bytes: int) -> int:
     """Bytes do LRU. O bloco é bf16, três matrizes, sem a cópia float32."""
 
     if slots < 0 or max_bytes < 0:
         raise ValueError("cache de experts precisa ser >= 0")
-    block = 3 * hidden * intermediate * 2
+    block = _expert_block_bf16(hidden, intermediate)
     if slots == 0 and max_bytes == 0:
         return 0
     if max_bytes == 0:
@@ -199,12 +219,16 @@ def estimate_bytes(
     read_cgroup: bool = True,
     expert_cache_slots: int = 0,
     expert_cache_max_bytes: int = 0,
+    expert_prefetch_layers: int = 0,
+    expert_prefetch_bytes: int = 0,
+    k2: int = 6,
 ) -> dict[str, int | None]:
     """Teto do anon com a cabeça e o expert em pedaços. Não inclui o store inteiro.
 
     ``resident_page_cache_if_kept`` é o cache do arquivo se ninguém pedir
     ``DONTNEED``. Não entra na soma. ``cgroup_bytes`` vem do processo, ou
-    do teste. ``expert_cache_*`` é o LRU bf16, também anônimo.
+    do teste. ``expert_cache_*`` é o LRU bf16. ``expert_prefetch_*`` é o
+    buffer da thread, também bf16, e pode estar cheio junto com o LRU.
     """
 
     if min(resident_bytes, vocab, hidden, intermediate, n_layers, n_experts, rank, seq_len, k1) < 1:
@@ -219,6 +243,9 @@ def estimate_bytes(
     )
     one_expert = 3 * hidden * intermediate * 4
     expert_cache = _expert_cache_bytes(hidden, intermediate, expert_cache_slots, expert_cache_max_bytes)
+    expert_prefetch = _expert_prefetch_bytes(
+        hidden, intermediate, expert_prefetch_layers, k2, expert_prefetch_bytes
+    )
     if n_heads is None or n_kv_heads is None or head_dim is None:
         attention = 0
     else:
@@ -238,6 +265,7 @@ def estimate_bytes(
         "lstm_grad_bytes": lstm_params * 4,
         "expert_fp32_bytes": one_expert,
         "expert_cache_bytes": expert_cache,
+        "expert_prefetch_bytes": expert_prefetch,
         "attention_fp32_bytes": attention,
         "lm_head_fp32_bytes": head,
         "overhead_bytes": OVERHEAD_BYTES,
@@ -337,6 +365,7 @@ class OffloadLanguageModel(nn.Module):
         self.time_log = False
         self.cache_sim_sizes: tuple[int, ...] = ()
         self.expert_cache = ExpertWeightCache(0, 0)
+        self.prefetch = ExpertPrefetcher(self)
         self.store_reads = 0
         self.expert_live = 0
         self.expert_live_max = 0
@@ -356,6 +385,8 @@ class OffloadLanguageModel(nn.Module):
         with _region("router_plan"):
             plan, _state = self.router.plan(token_ids)
         self._add_time("router_plan_s", time.perf_counter() - started)
+        if self.prefetch.enabled:
+            self.prefetch.set_plan(experts_by_layer(plan))
         hidden = self._embed(token_ids)
         self._phase("embed")
         spec = self.weights.spec
@@ -403,6 +434,8 @@ class OffloadLanguageModel(nn.Module):
         return self._layer_body(hidden, coeffs, index, valid, spec, layer, layer_index)
 
     def _layer_body(self, hidden, coeffs, index, valid, spec, layer, layer_index):
+        direction = 1 if self._io_phase == "forward" else -1
+        self.prefetch.arm(layer_index, direction)
         started = time.perf_counter()
         normed = rms_norm(hidden, _as(layer.input_norm, hidden), spec.rms_eps)
         self._add_time(self._phase_key("resident_s"), time.perf_counter() - started)
@@ -449,26 +482,42 @@ class OffloadLanguageModel(nn.Module):
     def set_expert_cache(self, slots: int, max_bytes: int = 0) -> None:
         self.expert_cache = ExpertWeightCache(slots, max_bytes)
 
-    def release_expert_cache(self) -> None:
-        """Solta os blocos bf16 antes do checkpoint. O passo seguinte relê."""
+    def set_expert_prefetch(self, layers: int, max_bytes: int = 0) -> None:
+        block = int(self.store.header.raw_nbytes)
+        cap = max_bytes
+        if layers > 0 and cap == 0:
+            cap = layers * max(self.router.k2, 1) * block
+        self.prefetch.start(layers, cap, block)
 
+    def release_expert_cache(self) -> None:
+        """Solta o LRU e junta a thread antes do checkpoint."""
+
+        self.prefetch.stop()
         self.expert_cache.clear()
 
     def _read(self, layer: int, expert: int, kind: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         key = (layer, expert)
-        cached = self.expert_cache.lookup(key)
-        if cached is None:
-            started = time.perf_counter()
-            with _region(f"expert_read_{kind}"):
-                gate_b, up_b, down_b = self.store.payload(layer, expert)
-            self.store_reads += 1
-            self._add_time(f"expert_read_{kind}_s", time.perf_counter() - started)
-            nbytes = len(gate_b) + len(up_b) + len(down_b)
-            self._add_time(f"expert_read_{kind}_bytes", nbytes)
-            self.expert_cache.store(key, (gate_b, up_b, down_b), nbytes)
+        if self.prefetch.enabled:
+            blobs, sync_s = self.prefetch.obtain(layer, expert, kind)
+            nbytes = len(blobs[0]) + len(blobs[1]) + len(blobs[2])
+            if sync_s is not None:
+                self._add_time(f"expert_read_{kind}_s", sync_s)
+                self._add_time(f"expert_read_{kind}_bytes", nbytes)
+            gate_b, up_b, down_b = blobs
         else:
-            gate_b, up_b, down_b = cached
-            nbytes = len(gate_b) + len(up_b) + len(down_b)
+            cached = self.expert_cache.lookup(key)
+            if cached is None:
+                started = time.perf_counter()
+                with _region(f"expert_read_{kind}"):
+                    gate_b, up_b, down_b = self.store.payload(layer, expert)
+                self.store_reads += 1
+                self._add_time(f"expert_read_{kind}_s", time.perf_counter() - started)
+                nbytes = len(gate_b) + len(up_b) + len(down_b)
+                self._add_time(f"expert_read_{kind}_bytes", nbytes)
+                self.expert_cache.store(key, (gate_b, up_b, down_b), nbytes)
+            else:
+                gate_b, up_b, down_b = cached
+                nbytes = len(gate_b) + len(up_b) + len(down_b)
         if self.time_log:
             self._read_seq.append((key, nbytes))
         started = time.perf_counter()
@@ -495,8 +544,8 @@ class OffloadLanguageModel(nn.Module):
         self._times = {}
         self._read_seq = []
         self._io_phase = "forward"
-        self.store_reads = 0
         self.expert_cache.reset_counters()
+        self.prefetch.reset_counters()
 
     def timing_report(self, wall_s: float) -> dict[str, float | int | dict | None]:
         exclusive = (
@@ -505,6 +554,7 @@ class OffloadLanguageModel(nn.Module):
             "resident_s",
             "attention_s",
             "expert_read_forward_s",
+            "prefetch_wait_s",
             "expert_convert_forward_s",
             "expert_compute_forward_s",
             "cross_entropy_forward_s",
@@ -537,6 +587,7 @@ class OffloadLanguageModel(nn.Module):
             str(size): simulate_expert_lru(self._read_seq, size) for size in self.cache_sim_sizes
         }
         report["expert_cache"] = self.expert_cache.stats()
+        report["expert_prefetch"] = self.prefetch.stats()
         report["store_reads"] = self.store_reads
         return report
 
@@ -582,6 +633,7 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     report["ru_maxrss_bytes"] = ru_maxrss_bytes()
     report["store_reads"] = model.store_reads
     report["expert_cache"] = model.expert_cache.stats()
+    report["expert_prefetch"] = model.prefetch.stats()
     if model.time_log:
         report["time"] = model.timing_report(time.perf_counter() - wall)
     model._phase("after-step")
@@ -1068,6 +1120,7 @@ class ExpertWeightCache:
         self.max_bytes = max_bytes
         self._items: OrderedDict[tuple[int, int], tuple[bytes, bytes, bytes]] = OrderedDict()
         self._sizes: dict[tuple[int, int], int] = {}
+        self._pinned: set[tuple[int, int]] = set()
         self.stored_bytes = 0
         self.hits = 0
         self.misses = 0
@@ -1077,16 +1130,29 @@ class ExpertWeightCache:
     def enabled(self) -> bool:
         return self.slots > 0 or self.max_bytes > 0
 
-    def lookup(self, key: tuple[int, int]) -> tuple[bytes, bytes, bytes] | None:
-        if not self.enabled:
-            return None
+    def set_pinned(self, keys: set[tuple[int, int]]) -> None:
+        """Experts da camada corrente. O LRU não os expulsa."""
+
+        self._pinned = set(keys)
+
+    def contains(self, key: tuple[int, int]) -> bool:
+        return key in self._items
+
+    def touch(self, key: tuple[int, int]) -> tuple[bytes, bytes, bytes] | None:
         found = self._items.get(key)
         if found is None:
-            self.misses += 1
             return None
         self.hits += 1
         self.avoided_bytes += self._sizes[key]
         self._items.move_to_end(key)
+        return found
+
+    def lookup(self, key: tuple[int, int]) -> tuple[bytes, bytes, bytes] | None:
+        if not self.enabled:
+            return None
+        found = self.touch(key)
+        if found is None:
+            self.misses += 1
         return found
 
     def store(self, key: tuple[int, int], blobs: tuple[bytes, bytes, bytes], nbytes: int) -> None:
@@ -1097,7 +1163,8 @@ class ExpertWeightCache:
         if self.max_bytes > 0 and nbytes > self.max_bytes:
             return
         while self._items and self._needs_room(nbytes):
-            self._evict()
+            if not self._evict():
+                break
         if self._needs_room(nbytes):
             return
         self._items[key] = blobs
@@ -1125,6 +1192,7 @@ class ExpertWeightCache:
     def clear(self) -> None:
         self._items.clear()
         self._sizes.clear()
+        self._pinned.clear()
         self.stored_bytes = 0
 
     def _needs_room(self, incoming: int) -> bool:
@@ -1134,9 +1202,293 @@ class ExpertWeightCache:
             return True
         return False
 
-    def _evict(self) -> None:
-        key, _blobs = self._items.popitem(last=False)
-        self.stored_bytes -= self._sizes.pop(key)
+    def _evict(self) -> bool:
+        victim = None
+        for key in self._items:
+            if key not in self._pinned:
+                victim = key
+                break
+        if victim is None:
+            return False
+        del self._items[victim]
+        self.stored_bytes -= self._sizes.pop(victim)
+        return True
+
+
+def experts_by_layer(plan) -> list[list[tuple[int, int]]]:
+    """Experts usados em cada camada, na ordem em que o forward os encontra."""
+
+    valid = plan.hot_valid[0]
+    index = plan.hot_index[0]
+    seq, n_layers, slots = valid.shape
+    layers: list[list[tuple[int, int]]] = []
+    for layer in range(n_layers):
+        found: list[tuple[int, int]] = []
+        seen: set[int] = set()
+        for token in range(seq):
+            for slot in range(slots):
+                if not bool(valid[token, layer, slot].item()):
+                    continue
+                expert = int(index[token, layer, slot].item())
+                if expert in seen:
+                    continue
+                seen.add(expert)
+                found.append((layer, expert))
+        layers.append(found)
+    return layers
+
+
+class ExpertPrefetcher:
+    """Uma thread lê o store enquanto a CPU computa a camada corrente.
+
+    O ``pread`` (``os.pread`` ou ``libc.pread``) solta o GIL. A thread não
+    chama o torch, então não abre outro pool de threads. Não altera o
+    ioprio: o processo herda ``IOSchedulingClass=idle``.
+
+    No forward a fila é ``l+1 .. l+D``. No backward, a recomputação anda
+    para trás, e a fila é ``l-1 .. l-D``. O buffer é separado do LRU e
+    cabe em ``max_bytes``. Ao entregar um bloco, ele sai do buffer e
+    entra no LRU sem expulsar a camada corrente.
+    """
+
+    def __init__(self, model: OffloadLanguageModel) -> None:
+        self.model = model
+        self.depth = 0
+        self.max_bytes = 0
+        self._block = 0
+        self._plan: list[list[tuple[int, int]]] = []
+        self._keep: set[tuple[int, int]] = set()
+        self._queue: list[tuple[int, int]] = []
+        self._buffer: dict[tuple[int, int], tuple[bytes, bytes, bytes]] = {}
+        self._sizes: dict[tuple[int, int], int] = {}
+        self._buffer_bytes = 0
+        self._inflight: set[tuple[int, int]] = set()
+        self._claimed: set[tuple[int, int]] = set()
+        self._stop = False
+        self._error: BaseException | None = None
+        self._thread: threading.Thread | None = None
+        self._cv = threading.Condition()
+        self.hits = 0
+        self.wait_s = 0.0
+        self.wait_forward_s = 0.0
+        self.wait_backward_s = 0.0
+        self.hidden_read_s = 0.0
+        self.background_bytes = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self._thread is not None
+
+    @property
+    def alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, layers: int, max_bytes: int, block: int) -> None:
+        if layers < 0 or max_bytes < 0 or block < 0:
+            raise ValueError("prefetch precisa ser >= 0")
+        self.stop()
+        if layers == 0 or max_bytes == 0 or block == 0:
+            self.depth = 0
+            self.max_bytes = 0
+            return
+        self.depth = layers
+        self.max_bytes = max_bytes
+        self._block = block
+        self._stop = False
+        self._error = None
+        self._thread = threading.Thread(target=self._run, name="expert-prefetch", daemon=False)
+        self._thread.start()
+
+    def stop(self) -> None:
+        thread = None
+        with self._cv:
+            self._stop = True
+            self._queue.clear()
+            self._cv.notify_all()
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        with self._cv:
+            self._thread = None
+            self._buffer.clear()
+            self._sizes.clear()
+            self._buffer_bytes = 0
+            self._inflight.clear()
+            self._claimed.clear()
+            self._queue.clear()
+            self.depth = 0
+        self.model.expert_cache.set_pinned(set())
+
+    def set_plan(self, layers: list[list[tuple[int, int]]]) -> None:
+        if not self.enabled:
+            return
+        with self._cv:
+            self._plan = layers
+
+    def arm(self, layer: int, direction: int) -> None:
+        if not self.enabled or not self._plan:
+            return
+        if direction not in (1, -1):
+            raise ValueError("o prefetch anda para a frente ou para trás")
+        with self._cv:
+            current = list(self._plan[layer]) if 0 <= layer < len(self._plan) else []
+            wanted: list[tuple[int, int]] = []
+            for step in range(1, self.depth + 1):
+                nxt = layer + direction * step
+                if 0 <= nxt < len(self._plan):
+                    wanted.extend(self._plan[nxt])
+            keep = set(current)
+            keep.update(wanted)
+            self._keep = keep
+            self.model.expert_cache.set_pinned(set(current))
+            self._drop_unwanted(keep)
+            self._queue = [key for key in wanted if not self._present(key)]
+            self._cv.notify_all()
+
+    def obtain(self, layer: int, expert: int, kind: str) -> tuple[tuple[bytes, bytes, bytes], float | None]:
+        """Devolve os bytes e, se a leitura foi síncrona, o tempo dela."""
+
+        key = (layer, expert)
+        while True:
+            with self._cv:
+                self._raise()
+                cached = self.model.expert_cache.touch(key)
+                if cached is not None:
+                    return cached, None
+                buffered = self._buffer.get(key)
+                if buffered is not None:
+                    self._take_buffer(key)
+                    self.hits += 1
+                    self.model.expert_cache.store(key, buffered, self._nbytes(buffered))
+                    return buffered, None
+                if key in self._inflight:
+                    waited = self._wait_locked()
+                    self._note_wait(waited)
+                    continue
+                if key in self._queue:
+                    self._queue.remove(key)
+                self._claimed.add(key)
+            started = time.perf_counter()
+            try:
+                with _region(f"expert_read_{kind}"):
+                    blobs = self._payload(key)
+            finally:
+                with self._cv:
+                    self._claimed.discard(key)
+                    self._cv.notify_all()
+            sync_s = time.perf_counter() - started
+            with self._cv:
+                self.model.store_reads += 1
+                self.model.expert_cache.store(key, blobs, self._nbytes(blobs))
+            return blobs, sync_s
+
+    def reset_counters(self) -> None:
+        with self._cv:
+            self.hits = 0
+            self.wait_s = 0.0
+            self.wait_forward_s = 0.0
+            self.wait_backward_s = 0.0
+            self.hidden_read_s = 0.0
+            self.background_bytes = 0
+            self.model.store_reads = 0
+
+    def stats(self) -> dict[str, float | int]:
+        with self._cv:
+            return {
+                "layers": self.depth,
+                "max_bytes": self.max_bytes,
+                "hits": self.hits,
+                "wait_s": self.wait_s,
+                "wait_forward_s": self.wait_forward_s,
+                "wait_backward_s": self.wait_backward_s,
+                "hidden_read_s": self.hidden_read_s,
+                "background_bytes": self.background_bytes,
+                "buffer_bytes": self._buffer_bytes,
+            }
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._stop and not self._queue:
+                    self._cv.wait()
+                if self._stop:
+                    return
+                if self._block > self.max_bytes:
+                    self._queue.clear()
+                    continue
+                if self._buffer_bytes + self._block > self.max_bytes:
+                    self._cv.wait(timeout=0.05)
+                    continue
+                key = self._queue.pop(0)
+                if self._present(key) or key in self._claimed:
+                    continue
+                self._inflight.add(key)
+            try:
+                started = time.perf_counter()
+                blobs = self._payload(key)
+                elapsed = time.perf_counter() - started
+            except Exception as exc:
+                with self._cv:
+                    self._error = exc
+                    self._inflight.discard(key)
+                    self._cv.notify_all()
+                return
+            nbytes = self._nbytes(blobs)
+            with self._cv:
+                self._inflight.discard(key)
+                self.hidden_read_s += elapsed
+                self.background_bytes += nbytes
+                self.model.store_reads += 1
+                if not self._stop and key not in self._claimed and key not in self._buffer:
+                    self._buffer[key] = blobs
+                    self._sizes[key] = nbytes
+                    self._buffer_bytes += nbytes
+                self._cv.notify_all()
+
+    def _payload(self, key: tuple[int, int]) -> tuple[bytes, bytes, bytes]:
+        # Fora do lock. os.pread e libc.pread soltam o GIL.
+        return self.model.store.payload(key[0], key[1])
+
+    def _present(self, key: tuple[int, int]) -> bool:
+        return (
+            key in self._buffer
+            or key in self._inflight
+            or key in self._claimed
+            or self.model.expert_cache.contains(key)
+        )
+
+    def _drop_unwanted(self, keep: set[tuple[int, int]]) -> None:
+        for key in list(self._buffer):
+            if key in keep:
+                continue
+            self._buffer_bytes -= self._sizes.pop(key)
+            del self._buffer[key]
+
+    def _take_buffer(self, key: tuple[int, int]) -> None:
+        del self._buffer[key]
+        self._buffer_bytes -= self._sizes.pop(key)
+        self._cv.notify_all()
+
+    def _wait_locked(self) -> float:
+        started = time.perf_counter()
+        self._cv.wait()
+        return time.perf_counter() - started
+
+    def _note_wait(self, waited: float) -> None:
+        self.wait_s += waited
+        if self.model._io_phase == "forward":
+            self.wait_forward_s += waited
+            self.model._add_time("prefetch_wait_s", waited)
+        else:
+            self.wait_backward_s += waited
+
+    def _raise(self) -> None:
+        if self._error is not None:
+            raise RuntimeError("prefetch do expert falhou") from self._error
+
+    @staticmethod
+    def _nbytes(blobs: tuple[bytes, bytes, bytes]) -> int:
+        return len(blobs[0]) + len(blobs[1]) + len(blobs[2])
 
 
 def simulate_expert_lru(reads: list[tuple[tuple[int, int], int]], capacity: int) -> dict[str, int]:
