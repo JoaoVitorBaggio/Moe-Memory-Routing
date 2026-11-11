@@ -56,6 +56,28 @@ def test_one_step_keeps_a_single_expert_copy(tmp_path):
         store.close()
 
 
+def test_time_log_partitions_the_step_and_simulates_the_lru(tmp_path):
+    from moe_memory.offload.lm_train import lm_step, make_optimizer, simulate_expert_lru
+
+    model, store, _directory = _model(tmp_path)
+    try:
+        model.time_log = True
+        model.cache_sim_sizes = (0, 1, 8)
+        tokens = torch.tensor([[1, 2, 3, 4, 5, 6]])
+        stats = lm_step(model, make_optimizer(model, 1e-3), tokens)
+        timing = stats["time"]
+        assert abs(timing["accounted_s"] + timing["outros_s"] - timing["wall_s"]) < 1e-6
+        assert timing["experts_leituras"] >= timing["experts_unicos"] >= 1
+        assert timing["expert_read_backward_bytes"] > 0
+        assert timing["cache_lru"]["0"]["hits"] == 0
+    finally:
+        store.close()
+    reads = [((0, 1), 10), ((0, 1), 10), ((0, 2), 10), ((0, 1), 10)]
+    assert simulate_expert_lru(reads, 1)["hits"] == 1
+    assert simulate_expert_lru(reads, 2)["hits"] == 2
+    assert simulate_expert_lru(reads, 2)["avoided_bytes"] == 20
+
+
 def test_cgroup_parser_accepts_a_number_and_max(tmp_path):
     path = tmp_path / "memory.max"
     path.write_text("9663676416\n", encoding="utf-8")

@@ -17,6 +17,7 @@ import gc
 import hashlib
 import json
 import resource
+import time
 from pathlib import Path
 
 import torch
@@ -179,6 +180,7 @@ def estimate_bytes(
         n_layers * n_experts * intermediate * rank * 4,
         n_layers * n_experts * hidden * rank * 4,
     )
+    pieces["activation_bytes"] = seq_len * hidden * 4 * (n_layers + 8)
     pieces["optimizer_step_temporary_bytes"] = largest
     pieces["checkpoint_extra_bytes"] = 0
     pieces["checkpoint_file_bytes"] = lora + lora * 2 + lstm_params * 12
@@ -261,8 +263,13 @@ class OffloadLanguageModel(nn.Module):
         self.lora = ExpertLoRA(spec.n_layers, spec.n_experts, spec.hidden_size, spec.moe_intermediate, rank, alpha)
         self.store_dtype = torch_dtype(store.header.dtype_code)
         self.memory_log = False
+        self.time_log = False
+        self.cache_sim_sizes: tuple[int, ...] = ()
         self.expert_live = 0
         self.expert_live_max = 0
+        self._io_phase = "forward"
+        self._times: dict[str, float] = {}
+        self._read_seq: list[tuple[tuple[int, int], int]] = []
         for tensor in _resident_tensors(weights):
             tensor.requires_grad_(False)
 
@@ -271,7 +278,10 @@ class OffloadLanguageModel(nn.Module):
             raise ValueError("a janela de offload é [1, T]")
         if token_ids.shape[1] < 2:
             raise ValueError("a janela precisa de ao menos 2 tokens")
+        _EXPERT_STATE["model"] = self
+        started = time.perf_counter()
         plan, _state = self.router.plan(token_ids)
+        self._add_time("router_plan_s", time.perf_counter() - started)
         hidden = self._embed(token_ids)
         self._phase("embed")
         spec = self.weights.spec
@@ -290,26 +300,35 @@ class OffloadLanguageModel(nn.Module):
                 use_reentrant=False,
             )
         self._phase(f"layers-done-{spec.n_layers}")
+        started = time.perf_counter()
         normed = rms_norm(hidden, _as(self.weights.final_norm, hidden), spec.rms_eps)
         loss = _chunked_cross_entropy(
             normed[:, :-1].reshape(-1, normed.shape[-1]),
             self.weights.lm_head,
             token_ids[:, 1:].reshape(-1),
         )
+        self._add_time("cross_entropy_forward_s", time.perf_counter() - started)
         self._phase("loss")
         return loss, plan
 
     def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        started = time.perf_counter()
         rows = self.weights.embed.index_select(0, token_ids.reshape(-1))
-        return rows.to(dtype=torch.float32).view(1, token_ids.shape[1], -1)
+        hidden = rows.to(dtype=torch.float32).view(1, token_ids.shape[1], -1)
+        self._add_time("embed_s", time.perf_counter() - started)
+        return hidden
 
     def _layer(self, hidden, coeffs, index, valid, layer_index_t):
         spec = self.weights.spec
         layer_index = int(layer_index_t.item())
         layer = self.weights.layers[layer_index]
+        started = time.perf_counter()
         normed = rms_norm(hidden, _as(layer.input_norm, hidden), spec.rms_eps)
+        self._add_time(self._phase_key("resident_s"), time.perf_counter() - started)
         hidden = hidden + _attention_seq(layer, normed, spec)
+        started = time.perf_counter()
         moe_in = rms_norm(hidden, _as(layer.post_norm, hidden), spec.rms_eps)
+        self._add_time(self._phase_key("resident_s"), time.perf_counter() - started)
         hidden = hidden + self._moe(moe_in, layer_index, index, valid, coeffs)
         return hidden
 
@@ -345,38 +364,114 @@ class OffloadLanguageModel(nn.Module):
         if self.expert_live > self.expert_live_max:
             self.expert_live_max = self.expert_live
 
-    def _read(self, layer: int, expert: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _read(self, layer: int, expert: int, kind: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        started = time.perf_counter()
         gate_b, up_b, down_b = self.store.payload(layer, expert)
+        self._add_time(f"expert_read_{kind}_s", time.perf_counter() - started)
+        nbytes = len(gate_b) + len(up_b) + len(down_b)
+        self._add_time(f"expert_read_{kind}_bytes", nbytes)
+        if self.time_log:
+            self._read_seq.append(((layer, expert), nbytes))
+        started = time.perf_counter()
         layout = self.store.layout
         gate = _matrix(gate_b, self.store_dtype, (layout.intermediate, layout.hidden))
         up = _matrix(up_b, self.store_dtype, (layout.intermediate, layout.hidden))
         down = _matrix(down_b, self.store_dtype, (layout.hidden, layout.intermediate))
+        self._add_time(f"expert_convert_{kind}_s", time.perf_counter() - started)
         return gate, up, down
+
+    def _add_time(self, key: str, value: float) -> None:
+        if not self.time_log:
+            return
+        self._times[key] = self._times.get(key, 0.0) + value
+
+    def _phase_key(self, name: str) -> str:
+        if self._io_phase == "forward":
+            return name
+        stem, suffix = name.rsplit("_s", 1)
+        return f"{stem}_recompute_s{suffix}"
+
+    def begin_step_timing(self) -> None:
+        self._times = {}
+        self._read_seq = []
+        self._io_phase = "forward"
+
+    def timing_report(self, wall_s: float) -> dict[str, float | int | dict | None]:
+        exclusive = (
+            "router_plan_s",
+            "embed_s",
+            "resident_s",
+            "attention_s",
+            "expert_read_forward_s",
+            "expert_convert_forward_s",
+            "expert_compute_forward_s",
+            "cross_entropy_forward_s",
+            "backward_s",
+            "optimizer_s",
+            "release_s",
+        )
+        accounted = sum(float(self._times.get(key, 0.0)) for key in exclusive)
+        report: dict[str, float | int | dict | None] = {key: float(self._times.get(key, 0.0)) for key in exclusive}
+        for kind in ("forward", "recompute", "backward"):
+            seconds = float(self._times.get(f"expert_read_{kind}_s", 0.0))
+            nbytes = int(self._times.get(f"expert_read_{kind}_bytes", 0.0))
+            report[f"expert_read_{kind}_s"] = seconds
+            report[f"expert_read_{kind}_bytes"] = nbytes
+            report[f"expert_read_{kind}_mb_s"] = (nbytes / 1e6 / seconds) if seconds else None
+            report[f"expert_convert_{kind}_s"] = float(self._times.get(f"expert_convert_{kind}_s", 0.0))
+            report[f"expert_compute_{kind}_s"] = float(self._times.get(f"expert_compute_{kind}_s", 0.0))
+        report["attention_recompute_s"] = float(self._times.get("attention_recompute_s", 0.0))
+        report["resident_recompute_s"] = float(self._times.get("resident_recompute_s", 0.0))
+        report["cross_entropy_backward_s"] = float(self._times.get("cross_entropy_backward_s", 0.0))
+        report["accounted_s"] = accounted
+        report["outros_s"] = wall_s - accounted
+        report["wall_s"] = wall_s
+        report["torch_threads"] = torch.get_num_threads()
+        keys = [item[0] for item in self._read_seq]
+        report["experts_leituras"] = len(keys)
+        report["experts_unicos"] = len(set(keys))
+        report["experts_releituras"] = len(keys) - len(set(keys))
+        report["cache_lru"] = {
+            str(size): simulate_expert_lru(self._read_seq, size) for size in self.cache_sim_sizes
+        }
+        return report
 
 
 def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token_ids: torch.Tensor) -> dict[str, float | int | bool]:
     model.router.train()
     model.lora.train()
     optimizer.zero_grad(set_to_none=True)
+    model.begin_step_timing()
+    wall = time.perf_counter()
     model._phase("forward")
     loss, plan = model.forward_window(token_ids)
     if not bool(torch.isfinite(loss).item()):
         raise RuntimeError("loss de linguagem não é finita")
     model._phase("backward")
+    model._io_phase = "backward"
+    started = time.perf_counter()
     loss.backward()
+    model._add_time("backward_s", time.perf_counter() - started)
+    model._io_phase = "forward"
     model._phase("optimizer")
     report = grad_report(model)
     if not report["grads_finite"]:
         raise RuntimeError("há gradiente não finito")
+    started = time.perf_counter()
     optimizer.step()
+    model._add_time("optimizer_s", time.perf_counter() - started)
     report["loss"] = float(loss.detach())
     report["distinct_experts"] = distinct_experts(plan)
     report["hot_entropy"] = _hot_entropy(plan)
     report["router_entropy"] = _router_entropy(model, token_ids)
     del loss, plan
+    started = time.perf_counter()
     release_step_memory(optimizer)
+    model._add_time("release_s", time.perf_counter() - started)
     report["rss_bytes"] = rss_bytes()
     report["ru_maxrss_bytes"] = ru_maxrss_bytes()
+    if model.time_log:
+        report["time"] = model.timing_report(time.perf_counter() - wall)
     model._phase("after-step")
     return report
 
@@ -643,13 +738,16 @@ class _ExpertFn(torch.autograd.Function):
         ctx.layer = layer
         ctx.expert = expert
         ctx.scale = model.lora.scale
-        gate, up, down = model._read(layer, expert)
+        kind = "forward" if model._io_phase == "forward" else "recompute"
+        gate, up, down = model._read(layer, expert, kind)
         model._note_expert(1)
+        started = time.perf_counter()
         try:
             with torch.no_grad():
                 projected = _swiglu(hidden, gate, up, down, gate_a, gate_b, up_a, up_b, down_a, down_b, ctx.scale)
                 out = projected * coeff.unsqueeze(-1)
         finally:
+            model._add_time(f"expert_compute_{kind}_s", time.perf_counter() - started)
             model._note_expert(-1)
             del gate, up, down
         ctx.save_for_backward(hidden, coeff, gate_a, gate_b, up_a, up_b, down_a, down_b)
@@ -670,13 +768,15 @@ class _ExpertFn(torch.autograd.Function):
                 down_a.detach().requires_grad_(True),
                 down_b.detach().requires_grad_(True),
             ]
-            gate, up, down = model._read(ctx.layer, ctx.expert)
+            gate, up, down = model._read(ctx.layer, ctx.expert, "backward")
             model._note_expert(1)
+            started = time.perf_counter()
             try:
                 projected = _swiglu(inputs[0], gate, up, down, *inputs[2:], ctx.scale)
                 out = projected * inputs[1].unsqueeze(-1)
                 grads = torch.autograd.grad(out, inputs, grad_out)
             finally:
+                model._add_time("expert_compute_backward_s", time.perf_counter() - started)
                 model._note_expert(-1)
                 del gate, up, down
         return grads
@@ -710,7 +810,11 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_loss):
         hidden, weight, targets = ctx.saved_tensors
+        started = time.perf_counter()
         grad_hidden = _ce_grad_hidden(hidden, weight, targets, ctx.chunk, grad_loss)
+        model = _EXPERT_STATE.get("model")
+        if model is not None:
+            model._add_time("cross_entropy_backward_s", time.perf_counter() - started)
         return grad_hidden, None, None
 
 
@@ -782,7 +886,39 @@ def _delta(hidden: torch.Tensor, left: torch.Tensor, right: torch.Tensor) -> tor
     return F.linear(F.linear(hidden, left), right)
 
 
+def simulate_expert_lru(reads: list[tuple[tuple[int, int], int]], capacity: int) -> dict[str, int]:
+    """Hits de um LRU. Não lê o store e não muda o treino."""
+
+    if capacity < 0:
+        raise ValueError("capacidade do LRU precisa ser >= 0")
+    cache: list[tuple[int, int]] = []
+    hits = 0
+    avoided = 0
+    for key, nbytes in reads:
+        if key in cache:
+            hits += 1
+            avoided += nbytes
+            cache.remove(key)
+            cache.append(key)
+            continue
+        if capacity == 0:
+            continue
+        if len(cache) >= capacity:
+            cache.pop(0)
+        cache.append(key)
+    return {"hits": hits, "avoided_bytes": avoided, "reads": len(reads)}
+
+
 def _attention_seq(layer, hidden: torch.Tensor, spec: QwenSpec) -> torch.Tensor:
+    model = _EXPERT_STATE.get("model")
+    started = time.perf_counter() if model is not None and model.time_log else None
+    result = _attention_seq_body(layer, hidden, spec)
+    if started is not None and model is not None:
+        model._add_time(model._phase_key("attention_s"), time.perf_counter() - started)
+    return result
+
+
+def _attention_seq_body(layer, hidden: torch.Tensor, spec: QwenSpec) -> torch.Tensor:
     batch, seq, _width = hidden.shape
     if batch != 1 or seq < 1:
         raise ValueError("a atenção do treino é batch 1")

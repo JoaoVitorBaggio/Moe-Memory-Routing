@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 os.environ.setdefault("MALLOC_ARENA_MAX", "2")
@@ -66,6 +67,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--estimate-only", action="store_true")
     parser.add_argument("--check-tokenizer", action="store_true")
     parser.add_argument("--memory-log", action="store_true")
+    parser.add_argument("--time-log", action="store_true")
+    parser.add_argument("--expert-cache-sim", default="32,64,128")
     parser.add_argument("--valid-forward", action="store_true")
     args = parser.parse_args(argv)
     if args.steps < 1 or args.seq_len < 2:
@@ -160,7 +163,9 @@ def main(argv: list[str] | None = None) -> int:
         torch.manual_seed(args.seed)
         refuse_cuda_bf16(torch.device(args.device), spec.dtype)
         tokenizer, _config_vocab_size = _load_tokenizer(args.model_dir, spec.vocab_size)
+        resident_started = time.perf_counter()
         weights = load_resident(resident_path, spec, torch.device("cpu"))
+        resident_load_s = time.perf_counter() - resident_started
         router = TwoHorizonLstmRouter(
             vocab_size=spec.vocab_size,
             n_layers=spec.n_layers,
@@ -175,6 +180,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         model = OffloadLanguageModel(weights, router, store, rank=args.lora_rank, alpha=args.lora_alpha)
         model.memory_log = args.memory_log
+        model.time_log = args.time_log
+        if args.time_log:
+            model.cache_sim_sizes = tuple(int(item) for item in args.expert_cache_sim.split(",") if item)
+            print(
+                json.dumps(
+                    {
+                        "phase": "resident-load",
+                        "resident_load_s": resident_load_s,
+                        "torch_threads": torch.get_num_threads(),
+                    }
+                ),
+                flush=True,
+            )
         if args.memory_log:
             print(
                 json.dumps({"phase": "resident-loaded", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
@@ -224,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
         args.out.mkdir(parents=True, exist_ok=True)
         checkpoint = args.out / "checkpoint"
+        checkpoint_started = time.perf_counter()
         save_checkpoint(
             checkpoint,
             step=args.steps,
@@ -231,9 +250,17 @@ def main(argv: list[str] | None = None) -> int:
             optimizer=optimizer,
             extra={"windows": windows, "seed": args.seed, "seq_len": args.seq_len},
         )
-        if args.memory_log:
+        checkpoint_s = time.perf_counter() - checkpoint_started
+        if args.memory_log or args.time_log:
             print(
-                json.dumps({"phase": "checkpoint", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
+                json.dumps(
+                    {
+                        "phase": "checkpoint",
+                        "checkpoint_save_s": checkpoint_s,
+                        "rss_bytes": rss_bytes(),
+                        "ru_maxrss_bytes": ru_maxrss_bytes(),
+                    }
+                ),
                 flush=True,
             )
         after = {
