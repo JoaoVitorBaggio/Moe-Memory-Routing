@@ -12,6 +12,9 @@ executa bf16.
 O backward da fatia não volta pelo ``SelectBackward``: o gradiente é
 somado direto em ``.grad[camada, expert]`` depois do passo. Isso evita
 materializar um zero do tensor compartilhado inteiro a cada expert.
+
+``--expert-cache N`` guarda o bf16 recém-lido do store, antes do
+float32. Não entra no grafo. Zero é o caminho de hoje.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import hashlib
 import json
 import resource
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -139,6 +143,42 @@ def ru_maxrss_bytes() -> int:
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
 
 
+def _expert_cache_bytes(hidden: int, intermediate: int, slots: int, max_bytes: int) -> int:
+    """Bytes do LRU. O bloco é bf16, três matrizes, sem a cópia float32."""
+
+    if slots < 0 or max_bytes < 0:
+        raise ValueError("cache de experts precisa ser >= 0")
+    block = 3 * hidden * intermediate * 2
+    if slots == 0 and max_bytes == 0:
+        return 0
+    if max_bytes == 0:
+        return slots * block
+    if slots == 0:
+        return max_bytes
+    return min(slots * block, max_bytes)
+
+
+def launch_allowed(estimate: dict[str, int | None]) -> bool:
+    """O anônimo, já com o cache, precisa caber em 8 GiB.
+
+    A conta do cgroup ainda soma 1,6 GiB de página residual. Com o cache
+    de 64 experts essa soma passa de 9 GiB por cerca de 100 MiB, enquanto
+    o pico medido de 7,63 GiB mais o cache continua abaixo. Se a conta sem
+    o cache já cabia e o anônimo com o cache continua no teto, o passo
+    começa. Sem cache, o cgroup estimado continua obrigatório.
+    """
+
+    total = int(estimate["total_bytes"] or 0)
+    if total > LAUNCH_CEILING_BYTES:
+        return False
+    cgroup = estimate["cgroup_bytes"]
+    cgroup_total = int(estimate["cgroup_total_bytes"] or 0)
+    cache = int(estimate.get("expert_cache_bytes") or 0)
+    if cgroup is None or cgroup_total <= cgroup:
+        return True
+    return cache > 0 and cgroup_total - cache <= int(cgroup) and total <= int(cgroup)
+
+
 def estimate_bytes(
     *,
     resident_bytes: int,
@@ -157,12 +197,14 @@ def estimate_bytes(
     head_dim: int | None = None,
     cgroup_bytes: int | None = None,
     read_cgroup: bool = True,
+    expert_cache_slots: int = 0,
+    expert_cache_max_bytes: int = 0,
 ) -> dict[str, int | None]:
     """Teto do anon com a cabeça e o expert em pedaços. Não inclui o store inteiro.
 
     ``resident_page_cache_if_kept`` é o cache do arquivo se ninguém pedir
     ``DONTNEED``. Não entra na soma. ``cgroup_bytes`` vem do processo, ou
-    do teste.
+    do teste. ``expert_cache_*`` é o LRU bf16, também anônimo.
     """
 
     if min(resident_bytes, vocab, hidden, intermediate, n_layers, n_experts, rank, seq_len, k1) < 1:
@@ -176,6 +218,7 @@ def estimate_bytes(
         + n_layers * (lstm_hidden * n_experts + n_experts)
     )
     one_expert = 3 * hidden * intermediate * 4
+    expert_cache = _expert_cache_bytes(hidden, intermediate, expert_cache_slots, expert_cache_max_bytes)
     if n_heads is None or n_kv_heads is None or head_dim is None:
         attention = 0
     else:
@@ -194,6 +237,7 @@ def estimate_bytes(
         "lstm_with_adam_bytes": lstm_params * 12,
         "lstm_grad_bytes": lstm_params * 4,
         "expert_fp32_bytes": one_expert,
+        "expert_cache_bytes": expert_cache,
         "attention_fp32_bytes": attention,
         "lm_head_fp32_bytes": head,
         "overhead_bytes": OVERHEAD_BYTES,
@@ -292,6 +336,8 @@ class OffloadLanguageModel(nn.Module):
         self.memory_log = False
         self.time_log = False
         self.cache_sim_sizes: tuple[int, ...] = ()
+        self.expert_cache = ExpertWeightCache(0, 0)
+        self.store_reads = 0
         self.expert_live = 0
         self.expert_live_max = 0
         self._io_phase = "forward"
@@ -400,15 +446,31 @@ class OffloadLanguageModel(nn.Module):
         if self.expert_live > self.expert_live_max:
             self.expert_live_max = self.expert_live
 
+    def set_expert_cache(self, slots: int, max_bytes: int = 0) -> None:
+        self.expert_cache = ExpertWeightCache(slots, max_bytes)
+
+    def release_expert_cache(self) -> None:
+        """Solta os blocos bf16 antes do checkpoint. O passo seguinte relê."""
+
+        self.expert_cache.clear()
+
     def _read(self, layer: int, expert: int, kind: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        started = time.perf_counter()
-        with _region(f"expert_read_{kind}"):
-            gate_b, up_b, down_b = self.store.payload(layer, expert)
-        self._add_time(f"expert_read_{kind}_s", time.perf_counter() - started)
-        nbytes = len(gate_b) + len(up_b) + len(down_b)
-        self._add_time(f"expert_read_{kind}_bytes", nbytes)
+        key = (layer, expert)
+        cached = self.expert_cache.lookup(key)
+        if cached is None:
+            started = time.perf_counter()
+            with _region(f"expert_read_{kind}"):
+                gate_b, up_b, down_b = self.store.payload(layer, expert)
+            self.store_reads += 1
+            self._add_time(f"expert_read_{kind}_s", time.perf_counter() - started)
+            nbytes = len(gate_b) + len(up_b) + len(down_b)
+            self._add_time(f"expert_read_{kind}_bytes", nbytes)
+            self.expert_cache.store(key, (gate_b, up_b, down_b), nbytes)
+        else:
+            gate_b, up_b, down_b = cached
+            nbytes = len(gate_b) + len(up_b) + len(down_b)
         if self.time_log:
-            self._read_seq.append(((layer, expert), nbytes))
+            self._read_seq.append((key, nbytes))
         started = time.perf_counter()
         with _region(f"bf16_fp32_{kind}"):
             layout = self.store.layout
@@ -433,6 +495,8 @@ class OffloadLanguageModel(nn.Module):
         self._times = {}
         self._read_seq = []
         self._io_phase = "forward"
+        self.store_reads = 0
+        self.expert_cache.reset_counters()
 
     def timing_report(self, wall_s: float) -> dict[str, float | int | dict | None]:
         exclusive = (
@@ -472,6 +536,8 @@ class OffloadLanguageModel(nn.Module):
         report["cache_lru"] = {
             str(size): simulate_expert_lru(self._read_seq, size) for size in self.cache_sim_sizes
         }
+        report["expert_cache"] = self.expert_cache.stats()
+        report["store_reads"] = self.store_reads
         return report
 
 
@@ -514,6 +580,8 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     model._add_time("release_s", time.perf_counter() - started)
     report["rss_bytes"] = rss_bytes()
     report["ru_maxrss_bytes"] = ru_maxrss_bytes()
+    report["store_reads"] = model.store_reads
+    report["expert_cache"] = model.expert_cache.stats()
     if model.time_log:
         report["time"] = model.timing_report(time.perf_counter() - wall)
     model._phase("after-step")
@@ -982,6 +1050,93 @@ def _matrix(raw: bytes, dtype: torch.dtype, shape: tuple[int, int]) -> torch.Ten
 
 def _delta(hidden: torch.Tensor, left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return F.linear(F.linear(hidden, left), right)
+
+
+class ExpertWeightCache:
+    """LRU dos blocos como o store devolve, antes do float32.
+
+    A recomputação do checkpoint e o backward da mesma camada vêm em
+    seguida. Com dezenas de vagas, esses experts acabam de ser lidos e
+    ficam no fim da fila: o backward não relê o SSD. A ordem reversa
+    das camadas continua a de um LRU comum, a mesma do ``--expert-cache-sim``.
+    """
+
+    def __init__(self, slots: int, max_bytes: int) -> None:
+        if slots < 0 or max_bytes < 0:
+            raise ValueError("cache de experts precisa ser >= 0")
+        self.slots = slots
+        self.max_bytes = max_bytes
+        self._items: OrderedDict[tuple[int, int], tuple[bytes, bytes, bytes]] = OrderedDict()
+        self._sizes: dict[tuple[int, int], int] = {}
+        self.stored_bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.avoided_bytes = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.slots > 0 or self.max_bytes > 0
+
+    def lookup(self, key: tuple[int, int]) -> tuple[bytes, bytes, bytes] | None:
+        if not self.enabled:
+            return None
+        found = self._items.get(key)
+        if found is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self.avoided_bytes += self._sizes[key]
+        self._items.move_to_end(key)
+        return found
+
+    def store(self, key: tuple[int, int], blobs: tuple[bytes, bytes, bytes], nbytes: int) -> None:
+        if not self.enabled or key in self._items:
+            if key in self._items:
+                self._items.move_to_end(key)
+            return
+        if self.max_bytes > 0 and nbytes > self.max_bytes:
+            return
+        while self._items and self._needs_room(nbytes):
+            self._evict()
+        if self._needs_room(nbytes):
+            return
+        self._items[key] = blobs
+        self._sizes[key] = nbytes
+        self.stored_bytes += nbytes
+
+    def stored(self) -> list[tuple[bytes, bytes, bytes]]:
+        return list(self._items.values())
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "slots": self.slots,
+            "max_bytes": self.max_bytes,
+            "hits": self.hits,
+            "misses": self.misses,
+            "avoided_bytes": self.avoided_bytes,
+            "bytes": self.stored_bytes,
+        }
+
+    def reset_counters(self) -> None:
+        self.hits = 0
+        self.misses = 0
+        self.avoided_bytes = 0
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._sizes.clear()
+        self.stored_bytes = 0
+
+    def _needs_room(self, incoming: int) -> bool:
+        if self.slots > 0 and len(self._items) >= self.slots:
+            return True
+        if self.max_bytes > 0 and self.stored_bytes + incoming > self.max_bytes:
+            return True
+        return False
+
+    def _evict(self) -> None:
+        key, _blobs = self._items.popitem(last=False)
+        self.stored_bytes -= self._sizes.pop(key)
 
 
 def simulate_expert_lru(reads: list[tuple[tuple[int, int], int]], capacity: int) -> dict[str, int]:

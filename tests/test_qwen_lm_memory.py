@@ -265,6 +265,77 @@ def test_backward_is_faster_without_full_tensor_grads(tmp_path):
         current_store.close()
 
 
+def test_expert_cache_matches_grads_and_skips_rereads(tmp_path):
+    from moe_memory.offload.lm_train import flush_lora_slice_grads
+
+    tokens = torch.tensor([[1, 2, 3, 4, 5, 6, 1, 2, 3, 4]])
+    cold, cold_store, _cold_dir = _model(tmp_path / "cold")
+    warm, warm_store, _warm_dir = _model(tmp_path / "warm")
+    try:
+        warm.set_expert_cache(32)
+        cold.time_log = True
+        warm.time_log = True
+        cold.cache_sim_sizes = (32,)
+        warm.cache_sim_sizes = (32,)
+        loss_cold, _plan = cold.forward_window(tokens)
+        loss_warm, _plan = warm.forward_window(tokens)
+        assert torch.equal(loss_cold, loss_warm)
+        after_forward = warm.store_reads
+        assert after_forward > 0
+        loss_cold.backward()
+        flush_lora_slice_grads()
+        loss_warm.backward()
+        flush_lora_slice_grads()
+        assert torch.equal(loss_cold, loss_warm)
+        for name, parameter in cold.named_parameters():
+            old = parameter.grad
+            new = warm.get_parameter(name).grad
+            if old is None:
+                assert new is None
+                continue
+            assert torch.equal(old, new), name
+        assert warm.store_reads == after_forward
+        assert warm.store_reads * 2 < cold.store_reads
+        assert warm.expert_cache.hits > 0
+        assert warm.expert_cache.hits + warm.expert_cache.misses == len(warm._read_seq)
+        for blobs in warm.expert_cache.stored():
+            assert all(isinstance(part, bytes) for part in blobs)
+        timing = warm.timing_report(1.0)
+        assert timing["expert_cache"]["hits"] == warm.expert_cache.hits
+        assert timing["expert_cache"]["avoided_bytes"] > 0
+        assert "32" in timing["cache_lru"]
+        warm.release_expert_cache()
+        assert warm.expert_cache.stored_bytes == 0
+        assert warm.expert_cache.stored() == []
+    finally:
+        cold_store.close()
+        warm_store.close()
+
+
+def test_expert_cache_byte_limit_keeps_a_single_block(tmp_path):
+    tokens = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    model, store, _directory = _model(tmp_path)
+    try:
+        model.set_expert_cache(0, max_bytes=1)
+        loss, _plan = model.forward_window(tokens)
+        loss.backward()
+        from moe_memory.offload.lm_train import flush_lora_slice_grads
+
+        flush_lora_slice_grads()
+        assert model.expert_cache.stored_bytes == 0
+        assert model.expert_cache.misses > 0
+        assert model.expert_cache.hits == 0
+        model.set_expert_cache(0, max_bytes=10**9)
+        model.store_reads = 0
+        model.expert_cache.reset_counters()
+        again, _plan = model.forward_window(tokens)
+        assert torch.equal(again, loss)
+        assert model.expert_cache.stored_bytes > 0
+        assert model.expert_cache.stored_bytes <= 10**9
+    finally:
+        store.close()
+
+
 def test_cgroup_parser_accepts_a_number_and_max(tmp_path):
     path = tmp_path / "memory.max"
     path.write_text("9663676416\n", encoding="utf-8")

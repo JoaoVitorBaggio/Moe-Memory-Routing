@@ -22,6 +22,7 @@ Procedimento da latência na GTX 1060: ``docs/plano-de-hardware.md``.
 
 from __future__ import annotations
 
+import weakref
 from typing import Protocol
 
 import torch
@@ -66,44 +67,68 @@ class CudaVram:
 
 
 class MockVram:
-    """CI sem GPU. O byte fica na CPU; um conjunto marca quem 'ocupa VRAM'.
+    """CI sem GPU. O byte fica na CPU; a marca segue o storage, não o endereço.
 
-    ``prepare`` simula o ``model.to(cuda)``: todo parâmetro atual conta
-    como residente. ``note_view`` propaga a marca para fatias do flat,
-    porque o ``data_ptr`` de um offset não é o do tensor base.
+    ``parameter.data`` devolve outro wrapper a cada acesso. O
+    ``untyped_storage`` é o mesmo objeto enquanto o bloco vive, inclusive
+    numa fatia. ``prepare`` simula o ``model.to(cuda)``. A referência é
+    fraca: quando o bloco morre, a marca sai junto. Um ``data_ptr``
+    reciclado depois do free não volta a contar como VRAM.
     """
 
     def __init__(self) -> None:
-        self._vram: set[int] = set()
-        self._pinned: set[int] = set()
+        self._vram: dict[int, weakref.ReferenceType] = {}
+        self._pinned: dict[int, weakref.ReferenceType] = {}
         self.last_non_blocking: list[bool] = []
 
     def prepare(self, module: nn.Module) -> None:
         for parameter in module.parameters():
-            self._vram.add(parameter.data_ptr())
+            self._remember(self._vram, parameter.data)
 
     def note_view(self, view: torch.Tensor, base: torch.Tensor) -> None:
-        if base.data_ptr() in self._vram or view.data_ptr() in self._vram:
-            self._vram.add(view.data_ptr())
-        if base.data_ptr() in self._pinned:
-            self._pinned.add(view.data_ptr())
+        if self._live(self._vram, base) or self._live(self._vram, view):
+            self._remember(self._vram, view)
+        if self._live(self._pinned, base):
+            self._remember(self._pinned, view)
 
     def on_device(self, tensor: torch.Tensor) -> bool:
-        return tensor.data_ptr() in self._vram
+        return self._live(self._vram, tensor)
 
     def is_pinned(self, tensor: torch.Tensor) -> bool:
-        return tensor.data_ptr() in self._pinned and tensor.data_ptr() not in self._vram
+        return self._live(self._pinned, tensor) and not self._live(self._vram, tensor)
 
     def pin(self, tensor: torch.Tensor) -> torch.Tensor:
         out = tensor.detach().to(dtype=torch.float32, device="cpu").contiguous().clone()
-        self._pinned.add(out.data_ptr())
+        self._remember(self._pinned, out)
         return out
 
     def to_device(self, tensor: torch.Tensor, *, non_blocking: bool = False) -> torch.Tensor:
         self.last_non_blocking.append(bool(non_blocking))
         out = tensor.detach().to(dtype=torch.float32, device="cpu").contiguous().clone()
-        self._vram.add(out.data_ptr())
+        self._remember(self._vram, out)
         return out
+
+    def _remember(self, bucket: dict[int, weakref.ReferenceType], tensor: torch.Tensor) -> None:
+        storage = tensor.untyped_storage()
+        key = id(storage)
+
+        def _drop(ref: weakref.ReferenceType, key: int = key, bucket: dict = bucket) -> None:
+            if bucket.get(key) is ref:
+                bucket.pop(key, None)
+
+        bucket[key] = weakref.ref(storage, _drop)
+
+    def _live(self, bucket: dict[int, weakref.ReferenceType], tensor: torch.Tensor) -> bool:
+        storage = tensor.untyped_storage()
+        ref = bucket.get(id(storage))
+        if ref is None:
+            return False
+        found = ref()
+        if found is storage:
+            return True
+        if found is None:
+            bucket.pop(id(storage), None)
+        return False
 
 
 class ExpertResidency:
