@@ -197,3 +197,5 @@ Na corrida da PR32 os dois passos terminaram e o processo morreu na passagem ext
 `--time-log` parte o tempo do passo sem mudar a loss. A leitura do expert aparece três vezes no código: o forward, a recomputação do checkpoint e o backward. O JSON também simula um LRU (`--expert-cache-sim`) e não guarda esses experts.
 
 `--profile-step N` liga o `torch.profiler` só nesse passo, com atividade de CPU, formas gravadas e sem `profile_memory`. `--profile-stack` e `--profile-trace` ficam desligados: o trace chrome pode ficar grande. O buffer esperado, sem stack e sem trace, é de dezenas a poucas centenas de MB em cima do RSS já estável. Não foi medido na 1060.
+
+O gradiente da LoRA não passa mais por `SelectBackward` da fatia. Cada expert soma em `.grad[camada, expert]`. O zero do tensor inteiro, de até 201 MB, deixa de nascer a cada expert.

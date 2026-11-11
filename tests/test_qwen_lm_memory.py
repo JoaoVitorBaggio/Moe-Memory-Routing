@@ -104,6 +104,167 @@ def test_profile_step_writes_tables_without_a_trace(tmp_path):
         store.close()
 
 
+def _grad_map(model):
+    found = {}
+    for name, parameter in model.named_parameters():
+        found[name] = None if parameter.grad is None else parameter.grad.detach().clone()
+    return found
+
+
+def test_lora_grads_match_the_old_slice_path_and_skip_select_backward(tmp_path):
+    from moe_memory.offload.lm_train import flush_lora_slice_grads, legacy_lora_slice_grads
+    from torch.profiler import ProfilerActivity, profile
+
+    tokens = torch.tensor([[1, 2, 3, 4, 5, 6, 1, 2, 3, 4]])
+    legacy, legacy_store, _legacy_dir = _model(tmp_path / "legacy")
+    current, current_store, _current_dir = _model(tmp_path / "current")
+    try:
+        with legacy_lora_slice_grads():
+            loss_old, _plan = legacy.forward_window(tokens)
+            loss_old.backward()
+            flush_lora_slice_grads()
+        loss_new, _plan = current.forward_window(tokens)
+        loss_new.backward()
+        flush_lora_slice_grads()
+        assert torch.allclose(loss_old, loss_new, atol=0, rtol=0)
+        for name, old in _grad_map(legacy).items():
+            new = current.get_parameter(name).grad
+            if old is None:
+                assert new is None
+                continue
+            assert new is not None
+            assert torch.allclose(old, new, atol=1e-6, rtol=1e-5), name
+        opt_old = torch.optim.AdamW([parameter for parameter in legacy.parameters() if parameter.requires_grad], lr=1e-3, weight_decay=0.0, foreach=False)
+        opt_new = torch.optim.AdamW([parameter for parameter in current.parameters() if parameter.requires_grad], lr=1e-3, weight_decay=0.0, foreach=False)
+        opt_old.step()
+        opt_new.step()
+        for name, parameter in legacy.named_parameters():
+            assert torch.allclose(parameter, current.get_parameter(name), atol=1e-6, rtol=1e-5), name
+
+        hidden = current.weights.spec.hidden_size
+        left = torch.randn(2, hidden)
+        coeff = torch.tensor([1.0, 0.4])
+        from moe_memory.offload.lm_train import _apply_expert
+
+        for target, flag in ((legacy, True), (current, False)):
+            target.zero_grad(set_to_none=True)
+        with legacy_lora_slice_grads():
+            out = _apply_expert(legacy, left, coeff, 0, 1) + _apply_expert(legacy, left + 0.1, coeff, 0, 1)
+            out.sum().backward()
+            flush_lora_slice_grads()
+        out = _apply_expert(current, left, coeff, 0, 1) + _apply_expert(current, left + 0.1, coeff, 0, 1)
+        out.sum().backward()
+        flush_lora_slice_grads()
+        assert torch.allclose(legacy.lora.gate_B.grad, current.lora.gate_B.grad, atol=1e-6, rtol=1e-5)
+
+        def full_lora_zeros(model, legacy: bool) -> int:
+            model.zero_grad(set_to_none=True)
+            full = {tuple(parameter.shape) for name, parameter in model.named_parameters() if name.startswith("lora.")}
+            loss, _plan = model.forward_window(tokens)
+            with profile(activities=[ProfilerActivity.CPU], record_shapes=True, profile_memory=False) as prof:
+                if legacy:
+                    with legacy_lora_slice_grads():
+                        loss.backward()
+                        flush_lora_slice_grads()
+                else:
+                    loss.backward()
+                    flush_lora_slice_grads()
+            total = 0
+            for event in prof.key_averages(group_by_input_shape=True):
+                if event.key != "aten::zero_":
+                    continue
+                shapes = getattr(event, "input_shapes", None) or []
+                if any(tuple(shape) in full for shape in shapes if shape):
+                    total += int(event.count)
+            return total
+
+        with legacy_lora_slice_grads():
+            old_zeros = full_lora_zeros(legacy, True)
+        new_zeros = full_lora_zeros(current, False)
+        lora_params = sum(1 for name, _parameter in current.named_parameters() if name.startswith("lora."))
+        assert old_zeros > lora_params
+        assert new_zeros <= lora_params
+    finally:
+        legacy_store.close()
+        current_store.close()
+
+
+def test_backward_is_faster_without_full_tensor_grads(tmp_path):
+    import time
+
+    from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
+    from moe_memory.offload.lm_train import (
+        OffloadLanguageModel,
+        flush_lora_slice_grads,
+        legacy_lora_slice_grads,
+    )
+    from moe_memory.offload.qwen import load_resident, load_spec
+    from moe_memory.offload.store import ExpertStore
+    from moe_memory.offload.synthetic import write_synthetic_bundle
+
+    def build(path: Path):
+        torch.manual_seed(1)
+        write_synthetic_bundle(
+            path,
+            n_layers=4,
+            n_experts=8,
+            hidden=1024,
+            intermediate=32,
+            vocab=32,
+            n_heads=8,
+            n_kv=2,
+            head_dim=32,
+            seed=0,
+        )
+        store = ExpertStore.open(path / "experts.moestore", direct=True)
+        spec = load_spec(path / "config.json", store.header.dtype_code)
+        weights = load_resident(path / "resident.bin", spec, torch.device("cpu"))
+        router = TwoHorizonLstmRouter(
+            vocab_size=32,
+            n_layers=4,
+            n_experts=8,
+            l1=1,
+            l2=2,
+            k1=2,
+            k2=4,
+            b2=2,
+            embed_dim=16,
+            hidden_size=16,
+        )
+        return OffloadLanguageModel(weights, router, store, rank=32, alpha=8.0), store
+
+    tokens = torch.randint(1, 32, (1, 8))
+
+    def median_backward(model, legacy: bool) -> float:
+        samples = []
+        for _ in range(3):
+            model.zero_grad(set_to_none=True)
+            loss, _plan = model.forward_window(tokens)
+            started = time.perf_counter()
+            if legacy:
+                with legacy_lora_slice_grads():
+                    loss.backward()
+                    flush_lora_slice_grads()
+            else:
+                loss.backward()
+                flush_lora_slice_grads()
+            samples.append(time.perf_counter() - started)
+        samples.sort()
+        return samples[1]
+
+    legacy, legacy_store = build(tmp_path / "legacy")
+    current, current_store = build(tmp_path / "current")
+    try:
+        assert legacy.lora.gate_A.numel() * 4 > 1_000_000
+        with legacy_lora_slice_grads():
+            old_seconds = median_backward(legacy, True)
+        new_seconds = median_backward(current, False)
+        assert new_seconds < old_seconds
+    finally:
+        legacy_store.close()
+        current_store.close()
+
+
 def test_cgroup_parser_accepts_a_number_and_max(tmp_path):
     path = tmp_path / "memory.max"
     path.write_text("9663676416\n", encoding="utf-8")
