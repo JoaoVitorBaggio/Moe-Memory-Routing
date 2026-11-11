@@ -39,6 +39,7 @@ class BlockFile:
         self.advise_noreuse()
 
     def read_at(self, offset: int, size: int) -> bytes:
+        """``pread`` solta o GIL. Outra thread pode computar durante a leitura."""
         if offset < 0 or size < 0:
             raise ValueError("offset e tamanho precisam ser >= 0")
         if self.direct:
@@ -109,6 +110,7 @@ def _pread_aligned(fd: int, offset: int, size: int) -> bytes:
 
 
 def _pread_into(fd: int, ptr: int, size: int, offset: int) -> None:
+    # ctypes solta o GIL em volta da syscall.
     got = _libc.pread(fd, ctypes.c_void_p(ptr), size, offset)
     if got < 0:
         err = ctypes.get_errno()

@@ -183,6 +183,37 @@ def test_sixty_four_expert_cache_stays_under_the_anon_ceiling():
     assert launch_allowed(cached) is True
 
 
+def test_cache_32_and_one_prefetch_layer_fit_under_9gib():
+    nine = 9_663_676_416
+    block = 3 * 2048 * 768 * 2
+    estimate = estimate_bytes(
+        resident_bytes=3_082_214_946,
+        vocab=151_936,
+        hidden=2048,
+        intermediate=768,
+        n_layers=48,
+        n_experts=128,
+        rank=4,
+        seq_len=32,
+        k1=4,
+        lstm_embed=64,
+        lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=nine,
+        read_cgroup=False,
+        expert_cache_slots=32,
+        expert_prefetch_layers=1,
+        k2=6,
+    )
+    assert estimate["expert_cache_bytes"] == 32 * block
+    assert estimate["expert_prefetch_bytes"] == 6 * block
+    assert estimate["total_bytes"] < LAUNCH_CEILING_BYTES
+    assert estimate["cgroup_total_bytes"] < nine
+    assert launch_allowed(estimate) is True
+
+
 def test_one_token_attention_matches_decode_and_is_causal(tmp_path: Path):
     model, store, _directory = _model(tmp_path)
     try:

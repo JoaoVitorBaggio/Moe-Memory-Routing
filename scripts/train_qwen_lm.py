@@ -75,6 +75,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile-trace", action="store_true")
     parser.add_argument("--expert-cache", type=int, default=0)
     parser.add_argument("--expert-cache-bytes", type=int, default=0)
+    parser.add_argument("--expert-prefetch-layers", type=int, default=0)
+    parser.add_argument("--expert-prefetch-bytes", type=int, default=0)
     parser.add_argument("--expert-cache-sim", default="32,64,128")
     parser.add_argument("--valid-forward", action="store_true")
     args = parser.parse_args(argv)
@@ -86,6 +88,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--profile-stack e --profile-trace pedem --profile-step")
     if args.profile_step is not None and not 1 <= args.profile_step <= args.steps:
         parser.error("--profile-step precisa ser um passo entre 1 e --steps")
+    if args.expert_cache < 0 or args.expert_cache_bytes < 0:
+        parser.error("--expert-cache e --expert-cache-bytes precisam ser >= 0")
+    if args.expert_prefetch_layers < 0 or args.expert_prefetch_bytes < 0:
+        parser.error("--expert-prefetch-layers e --expert-prefetch-bytes precisam ser >= 0")
     return args
 
 
@@ -119,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
         if not path.is_file():
             raise SystemExit(f"arquivo ausente: {path}. Não vou baixar.")
     store = ExpertStore.open(store_path, direct=True)
+    model = None
     try:
         spec = load_spec(config_path, store.header.dtype_code)
         if spec.vocab_size != _config_vocab(config_path):
@@ -148,6 +155,9 @@ def main(argv: list[str] | None = None) -> int:
             head_dim=spec.head_dim,
             expert_cache_slots=args.expert_cache,
             expert_cache_max_bytes=args.expert_cache_bytes,
+            expert_prefetch_layers=args.expert_prefetch_layers,
+            expert_prefetch_bytes=args.expert_prefetch_bytes,
+            k2=args.k2,
         )
         cgroup = estimate["cgroup_bytes"]
         fits_cgroup = cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
@@ -161,6 +171,8 @@ def main(argv: list[str] | None = None) -> int:
             "fits_cgroup_estimate": fits_cgroup,
             "expert_cache_slots": args.expert_cache,
             "expert_cache_max_bytes": args.expert_cache_bytes,
+            "expert_prefetch_layers": args.expert_prefetch_layers,
+            "expert_prefetch_bytes": args.expert_prefetch_bytes,
             "gpu": "não usada; residente bf16 e capability 6.1 não executam bf16",
         }
         print(json.dumps(summary, indent=2))
@@ -195,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         model = OffloadLanguageModel(weights, router, store, rank=args.lora_rank, alpha=args.lora_alpha)
         model.set_expert_cache(args.expert_cache, args.expert_cache_bytes)
+        model.set_expert_prefetch(args.expert_prefetch_layers, args.expert_prefetch_bytes)
         model.memory_log = args.memory_log
         model.time_log = args.time_log
         if args.time_log:
@@ -312,6 +325,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"checkpoint": str(checkpoint), "valid_loss": valid_loss, "store_unchanged": True}))
         return 0
     finally:
+        if model is not None:
+            model.release_expert_cache()
         store.close()
 
 

@@ -196,6 +196,10 @@ Na corrida da PR32 os dois passos terminaram e o processo morreu na passagem ext
 
 `--time-log` parte o tempo do passo sem mudar a loss. A leitura do expert aparece três vezes no código: o forward, a recomputação do checkpoint e o backward. O JSON também simula um LRU (`--expert-cache-sim`) e não guarda esses experts. `--expert-cache N` liga o LRU de verdade: guarda o bf16 do store, antes do float32, e solta os blocos antes do checkpoint. O padrão é 0. O backward relê a camada na hora, então um LRU de 64 vagas segura a camada corrente; a ordem entre camadas continua a do simulador.
 
+`--expert-prefetch-layers D` (padrão 0) lê os experts numa thread enquanto a CPU computa a camada. No forward a fila é a das camadas `l+1..l+D`; no backward, que recomputa de trás para a frente, é `l-1..l-D`. O `pread` solta o GIL. A thread não chama o torch e não mexe no ioprio. O buffer tem teto (`--expert-prefetch-bytes`, ou `D * k2` blocos bf16) e entra na estimativa junto com o LRU. Com o cache de 64 o pico medido encostou em 9 GiB; a combinação que a conta ainda coloca sob 9 GiB é cache 32 mais uma camada de prefetch. Os dois são soltos antes do checkpoint. No Fedora o pytest usa `--basetemp` num diretório de disco, porque `/tmp` é tmpfs.
+
+O passo seguinte, ainda não feito, é o treino misto: Adam e gradiente na RAM, o compute de cada camada na GPU de cerca de 6 GB, com offload SSD, RAM e VRAM.
+
 `--profile-step N` liga o `torch.profiler` só nesse passo, com atividade de CPU, formas gravadas e sem `profile_memory`. `--profile-stack` e `--profile-trace` ficam desligados: o trace chrome pode ficar grande. O buffer esperado, sem stack e sem trace, é de dezenas a poucas centenas de MB em cima do RSS já estável. Não foi medido na 1060.
 
 O gradiente da LoRA não passa mais por `SelectBackward` da fatia. Cada expert soma em `.grad[camada, expert]`. O zero do tensor inteiro, de até 201 MB, deixa de nascer a cada expert.

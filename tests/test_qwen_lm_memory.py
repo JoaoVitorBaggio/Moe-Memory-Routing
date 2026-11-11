@@ -336,6 +336,121 @@ def test_expert_cache_byte_limit_keeps_a_single_block(tmp_path):
         store.close()
 
 
+def test_pinned_experts_stay_in_the_lru():
+    from moe_memory.offload.lm_train import ExpertWeightCache
+
+    cache = ExpertWeightCache(2, 0)
+    blob = (b"g", b"u", b"d")
+    cache.set_pinned({(0, 0)})
+    cache.store((0, 0), blob, 3)
+    cache.store((0, 1), blob, 3)
+    cache.store((0, 2), blob, 3)
+    assert cache.contains((0, 0))
+    assert cache.contains((0, 2))
+    assert not cache.contains((0, 1))
+    cache.set_pinned({(0, 0), (0, 2)})
+    cache.store((0, 3), blob, 3)
+    assert cache.contains((0, 0))
+    assert cache.contains((0, 2))
+    assert not cache.contains((0, 3))
+
+
+def test_prefetch_hits_once_and_the_thread_joins():
+    import threading
+    import time
+
+    from moe_memory.offload.lm_train import ExpertPrefetcher, ExpertWeightCache
+
+    class Store:
+        def __init__(self):
+            self.calls: list[tuple[int, int]] = []
+
+        def payload(self, layer: int, expert: int):
+            self.calls.append((layer, expert))
+            time.sleep(0.02)
+            return (b"g", b"u", b"d")
+
+    class Model:
+        def __init__(self):
+            self.expert_cache = ExpertWeightCache(4, 0)
+            self.store = Store()
+            self.time_log = True
+            self._times: dict[str, float] = {}
+            self._io_phase = "forward"
+            self.store_reads = 0
+
+        def _add_time(self, key: str, value: float) -> None:
+            self._times[key] = self._times.get(key, 0.0) + value
+
+    model = Model()
+    prefetch = ExpertPrefetcher(model)
+    prefetch.start(1, max_bytes=3, block=3)
+    try:
+        prefetch.set_plan([[(0, 0)], [(1, 0)], [(2, 0)]])
+        prefetch.arm(0, 1)
+        time.sleep(0.15)
+        blobs, sync_s = prefetch.obtain(1, 0, "forward")
+        assert blobs == (b"g", b"u", b"d")
+        assert sync_s is None
+        assert prefetch.hits == 1
+        assert model.store.calls.count((1, 0)) == 1
+        again, again_sync = prefetch.obtain(1, 0, "forward")
+        assert again == blobs
+        assert again_sync is None
+        assert model.store.calls.count((1, 0)) == 1
+        assert prefetch.hidden_read_s > 0
+        first, first_sync = prefetch.obtain(0, 0, "forward")
+        assert first_sync is not None and first_sync > 0
+        prefetch.arm(1, 1)
+        _third, _third_sync = prefetch.obtain(2, 0, "forward")
+        assert model.store.calls.count((2, 0)) == 1
+    finally:
+        prefetch.stop()
+    assert not prefetch.alive
+    assert not any(thread.name == "expert-prefetch" and thread.is_alive() for thread in threading.enumerate())
+
+
+def test_prefetch_matches_grads_and_does_not_leak_a_thread(tmp_path):
+    import threading
+
+    from moe_memory.offload.lm_train import flush_lora_slice_grads, save_checkpoint
+
+    tokens = torch.tensor([[1, 2, 3, 4, 5, 6, 1, 2, 3, 4]])
+    plain, plain_store, _plain_dir = _model(tmp_path / "plain")
+    ahead, ahead_store, ahead_dir = _model(tmp_path / "ahead")
+    try:
+        plain.set_expert_cache(8)
+        ahead.set_expert_cache(8)
+        ahead.set_expert_prefetch(2)
+        loss_plain, _plan = plain.forward_window(tokens)
+        loss_ahead, _plan = ahead.forward_window(tokens)
+        assert torch.equal(loss_plain, loss_ahead)
+        loss_plain.backward()
+        flush_lora_slice_grads()
+        loss_ahead.backward()
+        flush_lora_slice_grads()
+        assert torch.equal(loss_plain, loss_ahead)
+        for name, parameter in plain.named_parameters():
+            old = parameter.grad
+            new = ahead.get_parameter(name).grad
+            if old is None:
+                assert new is None
+                continue
+            assert torch.equal(old, new), name
+        assert ahead.store_reads == plain.store_reads
+        assert ahead.prefetch.alive
+        optimizer = torch.optim.AdamW(ahead.parameters(), lr=1e-3, foreach=False)
+        ahead.release_expert_cache()
+        assert not ahead.prefetch.alive
+        save_checkpoint(ahead_dir / "checkpoint", step=1, model=ahead, optimizer=optimizer, extra={})
+        assert not any(thread.name == "expert-prefetch" and thread.is_alive() for thread in threading.enumerate())
+    finally:
+        plain.release_expert_cache()
+        ahead.release_expert_cache()
+        plain_store.close()
+        ahead_store.close()
+
+
 def test_cgroup_parser_accepts_a_number_and_max(tmp_path):
     path = tmp_path / "memory.max"
     path.write_text("9663676416\n", encoding="utf-8")
