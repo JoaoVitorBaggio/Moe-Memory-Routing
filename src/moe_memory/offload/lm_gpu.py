@@ -11,6 +11,7 @@ Ampere ou mais novo pode usar bf16.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -127,15 +128,16 @@ class LayerTransport:
         self.model = model
         self.device = model.compute_device
         self.dtype = model.compute_dtype
-        self.copy_stream = torch.cuda.Stream(device=self.device)
+        self.copy_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
         self._ready: _Pack | None = None
         self._ready_index = -1
         self._pending: _Pack | None = None
         self._pending_index = -1
         self._pending_event: torch.cuda.Event | None = None
-        self._h2d: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-        self._d2h: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-        self._compute: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        # Nomes distintos dos métodos de cópia. Uma lista `_h2d` sombreava `_h2d()`.
+        self._h2d_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._d2h_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self.h2d_bytes = 0
         self.d2h_bytes = 0
 
@@ -150,9 +152,9 @@ class LayerTransport:
         self._pending = None
         self._pending_index = -1
         self._pending_event = None
-        self._h2d.clear()
-        self._d2h.clear()
-        self._compute.clear()
+        self._h2d_events.clear()
+        self._d2h_events.clear()
+        self._compute_events.clear()
         self.h2d_bytes = 0
         self.d2h_bytes = 0
 
@@ -164,7 +166,7 @@ class LayerTransport:
             return self._ready
         if self._pending_event is not None:
             # A direção mudou. A cópia em voo precisa terminar antes de soltar o destino.
-            self._pending_event.synchronize()
+            self._sync_copy(self._pending_event)
         self._pending = None
         self._pending_event = None
         pack, _event = self._load(layer_index, layer, blobs, block=True)
@@ -206,10 +208,10 @@ class LayerTransport:
         return gate, up, down
 
     def note_compute(self, start: torch.cuda.Event, end: torch.cuda.Event) -> None:
-        self._compute.append((start, end))
+        self._compute_events.append((start, end))
 
     def note_d2h(self, start: torch.cuda.Event, end: torch.cuda.Event, nbytes: int) -> None:
-        self._d2h.append((start, end))
+        self._d2h_events.append((start, end))
         self.d2h_bytes += nbytes
 
     def resolve(self) -> dict[str, float | int]:
@@ -225,18 +227,30 @@ class LayerTransport:
                 "h2d_bytes": self.h2d_bytes,
                 "d2h_bytes": self.d2h_bytes,
             }
+        if self.device.type != "cuda":
+            return {
+                "h2d_s": 0.0,
+                "d2h_s": 0.0,
+                "h2d_wait_s": float(self.model._times.get("h2d_wait_s", 0.0)),
+                "h2d_wait_backward_s": float(self.model._times.get("h2d_wait_backward_s", 0.0)),
+                "gpu_compute_s": 0.0,
+                "h2d_bytes": self.h2d_bytes,
+                "d2h_bytes": self.d2h_bytes,
+            }
         torch.cuda.synchronize(self.device)
         return {
-            "h2d_s": _elapsed(self._h2d),
-            "d2h_s": _elapsed(self._d2h),
+            "h2d_s": _elapsed(self._h2d_events),
+            "d2h_s": _elapsed(self._d2h_events),
             "h2d_wait_s": float(self.model._times.get("h2d_wait_s", 0.0)),
             "h2d_wait_backward_s": float(self.model._times.get("h2d_wait_backward_s", 0.0)),
-            "gpu_compute_s": _elapsed(self._compute),
+            "gpu_compute_s": _elapsed(self._compute_events),
             "h2d_bytes": self.h2d_bytes,
             "d2h_bytes": self.d2h_bytes,
         }
 
     def check_budget(self) -> None:
+        if self.device.type != "cuda":
+            return
         peak = int(torch.cuda.max_memory_allocated(self.device))
         if peak > self.model.vram_budget:
             raise RuntimeError(
@@ -247,12 +261,7 @@ class LayerTransport:
     def _wait_pending(self) -> None:
         event = self._pending_event
         if event is not None:
-            if self.model.time_log:
-                started = time.perf_counter()
-                event.synchronize()
-                self._note_wait(time.perf_counter() - started)
-            else:
-                torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+            self._sync_copy(event)
         if self._pending is not None:
             self._pending.pinned.clear()
         self._ready = self._pending
@@ -263,12 +272,8 @@ class LayerTransport:
     def _load(self, layer_index: int, layer, blobs: dict, *, block: bool):
         pinned: list[torch.Tensor] = []
         experts: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        start = end = None
-        if self.model.time_log:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record(self.copy_stream)
-        with torch.cuda.stream(self.copy_stream):
+        start, end = self._open_span()
+        with self._copy_scope():
             view = _GpuLayer(
                 input_norm=self._h2d(layer.input_norm, pinned),
                 post_norm=self._h2d(layer.post_norm, pinned),
@@ -285,19 +290,11 @@ class LayerTransport:
             )
             for key, raw in blobs.items():
                 experts[key] = self._matrices(raw, pinned)
-        if end is not None:
-            end.record(self.copy_stream)
-            self._h2d.append((start, end))
-        event = torch.cuda.Event()
-        event.record(self.copy_stream)
+        self._close_span(start, end, self._h2d_events)
+        event = self._dependency_event()
         pack = _Pack(layer=view, experts=experts, pinned=pinned)
         if block:
-            if self.model.time_log:
-                started = time.perf_counter()
-                event.synchronize()
-                self._note_wait(time.perf_counter() - started)
-            else:
-                torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+            self._sync_copy(event)
             pack.pinned.clear()
         return pack, event
 
@@ -307,10 +304,10 @@ class LayerTransport:
         host = weight.detach()
         if host.device.type != "cpu":
             host = host.to("cpu")
-        if not host.is_pinned():
+        if self.device.type == "cuda" and not host.is_pinned():
             host = host.pin_memory()
         pinned.append(host)
-        gpu = host.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        gpu = host.to(device=self.device, dtype=self.dtype, non_blocking=self.device.type == "cuda")
         self.h2d_bytes += int(host.nbytes)
         return gpu
 
@@ -323,35 +320,60 @@ class LayerTransport:
         )
         out = []
         hold = pinned if pinned is not None else []
-        start = end = None
-        if block and self.model.time_log:
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record(self.copy_stream)
-        with torch.cuda.stream(self.copy_stream):
+        start, end = self._open_span() if block else (None, None)
+        with self._copy_scope():
             for raw, shape in zip(blobs, shapes, strict=True):
                 host = _host_matrix(raw, self.model.store_dtype, shape)
-                if not host.is_pinned():
+                if self.device.type == "cuda" and not host.is_pinned():
                     host = host.pin_memory()
                 hold.append(host)
-                gpu = host.to(device=self.device, dtype=self.dtype, non_blocking=True)
+                gpu = host.to(device=self.device, dtype=self.dtype, non_blocking=self.device.type == "cuda")
                 self.h2d_bytes += int(host.nbytes)
                 out.append(gpu)
         if block:
-            event = torch.cuda.Event()
-            event.record(self.copy_stream)
-            if end is not None:
-                end.record(self.copy_stream)
-                self._h2d.append((start, end))
-            if self.model.time_log:
-                started = time.perf_counter()
-                event.synchronize()
-                self._note_wait(time.perf_counter() - started)
-            else:
-                torch.cuda.current_stream(self.device).wait_stream(self.copy_stream)
+            self._close_span(start, end, self._h2d_events)
+            self._sync_copy(self._dependency_event())
             if pinned is None:
                 hold.clear()
         return tuple(out)
+
+    def _copy_scope(self):
+        if self.copy_stream is None:
+            return nullcontext()
+        return torch.cuda.stream(self.copy_stream)
+
+    def _open_span(self):
+        if self.copy_stream is None or not self.model.time_log:
+            return None, None
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record(self.copy_stream)
+        return start, end
+
+    def _close_span(self, start, end, bucket) -> None:
+        if start is None or end is None or self.copy_stream is None:
+            return
+        end.record(self.copy_stream)
+        bucket.append((start, end))
+
+    def _dependency_event(self):
+        if self.copy_stream is None:
+            return None
+        event = torch.cuda.Event()
+        event.record(self.copy_stream)
+        return event
+
+    def _sync_copy(self, event) -> None:
+        """Espera esta cópia antes de soltar o pinned. Não é um synchronize do device inteiro."""
+
+        if event is None:
+            return
+        if self.model.time_log:
+            started = time.perf_counter()
+            event.synchronize()
+            self._note_wait(time.perf_counter() - started)
+            return
+        event.synchronize()
 
     def _note_wait(self, waited: float) -> None:
         if self.model._io_phase == "forward":

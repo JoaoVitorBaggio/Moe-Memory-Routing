@@ -255,6 +255,43 @@ def test_cuda_layer_budget_fits_under_5gb_and_9gib_host():
     assert host_compute_threads(4, True) == 3
 
 
+def test_layer_transport_copies_a_layer_on_cpu(tmp_path: Path):
+    from moe_memory.offload.lm_gpu import LayerTransport
+
+    model, store, _directory = _model(tmp_path)
+    try:
+        assert model.gpu is None
+        model.compute_device = torch.device("cpu")
+        model.compute_dtype = torch.float32
+        model.vram_budget = 10**12
+        model.time_log = True
+        model._times = {}
+        model._io_phase = "forward"
+        transport = LayerTransport(model)
+        assert callable(transport._h2d)
+        layer = model.weights.layers[0]
+        raw = model.store.payload(0, 0)
+        pack = transport.ensure(0, layer, {(0, 0): raw})
+        assert torch.allclose(pack.layer.input_norm, layer.input_norm.to(dtype=torch.float32))
+        assert torch.allclose(pack.layer.q, layer.q.to(dtype=torch.float32))
+        gate, _up, _down = transport.take_expert(0, 0)
+        assert gate.shape[0] == model.store.layout.intermediate
+        copied = transport.h2d_now(0, 1, model.store.payload(0, 1))
+        assert copied[0].shape == gate.shape
+        assert transport.take_expert(0, 1)[0] is copied[0]
+        transport.stage_ahead(1, model.weights.layers[1], {})
+        nxt = transport.ensure(1, model.weights.layers[1], {})
+        assert nxt.layer.o.shape == model.weights.layers[1].o.shape
+        report = transport.resolve()
+        assert report["h2d_bytes"] > 0
+        assert report["h2d_s"] == 0.0
+        transport.check_budget()
+        transport.close()
+        assert transport._ready is None
+    finally:
+        store.close()
+
+
 def test_default_compute_stays_on_cpu(tmp_path: Path):
     model, store, _directory = _model(tmp_path)
     try:
