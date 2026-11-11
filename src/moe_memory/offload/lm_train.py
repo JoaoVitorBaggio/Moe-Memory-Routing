@@ -18,12 +18,34 @@ import hashlib
 import json
 import resource
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils.checkpoint import checkpoint
+
+# Só o passo pedido liga isto. Fora dele o rótulo é um contexto vazio.
+_PROFILE_LABELS = False
+
+
+class _EmptyRegion:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+
+_EMPTY_REGION = _EmptyRegion()
+
+
+def _region(name: str):
+    if not _PROFILE_LABELS:
+        return _EMPTY_REGION
+    return record_function(name)
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
 from moe_memory.offload.qwen import (
@@ -280,7 +302,8 @@ class OffloadLanguageModel(nn.Module):
             raise ValueError("a janela precisa de ao menos 2 tokens")
         _EXPERT_STATE["model"] = self
         started = time.perf_counter()
-        plan, _state = self.router.plan(token_ids)
+        with _region("router_plan"):
+            plan, _state = self.router.plan(token_ids)
         self._add_time("router_plan_s", time.perf_counter() - started)
         hidden = self._embed(token_ids)
         self._phase("embed")
@@ -301,12 +324,13 @@ class OffloadLanguageModel(nn.Module):
             )
         self._phase(f"layers-done-{spec.n_layers}")
         started = time.perf_counter()
-        normed = rms_norm(hidden, _as(self.weights.final_norm, hidden), spec.rms_eps)
-        loss = _chunked_cross_entropy(
-            normed[:, :-1].reshape(-1, normed.shape[-1]),
-            self.weights.lm_head,
-            token_ids[:, 1:].reshape(-1),
-        )
+        with _region("cross_entropy"):
+            normed = rms_norm(hidden, _as(self.weights.final_norm, hidden), spec.rms_eps)
+            loss = _chunked_cross_entropy(
+                normed[:, :-1].reshape(-1, normed.shape[-1]),
+                self.weights.lm_head,
+                token_ids[:, 1:].reshape(-1),
+            )
         self._add_time("cross_entropy_forward_s", time.perf_counter() - started)
         self._phase("loss")
         return loss, plan
@@ -322,10 +346,17 @@ class OffloadLanguageModel(nn.Module):
         spec = self.weights.spec
         layer_index = int(layer_index_t.item())
         layer = self.weights.layers[layer_index]
+        if self._io_phase == "backward":
+            with _region(f"checkpoint_recompute_layer_{layer_index}"):
+                return self._layer_body(hidden, coeffs, index, valid, spec, layer, layer_index)
+        return self._layer_body(hidden, coeffs, index, valid, spec, layer, layer_index)
+
+    def _layer_body(self, hidden, coeffs, index, valid, spec, layer, layer_index):
         started = time.perf_counter()
         normed = rms_norm(hidden, _as(layer.input_norm, hidden), spec.rms_eps)
         self._add_time(self._phase_key("resident_s"), time.perf_counter() - started)
-        hidden = hidden + _attention_seq(layer, normed, spec)
+        with _region(f"attention_layer_{layer_index}"):
+            hidden = hidden + _attention_seq(layer, normed, spec)
         started = time.perf_counter()
         moe_in = rms_norm(hidden, _as(layer.post_norm, hidden), spec.rms_eps)
         self._add_time(self._phase_key("resident_s"), time.perf_counter() - started)
@@ -366,17 +397,19 @@ class OffloadLanguageModel(nn.Module):
 
     def _read(self, layer: int, expert: int, kind: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         started = time.perf_counter()
-        gate_b, up_b, down_b = self.store.payload(layer, expert)
+        with _region(f"expert_read_{kind}"):
+            gate_b, up_b, down_b = self.store.payload(layer, expert)
         self._add_time(f"expert_read_{kind}_s", time.perf_counter() - started)
         nbytes = len(gate_b) + len(up_b) + len(down_b)
         self._add_time(f"expert_read_{kind}_bytes", nbytes)
         if self.time_log:
             self._read_seq.append(((layer, expert), nbytes))
         started = time.perf_counter()
-        layout = self.store.layout
-        gate = _matrix(gate_b, self.store_dtype, (layout.intermediate, layout.hidden))
-        up = _matrix(up_b, self.store_dtype, (layout.intermediate, layout.hidden))
-        down = _matrix(down_b, self.store_dtype, (layout.hidden, layout.intermediate))
+        with _region(f"bf16_fp32_{kind}"):
+            layout = self.store.layout
+            gate = _matrix(gate_b, self.store_dtype, (layout.intermediate, layout.hidden))
+            up = _matrix(up_b, self.store_dtype, (layout.intermediate, layout.hidden))
+            down = _matrix(down_b, self.store_dtype, (layout.hidden, layout.intermediate))
         self._add_time(f"expert_convert_{kind}_s", time.perf_counter() - started)
         return gate, up, down
 
@@ -458,7 +491,8 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     if not report["grads_finite"]:
         raise RuntimeError("há gradiente não finito")
     started = time.perf_counter()
-    optimizer.step()
+    with _region("optimizer_step"):
+        optimizer.step()
     model._add_time("optimizer_s", time.perf_counter() - started)
     report["loss"] = float(loss.detach())
     report["distinct_experts"] = distinct_experts(plan)
@@ -706,7 +740,8 @@ def _as(weight: torch.Tensor | None, ref: torch.Tensor) -> torch.Tensor | None:
         return None
     if weight.dtype == ref.dtype and weight.device == ref.device:
         return weight
-    return weight.to(dtype=ref.dtype, device=ref.device)
+    with _region("bf16_fp32"):
+        return weight.to(dtype=ref.dtype, device=ref.device)
 
 
 def _apply_expert(model: OffloadLanguageModel, hidden, coeff, layer: int, expert: int) -> torch.Tensor:
@@ -743,9 +778,10 @@ class _ExpertFn(torch.autograd.Function):
         model._note_expert(1)
         started = time.perf_counter()
         try:
-            with torch.no_grad():
-                projected = _swiglu(hidden, gate, up, down, gate_a, gate_b, up_a, up_b, down_a, down_b, ctx.scale)
-                out = projected * coeff.unsqueeze(-1)
+            with _region(f"expert_compute_{kind}"):
+                with torch.no_grad():
+                    projected = _swiglu(hidden, gate, up, down, gate_a, gate_b, up_a, up_b, down_a, down_b, ctx.scale)
+                    out = projected * coeff.unsqueeze(-1)
         finally:
             model._add_time(f"expert_compute_{kind}_s", time.perf_counter() - started)
             model._note_expert(-1)
@@ -772,9 +808,10 @@ class _ExpertFn(torch.autograd.Function):
             model._note_expert(1)
             started = time.perf_counter()
             try:
-                projected = _swiglu(inputs[0], gate, up, down, *inputs[2:], ctx.scale)
-                out = projected * inputs[1].unsqueeze(-1)
-                grads = torch.autograd.grad(out, inputs, grad_out)
+                with _region("expert_compute_backward"):
+                    projected = _swiglu(inputs[0], gate, up, down, *inputs[2:], ctx.scale)
+                    out = projected * inputs[1].unsqueeze(-1)
+                    grads = torch.autograd.grad(out, inputs, grad_out)
             finally:
                 model._add_time("expert_compute_backward_s", time.perf_counter() - started)
                 model._note_expert(-1)
@@ -786,10 +823,15 @@ _EXPERT_STATE: dict = {}
 
 
 def _swiglu(hidden, gate, up, down, gate_a, gate_b, up_a, up_b, down_a, down_b, scale):
-    projected_gate = F.linear(hidden, gate) + scale * _delta(hidden, gate_a, gate_b)
-    projected_up = F.linear(hidden, up) + scale * _delta(hidden, up_a, up_b)
+    with _region("lora"):
+        gate_delta = _delta(hidden, gate_a, gate_b)
+        up_delta = _delta(hidden, up_a, up_b)
+    projected_gate = F.linear(hidden, gate) + scale * gate_delta
+    projected_up = F.linear(hidden, up) + scale * up_delta
     mid = F.silu(projected_gate) * projected_up
-    return F.linear(mid, down) + scale * _delta(mid, down_a, down_b)
+    with _region("lora"):
+        down_delta = _delta(mid, down_a, down_b)
+    return F.linear(mid, down) + scale * down_delta
 
 
 def _chunked_cross_entropy(hidden: torch.Tensor, weight: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -811,7 +853,8 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_loss):
         hidden, weight, targets = ctx.saved_tensors
         started = time.perf_counter()
-        grad_hidden = _ce_grad_hidden(hidden, weight, targets, ctx.chunk, grad_loss)
+        with _region("cross_entropy_backward"):
+            grad_hidden = _ce_grad_hidden(hidden, weight, targets, ctx.chunk, grad_loss)
         model = _EXPERT_STATE.get("model")
         if model is not None:
             model._add_time("cross_entropy_backward_s", time.perf_counter() - started)
@@ -922,9 +965,10 @@ def _attention_seq_body(layer, hidden: torch.Tensor, spec: QwenSpec) -> torch.Te
     batch, seq, _width = hidden.shape
     if batch != 1 or seq < 1:
         raise ValueError("a atenção do treino é batch 1")
-    query = F.linear(hidden, _as(layer.q, hidden), _as(layer.q_bias, hidden))
-    key = F.linear(hidden, _as(layer.k, hidden), _as(layer.k_bias, hidden))
-    value = F.linear(hidden, _as(layer.v, hidden), _as(layer.v_bias, hidden))
+    with _region("qkvo"):
+        query = F.linear(hidden, _as(layer.q, hidden), _as(layer.q_bias, hidden))
+        key = F.linear(hidden, _as(layer.k, hidden), _as(layer.k_bias, hidden))
+        value = F.linear(hidden, _as(layer.v, hidden), _as(layer.v_bias, hidden))
     query = query.view(batch, seq, spec.n_heads, spec.head_dim)
     key = key.view(batch, seq, spec.n_kv_heads, spec.head_dim)
     value = value.view(batch, seq, spec.n_kv_heads, spec.head_dim)
@@ -943,7 +987,100 @@ def _attention_seq_body(layer, hidden: torch.Tensor, spec: QwenSpec) -> torch.Te
         is_causal=seq > 1,
     )
     mixed = mixed.transpose(1, 2).reshape(batch, seq, spec.n_heads * spec.head_dim)
-    return F.linear(mixed, _as(layer.o, hidden), _as(layer.o_bias, hidden))
+    with _region("qkvo"):
+        return F.linear(mixed, _as(layer.o, hidden), _as(layer.o_bias, hidden))
+
+
+_REGION_PREFIXES = (
+    "router_plan",
+    "cross_entropy",
+    "attention_layer_",
+    "checkpoint_recompute_layer_",
+    "qkvo",
+    "bf16_fp32",
+    "expert_read_",
+    "expert_compute_",
+    "lora",
+    "optimizer_step",
+)
+
+
+@contextmanager
+def profile_lm_step(out_dir: str | Path, *, with_stack: bool = False, with_trace: bool = False):
+    """Perfila só o bloco `with`. Sem profile_memory. A stack só se pedida."""
+
+    global _PROFILE_LABELS
+    directory = Path(out_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    _PROFILE_LABELS = True
+    try:
+        with profile(
+            activities=[ProfilerActivity.CPU],
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=with_stack,
+        ) as prof:
+            yield prof
+    finally:
+        _PROFILE_LABELS = False
+    write_step_profile(prof, directory, with_stack=with_stack, with_trace=with_trace)
+
+
+def write_step_profile(prof, out_dir: Path, *, with_stack: bool, with_trace: bool) -> None:
+    ops = prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=50)
+    (out_dir / "profile_ops_top50.txt").write_text(ops, encoding="utf-8")
+    shapes = prof.key_averages(group_by_input_shape=True).table(sort_by="self_cpu_time_total", row_limit=30)
+    (out_dir / "profile_shapes_top30.txt").write_text(shapes, encoding="utf-8")
+    (out_dir / "profile_regions.json").write_text(
+        json.dumps(_profile_summary(prof, with_stack=with_stack, with_trace=with_trace), indent=2),
+        encoding="utf-8",
+    )
+    if with_trace:
+        prof.export_chrome_trace(str(out_dir / "profile_trace.json"))
+
+
+def _profile_summary(prof, *, with_stack: bool, with_trace: bool) -> dict:
+    events = list(prof.key_averages())
+    regions: dict[str, dict[str, float | int]] = {}
+    total_calls = 0
+    aten_calls = 0
+    autograd_calls = 0
+    small_calls = 0
+    for event in events:
+        count = int(event.count)
+        total_calls += count
+        name = str(event.key)
+        if name.startswith("aten::"):
+            aten_calls += count
+        if "autograd" in name.lower() or name.startswith("Autograd"):
+            autograd_calls += count
+        self_us = float(getattr(event, "self_cpu_time_total", 0.0))
+        if count and self_us / count < 100:
+            small_calls += count
+        if not any(name == prefix or name.startswith(prefix) for prefix in _REGION_PREFIXES):
+            continue
+        regions[name] = {
+            "self_cpu_s": self_us / 1e6,
+            "cpu_s": float(getattr(event, "cpu_time_total", 0.0)) / 1e6,
+            "count": count,
+        }
+    return {
+        "regions": regions,
+        "calls": {
+            "total": total_calls,
+            "aten": aten_calls,
+            "autograd": autograd_calls,
+            "under_100us_self": small_calls,
+        },
+        "profile_memory": False,
+        "with_stack": with_stack,
+        "with_trace": with_trace,
+        "overhead_note": (
+            "Sem profile_memory e sem with_stack o buffer fica na ordem de dezenas "
+            "a poucas centenas de MB durante o passo. O trace chrome pode passar disso. "
+            "Não foi medido na 1060."
+        ),
+    }
 
 
 def _rope_seq(positions: torch.Tensor, head_dim: int, theta: float, dtype: torch.dtype):
