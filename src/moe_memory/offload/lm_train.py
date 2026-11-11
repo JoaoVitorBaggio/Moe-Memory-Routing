@@ -8,6 +8,10 @@ e o residente não são parâmetros. Treinam o LSTM e a LoRA.
 A loss é a entropia cruzada do próximo token. Não há KL, balanceamento
 nem penalidade de troca. Batch 1. O compute é float32: a GTX 1060 não
 executa bf16.
+
+O backward da fatia não volta pelo ``SelectBackward``: o gradiente é
+somado direto em ``.grad[camada, expert]`` depois do passo. Isso evita
+materializar um zero do tensor compartilhado inteiro a cada expert.
 """
 
 from __future__ import annotations
@@ -185,6 +189,7 @@ def estimate_bytes(
         "resident_bytes": resident_bytes,
         "lora_fp32_bytes": lora,
         "lora_grad_bytes": lora,
+        "lora_select_backward_bytes": 0,
         "adam_lora_bytes": lora * 2,
         "lstm_with_adam_bytes": lstm_params * 12,
         "lstm_grad_bytes": lstm_params * 4,
@@ -483,7 +488,12 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     model._phase("backward")
     model._io_phase = "backward"
     started = time.perf_counter()
-    loss.backward()
+    try:
+        loss.backward()
+        flush_lora_slice_grads()
+    except Exception:
+        _SLICE_GRADS.clear()
+        raise
     model._add_time("backward_s", time.perf_counter() - started)
     model._io_phase = "forward"
     model._phase("optimizer")
@@ -816,10 +826,55 @@ class _ExpertFn(torch.autograd.Function):
                 model._add_time("expert_compute_backward_s", time.perf_counter() - started)
                 model._note_expert(-1)
                 del gate, up, down
-        return grads
+        if _RETURN_SLICE_GRADS:
+            return grads
+        lora = model.lora
+        for param, grad in (
+            (lora.gate_A, grads[2]),
+            (lora.gate_B, grads[3]),
+            (lora.up_A, grads[4]),
+            (lora.up_B, grads[5]),
+            (lora.down_A, grads[6]),
+            (lora.down_B, grads[7]),
+        ):
+            _queue_slice_grad(param, ctx.layer, ctx.expert, grad)
+        return grads[0], grads[1], None, None, None, None, None, None
 
 
 _EXPERT_STATE: dict = {}
+# Gradiente da fatia, aplicado depois do backward. Não volta pelo SelectBackward.
+_SLICE_GRADS: list[tuple[torch.nn.Parameter, int, int, torch.Tensor]] = []
+_RETURN_SLICE_GRADS = False
+
+
+def _queue_slice_grad(param: torch.nn.Parameter, layer: int, expert: int, grad: torch.Tensor | None) -> None:
+    if grad is None:
+        return
+    _SLICE_GRADS.append((param, int(layer), int(expert), grad.detach()))
+
+
+def flush_lora_slice_grads() -> None:
+    """Soma cada fatia no ``.grad`` do tensor compartilhado, uma vez."""
+
+    for param, layer, expert, grad in _SLICE_GRADS:
+        if param.grad is None:
+            param.grad = torch.zeros_like(param)
+        param.grad[layer, expert].add_(grad)
+    _SLICE_GRADS.clear()
+
+
+@contextmanager
+def legacy_lora_slice_grads():
+    """Caminho antigo, só para o teste de equivalência. O treino não usa."""
+
+    global _RETURN_SLICE_GRADS
+    previous = _RETURN_SLICE_GRADS
+    _RETURN_SLICE_GRADS = True
+    try:
+        yield
+    finally:
+        _RETURN_SLICE_GRADS = previous
+        _SLICE_GRADS.clear()
 
 
 def _swiglu(hidden, gate, up, down, gate_a, gate_b, up_a, up_b, down_a, down_b, scale):
