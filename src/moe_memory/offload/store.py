@@ -353,6 +353,7 @@ class ResidentReader:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._fh = open(self.path, "rb")
+        _advise_fd(self._fh.fileno(), 0, 0, "POSIX_FADV_NOREUSE")
         magic = self._fh.read(len(RESIDENT_MAGIC))
         if magic != RESIDENT_MAGIC:
             raise ValueError(f"{path} não é pacote residente")
@@ -378,13 +379,7 @@ class ResidentReader:
 
     def close(self) -> None:
         fd = self._fh.fileno()
-        advise = getattr(os, "posix_fadvise", None)
-        flag = getattr(os, "POSIX_FADV_DONTNEED", None)
-        if advise is not None and flag is not None and fd >= 0:
-            try:
-                advise(fd, 0, 0, flag)
-            except OSError:
-                pass
+        _advise_fd(fd, 0, 0, "POSIX_FADV_DONTNEED")
         self._fh.close()
 
     def __enter__(self) -> ResidentReader:
@@ -392,6 +387,17 @@ class ResidentReader:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _advise_fd(fd: int, offset: int, size: int, flag_name: str) -> None:
+    advise = getattr(os, "posix_fadvise", None)
+    flag = getattr(os, flag_name, None)
+    if advise is None or flag is None or fd < 0:
+        return
+    try:
+        advise(fd, offset, size, flag)
+    except OSError:
+        return
 
 
 def torch_dtype(dtype_code: int) -> torch.dtype:

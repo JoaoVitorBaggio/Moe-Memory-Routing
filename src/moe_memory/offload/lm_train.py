@@ -12,6 +12,8 @@ executa bf16.
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import hashlib
 import json
 import resource
@@ -37,6 +39,8 @@ LAUNCH_CEILING_BYTES = 8 * 1024**3
 VRAM_BUDGET_BYTES = int(5.5 * 1024**3)
 OVERHEAD_BYTES = 512 * 1024**2
 LM_HEAD_CHUNK = 4096
+# O DONTNEED da PR32 deixou 1,0–1,6 GiB de página. É conselho, não garantia.
+FILE_CACHE_RESIDUAL_BYTES = int(1.6 * 1024**3)
 
 
 def pascal_bf16_cuda_ok(capability: tuple[int, int] | None, bf16_supported: bool) -> bool:
@@ -166,12 +170,27 @@ def estimate_bytes(
         "lm_head_fp32_bytes": head,
         "overhead_bytes": OVERHEAD_BYTES,
         "resident_page_cache_if_kept": resident_bytes,
-        "file_cache_bytes": 0,
+        "file_cache_bytes": FILE_CACHE_RESIDUAL_BYTES,
         "seq_len": seq_len,
         "k1": k1,
     }
-    skipped = {"resident_page_cache_if_kept", "seq_len", "k1"}
+    largest = max(
+        n_layers * n_experts * rank * hidden * 4,
+        n_layers * n_experts * intermediate * rank * 4,
+        n_layers * n_experts * hidden * rank * 4,
+    )
+    pieces["optimizer_step_temporary_bytes"] = largest
+    pieces["checkpoint_extra_bytes"] = 0
+    pieces["checkpoint_file_bytes"] = lora + lora * 2 + lstm_params * 12
+    skipped = {
+        "resident_page_cache_if_kept",
+        "seq_len",
+        "k1",
+        "checkpoint_file_bytes",
+        "file_cache_bytes",
+    }
     pieces["total_bytes"] = sum(value for key, value in pieces.items() if key not in skipped and value is not None)
+    pieces["cgroup_total_bytes"] = pieces["total_bytes"] + pieces["file_cache_bytes"]
     pieces["launch_ceiling_bytes"] = LAUNCH_CEILING_BYTES
     pieces["cgroup_bytes"] = cgroup_bytes
     pieces["vram_budget_bytes"] = VRAM_BUDGET_BYTES
@@ -354,7 +373,38 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     report["distinct_experts"] = distinct_experts(plan)
     report["hot_entropy"] = _hot_entropy(plan)
     report["router_entropy"] = _router_entropy(model, token_ids)
+    del loss, plan
+    release_step_memory(optimizer)
+    report["rss_bytes"] = rss_bytes()
+    report["ru_maxrss_bytes"] = ru_maxrss_bytes()
+    model._phase("after-step")
     return report
+
+
+def make_optimizer(model: OffloadLanguageModel, lr: float) -> torch.optim.Optimizer:
+    """AdamW sem ``foreach``. O caminho agrupado monta temporários do tamanho da LoRA inteira."""
+
+    return torch.optim.AdamW(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=lr,
+        weight_decay=0.0,
+        foreach=False,
+    )
+
+
+def malloc_trim() -> None:
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        return
+
+
+def release_step_memory(optimizer: torch.optim.Optimizer) -> None:
+    """Solta o gradiente e devolve arenas ao glibc antes do checkpoint."""
+
+    optimizer.zero_grad(set_to_none=True)
+    gc.collect()
+    malloc_trim()
 
 
 def grad_report(model: OffloadLanguageModel) -> dict[str, float | bool]:
@@ -399,18 +449,129 @@ def load_trainable(model: OffloadLanguageModel, payload: dict) -> None:
 
 
 def save_checkpoint(path: str | Path, *, step: int, model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, extra: dict) -> None:
-    torch.save(
-        {
-            "version": 1,
-            "kind": "qwen-lm-lora-lstm",
-            "step": step,
-            "router": model.router.state_dict(),
-            "lora": model.lora.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            **extra,
-        },
-        path,
-    )
+    """Grava um tensor por arquivo. Não monta o estado inteiro numa cópia só."""
+
+    directory = Path(path)
+    directory.mkdir(parents=True, exist_ok=True)
+    entries: list[dict] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        rel = f"weights/{len(entries):04d}.bin"
+        _write_tensor(directory / rel, parameter)
+        entries.append(
+            {
+                "kind": "param",
+                "name": name,
+                "dtype": _dtype_name(parameter.dtype),
+                "shape": list(parameter.shape),
+                "file": rel,
+            }
+        )
+        state = optimizer.state.get(parameter, {})
+        for key, value in state.items():
+            if not torch.is_tensor(value):
+                entries.append({"kind": "optim-scalar", "name": name, "key": key, "value": _json_scalar(value)})
+                continue
+            rel = f"optim/{len(entries):04d}-{key}.bin"
+            _write_tensor(directory / rel, value)
+            entries.append(
+                {
+                    "kind": "optim",
+                    "name": name,
+                    "key": key,
+                    "dtype": _dtype_name(value.dtype),
+                    "shape": list(value.shape),
+                    "file": rel,
+                }
+            )
+    meta = {
+        "version": 2,
+        "kind": "qwen-lm-lora-lstm",
+        "step": step,
+        "entries": entries,
+        "param_groups": [_jsonable_group(group) for group in optimizer.param_groups],
+        **extra,
+    }
+    (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+def _write_tensor(path: Path, tensor: torch.Tensor) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = tensor.detach()
+    if not raw.is_contiguous():
+        raw = raw.contiguous()
+    flat = raw.reshape(-1).view(torch.uint8)
+    with path.open("wb") as handle:
+        flat.numpy().tofile(handle)
+
+
+def _read_tensor_into(path: Path, dest: torch.Tensor, entry: dict) -> None:
+    if list(dest.shape) != list(entry["shape"]) or dest.dtype != _dtype_of(entry["dtype"]):
+        raise ValueError(f"tensor {entry.get('name')} não casa com {entry['shape']} {entry['dtype']}")
+    nbytes = dest.numel() * dest.element_size()
+    blob = path.read_bytes()
+    if len(blob) != nbytes:
+        raise ValueError(f"{path} tem {len(blob)} bytes, esperado {nbytes}")
+    dest.reshape(-1).view(torch.uint8).copy_(torch.frombuffer(bytearray(blob), dtype=torch.uint8))
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _dtype_of(name: str) -> torch.dtype:
+    dtype = getattr(torch, name, None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(f"dtype {name} não é do torch")
+    return dtype
+
+
+def _json_scalar(value):
+    if isinstance(value, (int, float, str, bool)) or value is None:
+        return value
+    raise ValueError(f"estado do otimizador não é tensor nem escalar: {type(value)}")
+
+
+def _jsonable_group(group: dict) -> dict:
+    saved = {}
+    for key, value in group.items():
+        if key == "params":
+            continue
+        if isinstance(value, tuple):
+            value = list(value)
+        if isinstance(value, list) and all(isinstance(item, (int, float)) for item in value):
+            saved[key] = value
+        elif isinstance(value, (int, float, str, bool)) or value is None:
+            saved[key] = value
+    return saved
+
+
+def load_checkpoint(path: str | Path, model: OffloadLanguageModel, optimizer: torch.optim.Optimizer) -> dict:
+    directory = Path(path)
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    if meta.get("version") != 2 or meta.get("kind") != "qwen-lm-lora-lstm":
+        raise ValueError("checkpoint não é o formato em streaming da LM")
+    named = dict(model.named_parameters())
+    for group, saved in zip(optimizer.param_groups, meta["param_groups"], strict=True):
+        for key, value in saved.items():
+            if key in group and key != "params":
+                group[key] = value
+    for entry in meta["entries"]:
+        parameter = named[entry["name"]]
+        if entry["kind"] == "param":
+            _read_tensor_into(directory / entry["file"], parameter, entry)
+            continue
+        slot = optimizer.state[parameter]
+        if entry["kind"] == "optim-scalar":
+            slot[entry["key"]] = entry["value"]
+            continue
+        if entry["kind"] != "optim":
+            raise ValueError(f"entrada de checkpoint desconhecida: {entry['kind']}")
+        tensor = torch.empty(entry["shape"], dtype=_dtype_of(entry["dtype"]))
+        _read_tensor_into(directory / entry["file"], tensor, entry)
+        slot[entry["key"]] = tensor
+    return meta
 
 
 def _hot_entropy(plan) -> float:

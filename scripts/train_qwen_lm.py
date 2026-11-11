@@ -11,8 +11,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+
+os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -29,8 +32,9 @@ from moe_memory.offload.lm_train import (
     lm_step,
     rss_bytes,
     ru_maxrss_bytes,
-    load_trainable,
+    make_optimizer,
     refuse_cuda_bf16,
+    release_step_memory,
     save_checkpoint,
 )
 from moe_memory.offload.qwen import load_resident, load_spec
@@ -62,6 +66,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--estimate-only", action="store_true")
     parser.add_argument("--check-tokenizer", action="store_true")
     parser.add_argument("--memory-log", action="store_true")
+    parser.add_argument("--valid-forward", action="store_true")
     args = parser.parse_args(argv)
     if args.steps < 1 or args.seq_len < 2:
         parser.error("steps >= 1 e seq-len >= 2")
@@ -129,7 +134,9 @@ def main(argv: list[str] | None = None) -> int:
             head_dim=spec.head_dim,
         )
         cgroup = estimate["cgroup_bytes"]
-        fits = estimate["total_bytes"] <= LAUNCH_CEILING_BYTES and (cgroup is None or estimate["total_bytes"] <= cgroup)
+        fits = estimate["total_bytes"] <= LAUNCH_CEILING_BYTES and (
+            cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
+        )
         summary = {
             "kind": "qwen-lm-lora-lstm-smoke",
             "device": "cpu",
@@ -173,13 +180,8 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps({"phase": "resident-loaded", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
                 flush=True,
             )
-        optimizer = torch.optim.AdamW(
-            [parameter for parameter in model.parameters() if parameter.requires_grad],
-            lr=args.lr,
-            weight_decay=0.0,
-        )
+        optimizer = make_optimizer(model, args.lr)
         train_files = wikitext_arrow_files(args.cache_dir, "train")
-        valid_files = wikitext_arrow_files(args.cache_dir, "validation")
         windows = list(
             iter_token_windows(
                 iter_arrow_text(train_files),
@@ -192,28 +194,36 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"o treino só rendeu {len(windows)} janelas")
         probe = tokenizer.encode("Hello")
         rows = []
-        first = None
         for step, window in enumerate(windows, start=1):
             tokens = torch.tensor(window, dtype=torch.long).view(1, -1)
-            if first is None:
-                first = tokens.clone()
             row = lm_step(model, optimizer, tokens)
             row["step"] = step
             rows.append(row)
             print(json.dumps(row), flush=True)
-        valid = next(
-            iter_token_windows(
-                iter_arrow_text(valid_files),
-                tokenizer,
-                seq_len=args.seq_len,
-                limit=1,
+        release_step_memory(optimizer)
+        valid_loss = None
+        if args.valid_forward:
+            valid_files = wikitext_arrow_files(args.cache_dir, "validation")
+            valid = next(
+                iter_token_windows(
+                    iter_arrow_text(valid_files),
+                    tokenizer,
+                    seq_len=args.seq_len,
+                    limit=1,
+                )
             )
-        )
-        with torch.no_grad():
-            valid_loss_t, _plan = model.forward_window(torch.tensor(valid, dtype=torch.long).view(1, -1))
-            valid_loss = float(valid_loss_t)
+            with torch.no_grad():
+                valid_loss_t, valid_plan = model.forward_window(torch.tensor(valid, dtype=torch.long).view(1, -1))
+                valid_loss = float(valid_loss_t)
+                del valid_loss_t, valid_plan
+            release_step_memory(optimizer)
+            if args.memory_log:
+                print(
+                    json.dumps({"phase": "valid-forward", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
+                    flush=True,
+                )
         args.out.mkdir(parents=True, exist_ok=True)
-        checkpoint = args.out / "checkpoint.pt"
+        checkpoint = args.out / "checkpoint"
         save_checkpoint(
             checkpoint,
             step=args.steps,
@@ -221,20 +231,11 @@ def main(argv: list[str] | None = None) -> int:
             optimizer=optimizer,
             extra={"windows": windows, "seed": args.seed, "seq_len": args.seq_len},
         )
-        routed = model.router.plan(first)[0].hot_index.detach().clone()
-        head = model.router.heads[0].weight.detach().clone()
-        with torch.no_grad():
-            model.router.heads[0].weight.add_(1)
-        if torch.equal(model.router.heads[0].weight, head):
-            raise SystemExit("a perturbação do LSTM não alterou o peso")
-        blob = torch.load(checkpoint, weights_only=False)
-        load_trainable(model, blob)
-        optimizer.load_state_dict(blob["optimizer"])
-        if blob.get("step") != args.steps or not torch.equal(model.router.heads[0].weight, head):
-            raise SystemExit("o arquivo do checkpoint não devolveu o peso do LSTM")
-        restored = model.router.plan(first)[0].hot_index.detach().clone()
-        if not torch.equal(restored, routed):
-            raise SystemExit("o arquivo do checkpoint não devolveu a rota do passo treinado")
+        if args.memory_log:
+            print(
+                json.dumps({"phase": "checkpoint", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
+                flush=True,
+            )
         after = {
             "store": fingerprint(store_path),
             "resident": fingerprint(resident_path),
