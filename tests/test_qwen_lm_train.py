@@ -17,7 +17,8 @@ from moe_memory.offload.lm_train import (
     estimate_bytes,
     fingerprint,
     lm_step,
-    load_trainable,
+    load_checkpoint,
+    make_optimizer,
     pascal_bf16_cuda_ok,
     save_checkpoint,
 )
@@ -124,9 +125,11 @@ def test_real_shape_estimate_fits_under_9gib_and_reads_the_given_cgroup():
     assert estimate["expert_fp32_bytes"] == 3 * 2048 * 768 * 4
     assert estimate["lm_head_fp32_bytes"] < resident
     assert estimate["lm_head_fp32_bytes"] == 4096 * 2048 * 4
-    assert estimate["file_cache_bytes"] == 0
+    assert estimate["file_cache_bytes"] == int(1.6 * 1024**3)
+    assert estimate["checkpoint_extra_bytes"] == 0
+    assert estimate["optimizer_step_temporary_bytes"] == 48 * 128 * 4 * 2048 * 4
     assert estimate["total_bytes"] < LAUNCH_CEILING_BYTES
-    assert estimate["total_bytes"] < nine
+    assert estimate["cgroup_total_bytes"] < nine
     assert estimate["resident_bytes"] == resident
 
 
@@ -181,24 +184,26 @@ def test_checkpoint_restores_routing_and_the_next_step(tmp_path: Path):
     try:
         first = torch.tensor([[4, 5, 6, 7]])
         second = torch.tensor([[8, 9, 10, 11]])
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.0)
+        optimizer = make_optimizer(model, 1e-2)
         lm_step(model, optimizer, first)
-        path = directory / "checkpoint.pt"
+        path = directory / "checkpoint"
         save_checkpoint(path, step=1, model=model, optimizer=optimizer, extra={"windows": [first.view(-1).tolist()]})
         routed = model.router.plan(first)[0].hot_index.detach().clone()
+        saved_avg = optimizer.state[model.lora.gate_B]["exp_avg"].detach().clone()
         other, other_store, _other_dir = _model(directory / "second")
         try:
-            blob = torch.load(path, weights_only=False)
-            load_trainable(other, blob)
-            other_opt = torch.optim.AdamW(other.parameters(), lr=1e-2, weight_decay=0.0)
-            other_opt.load_state_dict(blob["optimizer"])
+            other_opt = make_optimizer(other, 1e-2)
+            meta = load_checkpoint(path, other, other_opt)
             assert torch.equal(other.router.plan(first)[0].hot_index, routed)
+            assert torch.equal(other_opt.state[other.lora.gate_B]["exp_avg"], saved_avg)
             again = lm_step(model, optimizer, second)
             resumed = lm_step(other, other_opt, second)
             assert again["loss"] == pytest.approx(resumed["loss"])
             assert torch.equal(model.lora.down_B, other.lora.down_B)
-            assert blob["step"] == 1
-            assert blob["kind"] == "qwen-lm-lora-lstm"
+            assert meta["step"] == 1
+            assert meta["kind"] == "qwen-lm-lora-lstm"
+            assert (path / "meta.json").is_file()
+            assert not (path / "checkpoint.pt").exists()
         finally:
             other_store.close()
     finally:

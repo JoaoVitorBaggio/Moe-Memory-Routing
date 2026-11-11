@@ -36,6 +36,7 @@ class BlockFile:
                 self.fd = os.open(path, flags)
         else:
             self.fd = os.open(path, flags)
+        self.advise_noreuse()
 
     def read_at(self, offset: int, size: int) -> bytes:
         if offset < 0 or size < 0:
@@ -49,13 +50,24 @@ class BlockFile:
             raise OSError(f"leitura curta em {self.path}: {len(got)} de {size} em {offset}")
         return got
 
-    def advise_dontneed(self, offset: int, size: int) -> None:
-        """Solta o cache de página deste trecho. O byte já copiado não depende dele."""
+    def advise_noreuse(self) -> None:
+        """Pede para não guardar o arquivo. O kernel pode ignorar."""
 
-        if self.fd < 0 or size <= 0:
+        self._advise(0, 0, "POSIX_FADV_NOREUSE")
+
+    def advise_dontneed(self, offset: int, size: int) -> None:
+        """Solta o cache deste trecho. O byte já copiado não depende dele.
+
+        É conselho. Na corrida da PR32 sobraram 1,0–1,6 GiB de página.
+        """
+
+        self._advise(offset, size, "POSIX_FADV_DONTNEED")
+
+    def _advise(self, offset: int, size: int, flag_name: str) -> None:
+        if self.fd < 0:
             return
         advise = getattr(os, "posix_fadvise", None)
-        flag = getattr(os, "POSIX_FADV_DONTNEED", None)
+        flag = getattr(os, flag_name, None)
         if advise is None or flag is None:
             return
         try:
