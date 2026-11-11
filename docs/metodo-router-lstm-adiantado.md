@@ -194,7 +194,7 @@ O teto de 7,53 GiB deixava de fora o gradiente da LoRA, a cabeça inteira em flo
 
 Na corrida da PR32 os dois passos terminaram e o processo morreu na passagem extra de validação e no `checkpoint.pt` de 2,6 GB. O checkpoint agora é um arquivo por tensor, com o Adam incluído, gravado depois de `zero_grad` e `malloc_trim`. O Adam usa `foreach=False`. A loss de validação só roda com `--valid-forward`, também depois de soltar o passo. `DONTNEED` continua sendo conselho: a página residual medida foi 1,0–1,6 GiB e entra na conta do cgroup.
 
-`--time-log` parte o tempo do passo sem mudar a loss. A leitura do expert aparece três vezes no código: o forward, a recomputação do checkpoint e o backward. O JSON também simula um LRU (`--expert-cache-sim`) e não guarda esses experts.
+`--time-log` parte o tempo do passo sem mudar a loss. A leitura do expert aparece três vezes no código: o forward, a recomputação do checkpoint e o backward. O JSON também simula um LRU (`--expert-cache-sim`) e não guarda esses experts. `--expert-cache N` liga o LRU de verdade: guarda o bf16 do store, antes do float32, e solta os blocos antes do checkpoint. O padrão é 0. O backward relê a camada na hora, então um LRU de 64 vagas segura a camada corrente; a ordem entre camadas continua a do simulador.
 
 `--profile-step N` liga o `torch.profiler` só nesse passo, com atividade de CPU, formas gravadas e sem `profile_memory`. `--profile-stack` e `--profile-trace` ficam desligados: o trace chrome pode ficar grande. O buffer esperado, sem stack e sem trace, é de dezenas a poucas centenas de MB em cima do RSS já estável. Não foi medido na 1060.
 

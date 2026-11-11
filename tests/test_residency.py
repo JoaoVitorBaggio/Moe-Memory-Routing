@@ -1,5 +1,6 @@
 """Residência física: mock de VRAM no CI, parâmetros quietos no CPU."""
 
+import gc
 import math
 from pathlib import Path
 
@@ -123,6 +124,32 @@ def test_mock_vram_parks_non_hot_experts_and_stages_them_for_compute(tmp_path: P
     residency.stage_for_compute(0, warm_id)
     assert backend.last_non_blocking
     assert all(backend.last_non_blocking)
+
+
+def test_mock_vram_does_not_keep_a_freed_address(tmp_path: Path):
+    backend = MockVram()
+    staged = backend.to_device(torch.empty(1 << 16))
+    pointer = staged.data_ptr()
+    assert backend.on_device(staged)
+    del staged
+    gc.collect()
+    recycled = None
+    for _ in range(200):
+        candidate = torch.empty(1 << 16)
+        if candidate.data_ptr() == pointer:
+            recycled = candidate
+            break
+    if recycled is not None:
+        assert not backend.on_device(recycled)
+        assert not backend.is_pinned(recycled)
+    live = backend.pin(torch.ones(8))
+    view = live.narrow(0, 2, 4)
+    backend.note_view(view, live)
+    assert backend.is_pinned(live)
+    assert backend.is_pinned(view)
+    assert view.data_ptr() != live.data_ptr()
+    assert not backend.on_device(view)
+    assert not backend.on_device(live.clone())
 
 
 def test_promoting_a_cold_expert_loads_the_memmap_into_vram(tmp_path: Path):

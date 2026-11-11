@@ -30,6 +30,7 @@ from moe_memory.offload.lm_train import (
     OffloadLanguageModel,
     estimate_bytes,
     fingerprint,
+    launch_allowed,
     lm_step,
     rss_bytes,
     ru_maxrss_bytes,
@@ -72,6 +73,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile-step", type=int, default=None)
     parser.add_argument("--profile-stack", action="store_true")
     parser.add_argument("--profile-trace", action="store_true")
+    parser.add_argument("--expert-cache", type=int, default=0)
+    parser.add_argument("--expert-cache-bytes", type=int, default=0)
     parser.add_argument("--expert-cache-sim", default="32,64,128")
     parser.add_argument("--valid-forward", action="store_true")
     args = parser.parse_args(argv)
@@ -143,17 +146,21 @@ def main(argv: list[str] | None = None) -> int:
             n_heads=spec.n_heads,
             n_kv_heads=spec.n_kv_heads,
             head_dim=spec.head_dim,
+            expert_cache_slots=args.expert_cache,
+            expert_cache_max_bytes=args.expert_cache_bytes,
         )
         cgroup = estimate["cgroup_bytes"]
-        fits = estimate["total_bytes"] <= LAUNCH_CEILING_BYTES and (
-            cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
-        )
+        fits_cgroup = cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
+        fits = launch_allowed(estimate)
         summary = {
             "kind": "qwen-lm-lora-lstm-smoke",
             "device": "cpu",
             "compute_dtype": "float32",
             "estimate": estimate,
             "fits_launch_ceiling": fits,
+            "fits_cgroup_estimate": fits_cgroup,
+            "expert_cache_slots": args.expert_cache,
+            "expert_cache_max_bytes": args.expert_cache_bytes,
             "gpu": "não usada; residente bf16 e capability 6.1 não executam bf16",
         }
         print(json.dumps(summary, indent=2))
@@ -187,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             hidden_size=args.lstm_hidden,
         )
         model = OffloadLanguageModel(weights, router, store, rank=args.lora_rank, alpha=args.lora_alpha)
+        model.set_expert_cache(args.expert_cache, args.expert_cache_bytes)
         model.memory_log = args.memory_log
         model.time_log = args.time_log
         if args.time_log:
@@ -256,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
                     json.dumps({"phase": "valid-forward", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
                     flush=True,
                 )
+        model.release_expert_cache()
         args.out.mkdir(parents=True, exist_ok=True)
         checkpoint = args.out / "checkpoint"
         checkpoint_started = time.perf_counter()

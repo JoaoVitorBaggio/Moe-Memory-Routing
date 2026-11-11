@@ -16,6 +16,7 @@ from moe_memory.offload.lm_train import (
     OffloadLanguageModel,
     estimate_bytes,
     fingerprint,
+    launch_allowed,
     lm_step,
     load_checkpoint,
     make_optimizer,
@@ -131,6 +132,55 @@ def test_real_shape_estimate_fits_under_9gib_and_reads_the_given_cgroup():
     assert estimate["total_bytes"] < LAUNCH_CEILING_BYTES
     assert estimate["cgroup_total_bytes"] < nine
     assert estimate["resident_bytes"] == resident
+    assert estimate["expert_cache_bytes"] == 0
+
+
+def test_sixty_four_expert_cache_stays_under_the_anon_ceiling():
+    nine = 9_663_676_416
+    base = estimate_bytes(
+        resident_bytes=3_082_214_946,
+        vocab=151_936,
+        hidden=2048,
+        intermediate=768,
+        n_layers=48,
+        n_experts=128,
+        rank=4,
+        seq_len=32,
+        k1=4,
+        lstm_embed=64,
+        lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=nine,
+        read_cgroup=False,
+    )
+    cached = estimate_bytes(
+        resident_bytes=3_082_214_946,
+        vocab=151_936,
+        hidden=2048,
+        intermediate=768,
+        n_layers=48,
+        n_experts=128,
+        rank=4,
+        seq_len=32,
+        k1=4,
+        lstm_embed=64,
+        lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=nine,
+        read_cgroup=False,
+        expert_cache_slots=64,
+    )
+    block = 3 * 2048 * 768 * 2
+    assert cached["expert_cache_bytes"] == 64 * block
+    assert cached["total_bytes"] == base["total_bytes"] + 64 * block
+    assert cached["total_bytes"] < LAUNCH_CEILING_BYTES
+    assert cached["cgroup_total_bytes"] > nine
+    assert launch_allowed(base) is True
+    assert launch_allowed(cached) is True
 
 
 def test_one_token_attention_matches_decode_and_is_causal(tmp_path: Path):
