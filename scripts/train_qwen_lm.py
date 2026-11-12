@@ -69,6 +69,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--device-compute", default="cpu")
     parser.add_argument("--vram-budget-gb", type=float, default=5.0)
+    parser.add_argument("--vram-expert-cache-gb", type=float, default=0.0)
     parser.add_argument("--estimate-only", action="store_true")
     parser.add_argument("--check-tokenizer", action="store_true")
     parser.add_argument("--memory-log", action="store_true")
@@ -99,6 +100,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--device-compute é cpu ou cuda")
     if args.vram_budget_gb <= 0:
         parser.error("--vram-budget-gb precisa ser > 0")
+    if args.vram_expert_cache_gb < 0:
+        parser.error("--vram-expert-cache-gb precisa ser >= 0")
     return args
 
 
@@ -174,6 +177,7 @@ def main(argv: list[str] | None = None) -> int:
             k2=args.k2,
             compute_cuda=args.device_compute == "cuda",
             compute_elem=2 if _cuda_compute_is_bf16() else 4,
+            vram_expert_cache_bytes=int(args.vram_expert_cache_gb * 1024**3),
         )
         cgroup = estimate["cgroup_bytes"]
         fits_cgroup = cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
@@ -190,6 +194,7 @@ def main(argv: list[str] | None = None) -> int:
             "fits_cgroup_estimate": fits_cgroup,
             "fits_vram": fits_vram,
             "vram_budget_bytes": vram_budget,
+            "vram_expert_cache_gb": args.vram_expert_cache_gb,
             "expert_cache_slots": args.expert_cache,
             "expert_cache_max_bytes": args.expert_cache_bytes,
             "expert_prefetch_layers": args.expert_prefetch_layers,
@@ -238,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         model = OffloadLanguageModel(weights, router, store, rank=args.lora_rank, alpha=args.lora_alpha)
         model.set_expert_cache(args.expert_cache, args.expert_cache_bytes)
         model.set_expert_prefetch(args.expert_prefetch_layers, args.expert_prefetch_bytes)
+        model.set_vram_expert_cache(int(args.vram_expert_cache_gb * 1024**3))
         if args.device_compute == "cuda":
             torch.set_num_threads(host_compute_threads(os.cpu_count() or 1, True))
             model.set_compute_device(torch.device("cuda"), vram_budget)

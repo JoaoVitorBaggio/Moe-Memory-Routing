@@ -82,20 +82,26 @@ def estimate_vram_bytes(
     k2: int,
     rank: int,
     compute_elem: int,
+    vram_expert_cache_bytes: int = 0,
+    ce_bytes: int = 0,
 ) -> dict[str, int]:
-    """Duas camadas no device (a que computa e a que está copiando) mais a ativação."""
+    """Duas camadas de atenção, o cache de experts e a fatia da cabeça."""
 
     if min(hidden, n_heads, n_kv_heads, head_dim, intermediate, seq_len, k2, rank, compute_elem) < 1:
         raise ValueError("VRAM com dimensão < 1")
+    if vram_expert_cache_bytes < 0 or ce_bytes < 0:
+        raise ValueError("cache de VRAM e a cabeça precisam ser >= 0")
     attention = _attention_bytes(hidden, n_heads, n_kv_heads, head_dim, compute_elem)
     expert = _expert_bytes(hidden, intermediate, compute_elem)
     lora = k2 * 3 * (rank * hidden + intermediate * rank) * compute_elem
     activation = seq_len * hidden * compute_elem * 16 + seq_len * n_heads * seq_len * compute_elem
-    one = attention + k2 * expert
-    total = 2 * one + lora + activation + VRAM_OVERHEAD_BYTES
+    live_experts = 2 * k2 * expert
+    total = 2 * attention + live_experts + vram_expert_cache_bytes + lora + activation + ce_bytes + VRAM_OVERHEAD_BYTES
     return {
         "vram_attention_bytes": attention,
         "vram_experts_bytes": k2 * expert,
+        "vram_expert_cache_bytes": vram_expert_cache_bytes,
+        "vram_lm_head_bytes": ce_bytes,
         "vram_lora_bytes": lora,
         "vram_activation_bytes": activation,
         "vram_overhead_bytes": VRAM_OVERHEAD_BYTES,
@@ -112,6 +118,98 @@ def assert_vram_fits(vram_bytes: int, budget: int) -> None:
             f"VRAM estimada {vram_bytes} bytes passa de {budget}. "
             "Não carrego o modelo inteiro na GPU."
         )
+
+
+class VramExpertCache:
+    """Experts já na VRAM. O LRU não expulsa a camada que está computando.
+
+    O backward anda para trás, mas o uso (forward, recompute, backward)
+    toca o expert e o traz para o fim da fila. A camada corrente fica presa.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        if max_bytes < 0:
+            raise ValueError("cache de VRAM precisa ser >= 0")
+        self.max_bytes = max_bytes
+        self._items: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._order: list[tuple[int, int]] = []
+        self._sizes: dict[tuple[int, int], int] = {}
+        self._pinned: set[tuple[int, int]] = set()
+        self.stored_bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.avoided_bytes = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_bytes > 0
+
+    def set_pinned(self, keys: set[tuple[int, int]]) -> None:
+        self._pinned = set(keys)
+
+    def reset_counters(self) -> None:
+        self.hits = 0
+        self.misses = 0
+        self.avoided_bytes = 0
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._order.clear()
+        self._sizes.clear()
+        self._pinned.clear()
+        self.stored_bytes = 0
+
+    def take(self, key: tuple[int, int]):
+        if not self.enabled:
+            return None
+        found = self._items.get(key)
+        if found is None:
+            return None
+        self.hits += 1
+        self.avoided_bytes += self._sizes[key]
+        self._order.remove(key)
+        self._order.append(key)
+        return found
+
+    def note_miss(self) -> None:
+        if self.enabled:
+            self.misses += 1
+
+    def put(self, key: tuple[int, int], tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> None:
+        if not self.enabled or key in self._items:
+            if key in self._items:
+                self._order.remove(key)
+                self._order.append(key)
+            return
+        nbytes = sum(int(tensor.nbytes) for tensor in tensors)
+        if nbytes > self.max_bytes:
+            return
+        while self.stored_bytes + nbytes > self.max_bytes:
+            if not self._evict():
+                return
+        self._items[key] = tensors
+        self._sizes[key] = nbytes
+        self._order.append(key)
+        self.stored_bytes += nbytes
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "max_bytes": self.max_bytes,
+            "hits": self.hits,
+            "misses": self.misses,
+            "avoided_bytes": self.avoided_bytes,
+            "bytes": self.stored_bytes,
+        }
+
+    def _evict(self) -> bool:
+        for key in self._order:
+            if key in self._pinned:
+                continue
+            self._order.remove(key)
+            del self._items[key]
+            self.stored_bytes -= self._sizes.pop(key)
+            return True
+        return False
 
 
 @dataclass
@@ -140,9 +238,11 @@ class LayerTransport:
         self._compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self.h2d_bytes = 0
         self.d2h_bytes = 0
+        self.vram_cache = VramExpertCache(0)
 
     def close(self) -> None:
         self.reset()
+        self.vram_cache.clear()
 
     def reset(self) -> None:
         if self._pending_event is not None:
@@ -157,6 +257,18 @@ class LayerTransport:
         self._compute_events.clear()
         self.h2d_bytes = 0
         self.d2h_bytes = 0
+        self.vram_cache.reset_counters()
+
+    def set_vram_cache(self, max_bytes: int) -> None:
+        self.vram_cache = VramExpertCache(max_bytes)
+
+    def take_cached_expert(self, layer: int, expert: int):
+        return self.vram_cache.take((layer, expert))
+
+    def remember_expert(self, layer: int, expert: int, tensors, *, miss: bool) -> None:
+        if miss:
+            self.vram_cache.note_miss()
+        self.vram_cache.put((layer, expert), tensors)
 
     def ensure(self, layer_index: int, layer, blobs: dict[tuple[int, int], tuple[bytes, bytes, bytes]]) -> _Pack:
         if self._ready is not None and self._ready_index == layer_index:
