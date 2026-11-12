@@ -1,14 +1,14 @@
 """WikiText-2 cru já em cache, tokenizado com o vocabulário do Qwen.
 
-Não chama o Hub e não usa o GPT-2. O split de teste não entra no treino
-nem na avaliação. A avaliação usa o split ``validation``, em janelas
-contíguas e sem embaralhar. Ele é outro arquivo, então não reparte uma
-janela com o ``train``. O loader não repete época: se acabam as janelas,
-o treino para.
+Não chama o Hub e não usa o GPT-2. O treino e a avaliação do meio do
+treino usam ``train`` e ``validation``. O ``test`` fica para o
+``eval_ppl.py``. As janelas são contíguas, sem embaralhar e sem repetir.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -25,7 +25,8 @@ def holdout_note() -> str:
     return (
         "Treino: WikiText-2 raw, split train, janelas contíguas sem repetir. "
         "Avaliação: split validation, o mesmo tokenizador e o mesmo tamanho de janela. "
-        "O split test não entra. Train e validation são arquivos diferentes."
+        "O split test não entra neste hold-out; o eval_ppl.py lê o test à parte. "
+        "Train e validation são arquivos diferentes."
     )
 
 
@@ -124,3 +125,22 @@ def iter_token_windows(
         if produced >= limit:
             return
         window = emit()
+
+
+def paper_windows(texts: Iterator[str], tokenizer: QwenTokenizer, *, context_len: int, eval_tokens: int) -> list[list[int]]:
+    """Menor prefixo de janelas cuja loss cobre pelo menos ``eval_tokens`` tokens."""
+
+    if context_len < 2 or eval_tokens < 1:
+        raise ValueError("contexto >= 2 e eval-tokens >= 1")
+    per_window = context_len - 1
+    limit = (eval_tokens + per_window - 1) // per_window
+    return list(iter_token_windows(texts, tokenizer, seq_len=context_len, limit=limit))
+
+
+def windows_sha256(windows: list[list[int]]) -> str:
+    blob = json.dumps(windows, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def target_tokens(windows: list[list[int]]) -> int:
+    return sum(len(window) - 1 for window in windows)

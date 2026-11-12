@@ -1,8 +1,13 @@
-"""Gate original do Qwen3, congelado, com o top-k do config.
+"""Gate original do Qwen3, congelado.
 
 Não cria LSTM. O score é a projeção linear do hidden da camada, a
-softmax e o top-k renormalizado (``norm_topk_prob``). A escolha e o
-peso saem sem gradiente: a LoRA treina pelo expert, o gate não.
+softmax e o top-k renormalizado (``norm_topk_prob``). Sem ``--qwen-topk``
+o K é o ``num_experts_per_tok`` do config, 8 no Qwen3-30B-A3B: é a
+escolha original. ``--qwen-topk 4`` pega os quatro maiores e renormaliza
+do mesmo jeito. O treino LSTM executa ``k1`` experts por token e por
+camada; ``k2`` é o morno e ``b2`` limita experts novos. K igual a ``k1``
+iguala o número de experts que o MoE realmente calcula. No L1, ``k1`` é 4.
+A escolha e o peso saem sem gradiente: a LoRA treina pelo expert, o gate não.
 """
 
 from __future__ import annotations

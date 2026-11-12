@@ -237,6 +237,7 @@ def estimate_bytes(
     sparse_adam_steps: int = 0,
     trainable_lora: bool = True,
     trainable_lstm: bool = True,
+    vram_k: int | None = None,
 ) -> dict[str, int | None]:
     """Teto do anon com a cabeça e o expert em pedaços. Não inclui o store inteiro.
 
@@ -335,13 +336,14 @@ def estimate_bytes(
             raise ValueError("a estimativa da GPU precisa das dimensões da atenção")
         from moe_memory.offload.lm_gpu import estimate_pinned_bytes, estimate_vram_bytes
 
+        live_k = max(k2 if vram_k is None else vram_k, 1)
         pinned = estimate_pinned_bytes(
             hidden=hidden,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
             intermediate=intermediate,
-            k2=max(k2, 1),
+            k2=live_k,
         )
         vram = estimate_vram_bytes(
             hidden=hidden,
@@ -350,7 +352,7 @@ def estimate_bytes(
             head_dim=head_dim,
             intermediate=intermediate,
             seq_len=seq_len,
-            k2=max(k2, 1),
+            k2=live_k,
             rank=rank,
             compute_elem=compute_elem,
             vram_expert_cache_bytes=max(0, vram_expert_cache_bytes),
