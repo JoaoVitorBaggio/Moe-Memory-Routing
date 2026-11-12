@@ -17,6 +17,11 @@ from dataclasses import dataclass
 import torch
 
 VRAM_OVERHEAD_BYTES = 256 * 1024**2
+# Pico medido na 1060 com cache de 3 GiB e o top-8: 5478979584 bytes.
+# A fórmula daquele desenho ficava perto de 4,2 GiB. A diferença entra
+# só no encaixe do modo qwen, para o cache encolher antes do check_budget.
+QWEN_VRAM_MEASURED_PEAK = 5_478_979_584
+QWEN_VRAM_FIT_SLACK = 1024**3
 
 
 def compute_dtype_for(device: torch.device) -> torch.dtype:
@@ -108,6 +113,21 @@ def estimate_vram_bytes(
         "vram_layers_on_device": 2,
         "vram_bytes": total,
     }
+
+
+def fit_vram_cache(formula_bytes: int, requested_cache: int, budget: int, slack: int) -> int:
+    """Maior cache que não passa de ``requested`` e deixa a fórmula mais a folga no orçamento.
+
+    ``formula_bytes`` já inclui ``requested_cache``. O restante da conta não muda
+    quando o cache encolhe. Folga zero devolve o pedido se a fórmula já cabe.
+    """
+
+    if requested_cache < 0 or budget < 1 or slack < 0 or formula_bytes < requested_cache:
+        raise ValueError("cache, orçamento ou fórmula inválidos")
+    room = budget - slack - (formula_bytes - requested_cache)
+    if room <= 0:
+        return 0
+    return min(requested_cache, room)
 
 
 def assert_vram_fits(vram_bytes: int, budget: int) -> None:

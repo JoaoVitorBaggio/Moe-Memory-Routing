@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import torch
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
-from moe_memory.offload.lm_gpu import host_compute_threads
+from moe_memory.offload.lm_gpu import QWEN_VRAM_FIT_SLACK, fit_vram_cache, host_compute_threads
 from moe_memory.offload.lm_train import (
     LAUNCH_CEILING_BYTES,
     OffloadLanguageModel,
@@ -61,6 +61,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=Path("outputs/qwen-lm-smoke"))
     parser.add_argument("--steps", type=int, default=2)
     parser.add_argument("--router", choices=("lstm", "qwen"), default="lstm")
+    parser.add_argument(
+        "--qwen-topk",
+        type=int,
+        default=None,
+        help="Top-k do gate original. Omitido usa o num_experts_per_tok (8). K=k1 iguala o LSTM.",
+    )
     parser.add_argument("--eval-every", type=int, default=0)
     parser.add_argument("--eval-batches", type=int, default=1)
     parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
@@ -131,6 +137,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("steps precisa ser >= 0")
     if args.steps == 0 and (args.router != "qwen" or args.eval_batches < 1):
         parser.error("steps 0 é a avaliação do Qwen original: --router qwen e --eval-batches >= 1")
+    if args.qwen_topk is not None and (args.router != "qwen" or args.qwen_topk < 1):
+        parser.error("--qwen-topk pede --router qwen e K >= 1")
     if args.eval_every < 0 or args.eval_batches < 1:
         parser.error("--eval-every >= 0 e --eval-batches >= 1")
     if args.warmup_steps < 0 or args.lr_min < 0 or args.checkpoint_every < 0:
@@ -206,6 +214,11 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise SystemExit("config.json não fecha com o cabeçalho do store")
         resident_bytes = resident_path.stat().st_size
+        qwen_topk = spec.experts_per_tok if args.qwen_topk is None else args.qwen_topk
+        if args.router == "qwen" and qwen_topk > spec.n_experts:
+            raise SystemExit(f"qwen-topk {qwen_topk} passa de {spec.n_experts} experts")
+        vram_k = qwen_topk if args.router == "qwen" else None
+        requested_cache = int(args.vram_expert_cache_gb * 1024**3)
         estimate = estimate_bytes(
             resident_bytes=resident_bytes,
             vocab=spec.vocab_size,
@@ -228,19 +241,56 @@ def main(argv: list[str] | None = None) -> int:
             k2=args.k2,
             compute_cuda=args.device_compute == "cuda",
             compute_elem=2 if _cuda_compute_is_bf16() else 4,
-            vram_expert_cache_bytes=int(args.vram_expert_cache_gb * 1024**3),
+            vram_expert_cache_bytes=requested_cache,
             lm_head_vram=args.lm_head_vram,
             vram_cache_elem=2 if args.vram_cache_dtype == "bf16" else 4,
             sparse_adam_steps=args.steps if args.sparse_adamw and args.steps > 0 else 0,
             trainable_lora=args.steps > 0,
             trainable_lstm=args.router == "lstm" and args.steps > 0,
+            vram_k=vram_k,
         )
+        cache_bytes = requested_cache
+        vram_slack = 0
+        if args.router == "qwen" and args.device_compute == "cuda":
+            vram_slack = QWEN_VRAM_FIT_SLACK
+            cache_bytes = fit_vram_cache(int(estimate["vram_bytes"]), requested_cache, int(args.vram_budget_gb * 1024**3), vram_slack)
+            if cache_bytes != requested_cache:
+                estimate = estimate_bytes(
+                    resident_bytes=resident_bytes,
+                    vocab=spec.vocab_size,
+                    hidden=spec.hidden_size,
+                    intermediate=spec.moe_intermediate,
+                    n_layers=spec.n_layers,
+                    n_experts=spec.n_experts,
+                    rank=args.lora_rank,
+                    seq_len=args.seq_len,
+                    k1=args.k1,
+                    lstm_embed=args.lstm_embed,
+                    lstm_hidden=args.lstm_hidden,
+                    n_heads=spec.n_heads,
+                    n_kv_heads=spec.n_kv_heads,
+                    head_dim=spec.head_dim,
+                    expert_cache_slots=args.expert_cache,
+                    expert_cache_max_bytes=args.expert_cache_bytes,
+                    expert_prefetch_layers=args.expert_prefetch_layers,
+                    expert_prefetch_bytes=args.expert_prefetch_bytes,
+                    k2=args.k2,
+                    compute_cuda=True,
+                    compute_elem=2 if _cuda_compute_is_bf16() else 4,
+                    vram_expert_cache_bytes=cache_bytes,
+                    lm_head_vram=args.lm_head_vram,
+                    vram_cache_elem=2 if args.vram_cache_dtype == "bf16" else 4,
+                    sparse_adam_steps=args.steps if args.sparse_adamw and args.steps > 0 else 0,
+                    trainable_lora=args.steps > 0,
+                    trainable_lstm=False,
+                    vram_k=vram_k,
+                )
         checkpoint_bytes = int(estimate["lora_fp32_bytes"] + estimate["adam_lora_bytes"] + estimate["lstm_with_adam_bytes"] - estimate["lstm_grad_bytes"])
         cgroup = estimate["cgroup_bytes"]
         fits_cgroup = cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
         fits = launch_allowed(estimate)
         vram_budget = int(args.vram_budget_gb * 1024**3)
-        fits_vram = args.device_compute == "cpu" or int(estimate["vram_bytes"]) <= vram_budget
+        fits_vram = args.device_compute == "cpu" or int(estimate["vram_bytes"]) + vram_slack <= vram_budget
         summary = {
             "kind": "qwen-lm-lora-lstm-smoke",
             "device": "cpu",
@@ -252,6 +302,9 @@ def main(argv: list[str] | None = None) -> int:
             "fits_vram": fits_vram,
             "vram_budget_bytes": vram_budget,
             "vram_expert_cache_gb": args.vram_expert_cache_gb,
+            "vram_expert_cache_bytes_used": cache_bytes,
+            "qwen_topk": qwen_topk if args.router == "qwen" else None,
+            "qwen_vram_slack_bytes": vram_slack,
             "vram_cache_dtype": args.vram_cache_dtype,
             "lm_head_vram": args.lm_head_vram,
             "prefetch_vram_aware": args.prefetch_vram_aware,
@@ -304,7 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 vocab_size=spec.vocab_size,
                 n_layers=spec.n_layers,
                 n_experts=spec.n_experts,
-                experts_per_tok=spec.experts_per_tok,
+                experts_per_tok=qwen_topk,
             )
         else:
             router = TwoHorizonLstmRouter(
@@ -330,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         model.set_expert_cache(args.expert_cache, args.expert_cache_bytes)
         model.set_prefetch_vram_aware(args.prefetch_vram_aware)
         model.set_expert_prefetch(args.expert_prefetch_layers, args.expert_prefetch_bytes)
-        model.set_vram_expert_cache(int(args.vram_expert_cache_gb * 1024**3), args.vram_cache_dtype)
+        model.set_vram_expert_cache(cache_bytes, args.vram_cache_dtype)
         if args.device_compute == "cuda":
             torch.set_num_threads(host_compute_threads(os.cpu_count() or 1, True))
             model.set_compute_device(torch.device("cuda"), vram_budget)
