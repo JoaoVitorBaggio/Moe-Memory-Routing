@@ -205,6 +205,23 @@ Run de medição, perfil ou smoke que não precisa retomar usa `--no-checkpoint`
 
 `--device-compute cuda` calcula uma camada por vez na GPU. O padrão continua a CPU. O Adam, o gradiente da LoRA e o LSTM ficam na RAM. A cópia usa pinned e um stream separado; o pinned entra na conta da RAM do host. A 1060 não executa bf16, então o compute nela é fp32. Ampere ou mais novo pode usar bf16. O orçamento `--vram-budget-gb` (padrão 5) recusa o passo se a estimativa não cabe. Não sobe o modelo inteiro. `--vram-expert-cache-gb` guarda na VRAM os experts já copiados, para o recompute e o backward não repetirem o H2D. A entropia cruzada da cabeça sobe em fatias para a GPU quando o compute é cuda. O `--time-log` separa a espera da volta para a CPU (`d2h_wait_s`), o agrupamento dos experts (`moe_group_s`) e a subida da ativação (`h2d_activation_s`).
 
+Três flags nascem desligadas. `--lm-head-vram` sobe a cabeça uma vez, em bf16, e o backward reaproveita o máximo e o log Z do forward: uma passada em vez de três, com os mesmos kernels e a mesma ordem. A cópia da CPU sai quando a cabeça não divide o storage do embedding. Os bytes da cabeça entram em `h2d_bytes` e em `lm_head_h2d_bytes`; sem a flag, cada fatia que cruza para a GPU também entra em `h2d_bytes`. `--prefetch-vram-aware` não pede ao store uma chave que já está no cache de VRAM e lê o bloco num anel de `uint8` pinned. Se a chave sair da VRAM antes do uso, o passo lê do store. `prefetch_skipped_vram` e `prefetch_wasted` aparecem no timing mesmo com a flag desligada: o primeiro conta candidatos que já estavam na VRAM na hora do `arm`, o segundo conta leitura que não foi usada. `--vram-cache-dtype bf16` guarda o expert em bf16 e converte para fp32 na hora do uso. Em 3,0 GiB cabem 341 experts de 9437184 bytes. O padrão `fp32` é o armazenamento de hoje na 1060. `--vram-cache-sim 170,341` prevê o hit de um LRU simples sobre a sequência lógica de leituras; o cache real ainda prende a camada corrente.
+
+A conta da VRAM, com a cabeça inteira, o cache de 3,0 GiB e o resto de duas camadas, cabe em 5 GiB. Comando de medição:
+
+```
+systemd-run --user --scope \
+  -p MemoryMax=9663676416 -p MemorySwapMax=0 \
+  -p IOSchedulingClass=idle \
+  env MALLOC_ARENA_MAX=2 python3 scripts/train_qwen_lm.py \
+  --steps 3 --seq-len 32 --device cpu --device-compute cuda \
+  --vram-budget-gb 5 --vram-expert-cache-gb 3.0 \
+  --vram-cache-dtype bf16 --lm-head-vram --prefetch-vram-aware \
+  --expert-cache 0 --expert-prefetch-layers 1 \
+  --no-checkpoint --memory-log --time-log \
+  --out outputs/qwen-lm-vram-bf16
+```
+
 `--profile-step N` liga o `torch.profiler` só nesse passo, com atividade de CPU, formas gravadas e sem `profile_memory`. `--profile-stack` e `--profile-trace` ficam desligados: o trace chrome pode ficar grande. O buffer esperado, sem stack e sem trace, é de dezenas a poucas centenas de MB em cima do RSS já estável. Não foi medido na 1060.
 
 O gradiente da LoRA não passa mais por `SelectBackward` da fatia. Cada expert soma em `.grad[camada, expert]`. O zero do tensor inteiro, de até 201 MB, deixa de nascer a cada expert.

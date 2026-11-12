@@ -127,10 +127,18 @@ class VramExpertCache:
     toca o expert e o traz para o fim da fila. A camada corrente fica presa.
     """
 
-    def __init__(self, max_bytes: int) -> None:
+    def __init__(
+        self,
+        max_bytes: int,
+        dtype: torch.dtype = torch.float32,
+        compute_dtype: torch.dtype | None = None,
+    ) -> None:
         if max_bytes < 0:
             raise ValueError("cache de VRAM precisa ser >= 0")
         self.max_bytes = max_bytes
+        self.dtype = dtype
+        self.compute_dtype = compute_dtype or dtype
+        self.expert_nbytes = 0
         self._items: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._order: list[tuple[int, int]] = []
         self._sizes: dict[tuple[int, int], int] = {}
@@ -146,6 +154,14 @@ class VramExpertCache:
 
     def set_pinned(self, keys: set[tuple[int, int]]) -> None:
         self._pinned = set(keys)
+
+    def contains(self, key: tuple[int, int]) -> bool:
+        if not self.enabled:
+            return False
+        try:
+            return key in self._items
+        except RuntimeError:
+            return False
 
     def reset_counters(self) -> None:
         self.hits = 0
@@ -169,7 +185,7 @@ class VramExpertCache:
         self.avoided_bytes += self._sizes[key]
         self._order.remove(key)
         self._order.append(key)
-        return found
+        return self._for_compute(found)
 
     def note_miss(self) -> None:
         if self.enabled:
@@ -181,6 +197,8 @@ class VramExpertCache:
                 self._order.remove(key)
                 self._order.append(key)
             return
+        if tensors[0].dtype != self.dtype:
+            tensors = tuple(tensor.to(dtype=self.dtype) for tensor in tensors)
         nbytes = sum(int(tensor.nbytes) for tensor in tensors)
         if nbytes > self.max_bytes:
             return
@@ -192,14 +210,23 @@ class VramExpertCache:
         self._order.append(key)
         self.stored_bytes += nbytes
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | str]:
+        capacity = self.max_bytes // self.expert_nbytes if self.expert_nbytes else 0
         return {
             "max_bytes": self.max_bytes,
             "hits": self.hits,
             "misses": self.misses,
             "avoided_bytes": self.avoided_bytes,
             "bytes": self.stored_bytes,
+            "dtype": "bfloat16" if self.dtype == torch.bfloat16 else "float32",
+            "expert_nbytes": self.expert_nbytes,
+            "capacity_experts": capacity,
         }
+
+    def _for_compute(self, tensors):
+        if all(tensor.dtype == self.compute_dtype for tensor in tensors):
+            return tensors
+        return tuple(tensor.to(dtype=self.compute_dtype) for tensor in tensors)
 
     def _evict(self) -> bool:
         for key in self._order:
@@ -238,7 +265,9 @@ class LayerTransport:
         self._compute_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self.h2d_bytes = 0
         self.d2h_bytes = 0
-        self.vram_cache = VramExpertCache(0)
+        self.resident_h2d_bytes = 0
+        self._stored_for: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.vram_cache = VramExpertCache(0, compute_dtype=self.dtype)
 
     def close(self) -> None:
         self.reset()
@@ -257,10 +286,16 @@ class LayerTransport:
         self._compute_events.clear()
         self.h2d_bytes = 0
         self.d2h_bytes = 0
+        self._stored_for.clear()
         self.vram_cache.reset_counters()
 
-    def set_vram_cache(self, max_bytes: int) -> None:
-        self.vram_cache = VramExpertCache(max_bytes)
+    def set_vram_cache(self, max_bytes: int, dtype: torch.dtype | None = None) -> None:
+        storage = self.dtype if dtype is None else dtype
+        cache = VramExpertCache(max_bytes, dtype=storage, compute_dtype=self.dtype)
+        layout = self.model.store.layout
+        elem = torch.empty((), dtype=storage).element_size()
+        cache.expert_nbytes = 3 * layout.hidden * layout.intermediate * elem
+        self.vram_cache = cache
 
     def take_cached_expert(self, layer: int, expert: int):
         return self.vram_cache.take((layer, expert))
@@ -268,7 +303,9 @@ class LayerTransport:
     def remember_expert(self, layer: int, expert: int, tensors, *, miss: bool) -> None:
         if miss:
             self.vram_cache.note_miss()
-        self.vram_cache.put((layer, expert), tensors)
+        key = (layer, expert)
+        stored = self._stored_for.pop(key, None)
+        self.vram_cache.put(key, stored if stored is not None else tensors)
 
     def ensure(self, layer_index: int, layer, blobs: dict[tuple[int, int], tuple[bytes, bytes, bytes]]) -> _Pack:
         if self._ready is not None and self._ready_index == layer_index:
@@ -314,10 +351,26 @@ class LayerTransport:
         return None
 
     def h2d_now(self, layer: int, expert: int, blobs: tuple[bytes, bytes, bytes]):
-        gate, up, down = self._matrices(blobs, block=True)
+        gate, up, down = self._matrices(blobs, block=True, key=(layer, expert))
         if self._ready is not None:
             self._ready.experts[(layer, expert)] = (gate, up, down)
         return gate, up, down
+
+    def h2d_from_block(self, layer: int, expert: int, block: torch.Tensor):
+        from moe_memory.offload.blocks import split_block
+
+        views = split_block(block, self.model.store.layout, self.model.store_dtype)
+        compute, stored = self._place_views(views, block=True)
+        if stored[0].data_ptr() == views[0].data_ptr():
+            stored = tuple(tensor.clone() for tensor in stored)
+            if compute[0].data_ptr() == views[0].data_ptr():
+                compute = stored
+        key = (layer, expert)
+        if stored[0].dtype != self.dtype:
+            self._stored_for[key] = stored
+        if self._ready is not None:
+            self._ready.experts[key] = compute
+        return compute
 
     def note_compute(self, start: torch.cuda.Event, end: torch.cuda.Event) -> None:
         self._compute_events.append((start, end))
@@ -336,7 +389,7 @@ class LayerTransport:
                 "h2d_wait_s": float(self.model._times.get("h2d_wait_s", 0.0)),
                 "h2d_wait_backward_s": float(self.model._times.get("h2d_wait_backward_s", 0.0)),
                 "gpu_compute_s": 0.0,
-                "h2d_bytes": self.h2d_bytes,
+                "h2d_bytes": self.h2d_bytes + self.resident_h2d_bytes,
                 "d2h_bytes": self.d2h_bytes,
             }
         if self.device.type != "cuda":
@@ -346,7 +399,7 @@ class LayerTransport:
                 "h2d_wait_s": float(self.model._times.get("h2d_wait_s", 0.0)),
                 "h2d_wait_backward_s": float(self.model._times.get("h2d_wait_backward_s", 0.0)),
                 "gpu_compute_s": 0.0,
-                "h2d_bytes": self.h2d_bytes,
+                "h2d_bytes": self.h2d_bytes + self.resident_h2d_bytes,
                 "d2h_bytes": self.d2h_bytes,
             }
         torch.cuda.synchronize(self.device)
@@ -356,7 +409,7 @@ class LayerTransport:
             "h2d_wait_s": float(self.model._times.get("h2d_wait_s", 0.0)),
             "h2d_wait_backward_s": float(self.model._times.get("h2d_wait_backward_s", 0.0)),
             "gpu_compute_s": _elapsed(self._compute_events),
-            "h2d_bytes": self.h2d_bytes,
+            "h2d_bytes": self.h2d_bytes + self.resident_h2d_bytes,
             "d2h_bytes": self.d2h_bytes,
         }
 
@@ -401,7 +454,7 @@ class LayerTransport:
                 o_bias=self._h2d(layer.o_bias, pinned),
             )
             for key, raw in blobs.items():
-                experts[key] = self._matrices(raw, pinned)
+                experts[key] = self._matrices(raw, pinned, key=key)
         self._close_span(start, end, self._h2d_events)
         event = self._dependency_event()
         pack = _Pack(layer=view, experts=experts, pinned=pinned)
@@ -423,31 +476,56 @@ class LayerTransport:
         self.h2d_bytes += int(host.nbytes)
         return gpu
 
-    def _matrices(self, blobs: tuple[bytes, bytes, bytes], pinned: list[torch.Tensor] | None = None, block: bool = False):
+    def _matrices(
+        self,
+        blobs: tuple[bytes, bytes, bytes],
+        pinned: list[torch.Tensor] | None = None,
+        block: bool = False,
+        key: tuple[int, int] | None = None,
+    ):
         layout = self.model.store.layout
         shapes = (
             (layout.intermediate, layout.hidden),
             (layout.intermediate, layout.hidden),
             (layout.hidden, layout.intermediate),
         )
-        out = []
+        hosts = []
         hold = pinned if pinned is not None else []
+        for raw, shape in zip(blobs, shapes, strict=True):
+            host = _host_matrix(raw, self.model.store_dtype, shape)
+            hosts.append(host)
+        compute, stored = self._place_views(hosts, block=block, hold=hold)
+        if key is not None and stored[0].dtype != self.dtype:
+            self._stored_for[key] = stored
+        return compute
+
+    def _storage_dtype(self) -> torch.dtype:
+        if self.vram_cache.enabled:
+            return self.vram_cache.dtype
+        return self.dtype
+
+    def _place_views(self, hosts, *, block: bool, hold: list[torch.Tensor] | None = None):
+        bucket = hold if hold is not None else []
+        compute_out = []
+        stored_out = []
+        storage = self._storage_dtype()
         start, end = self._open_span() if block else (None, None)
         with self._copy_scope():
-            for raw, shape in zip(blobs, shapes, strict=True):
-                host = _host_matrix(raw, self.model.store_dtype, shape)
+            for host in hosts:
                 if self.device.type == "cuda" and not host.is_pinned():
                     host = host.pin_memory()
-                hold.append(host)
-                gpu = host.to(device=self.device, dtype=self.dtype, non_blocking=self.device.type == "cuda")
+                bucket.append(host)
+                stored = host.to(device=self.device, dtype=storage, non_blocking=self.device.type == "cuda")
                 self.h2d_bytes += int(host.nbytes)
-                out.append(gpu)
+                compute = stored if stored.dtype == self.dtype else stored.to(dtype=self.dtype)
+                compute_out.append(compute)
+                stored_out.append(stored)
         if block:
             self._close_span(start, end, self._h2d_events)
             self._sync_copy(self._dependency_event())
-            if pinned is None:
-                hold.clear()
-        return tuple(out)
+            if hold is None:
+                bucket.clear()
+        return tuple(compute_out), tuple(stored_out)
 
     def _copy_scope(self):
         if self.copy_stream is None:

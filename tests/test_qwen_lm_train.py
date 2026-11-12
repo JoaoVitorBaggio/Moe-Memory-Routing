@@ -297,6 +297,144 @@ def test_vram_expert_cache_does_not_evict_the_pinned_layer():
     assert cache.take((0, 1)) is None
     assert cache.hits == 1
     assert cache.avoided_bytes == 12
+    same = torch.ones(2)
+    plain = VramExpertCache(100)
+    plain.put((1, 0), (same, same, same))
+    assert plain.take((1, 0))[0] is same
+
+
+def test_bf16_vram_cache_returns_fp32_matching_the_direct_cast(tmp_path: Path):
+    from moe_memory.offload.lm_gpu import LayerTransport, VramExpertCache
+
+    source = torch.randn(4, 6, dtype=torch.bfloat16)
+    direct = source.float()
+    cache = VramExpertCache(source.nbytes * 3 * 2, dtype=torch.bfloat16, compute_dtype=torch.float32)
+    cache.expert_nbytes = source.nbytes * 3
+    cache.put((0, 0), (source, source, source))
+    cache.put((0, 1), (source.clone(), source.clone(), source.clone()))
+    assert cache.contains((0, 0)) and cache.contains((0, 1))
+    assert cache.stats()["capacity_experts"] == 2
+    taken = cache.take((0, 1))
+    assert taken[0].dtype == torch.float32
+    assert torch.equal(taken[0], direct)
+    wide = VramExpertCache(source.nbytes * 3 * 2, dtype=torch.float32, compute_dtype=torch.float32)
+    wide.put((0, 0), (direct, direct, direct))
+    wide.put((0, 1), (direct.clone(), direct.clone(), direct.clone()))
+    assert wide.contains((0, 1))
+    assert not wide.contains((0, 0))
+
+    model, store, _directory = _model(tmp_path)
+    try:
+        model.compute_device = torch.device("cpu")
+        model.compute_dtype = torch.float32
+        bf16 = LayerTransport(model)
+        fp32 = LayerTransport(model)
+        bf16.set_vram_cache(10**7, torch.bfloat16)
+        fp32.set_vram_cache(10**7, torch.float32)
+        hosts = (source, source, source)
+        got_bf16, stored = bf16._place_views(hosts, block=True)
+        got_fp32, _stored_fp32 = fp32._place_views(hosts, block=True)
+        assert stored[0].dtype == torch.bfloat16
+        assert got_bf16[0].dtype == torch.float32
+        assert torch.equal(got_bf16[0], got_fp32[0])
+        assert torch.equal(got_bf16[0], direct)
+    finally:
+        store.close()
+
+
+def test_lm_head_vram_keeps_the_step_identical(tmp_path: Path):
+    from moe_memory.offload.lm_train import lm_step, make_optimizer, release_cpu_lm_head
+
+    plain, store_plain, _left = _model(tmp_path / "plain")
+    flagged, store_flagged, _right = _model(tmp_path / "flag")
+    try:
+        flagged.enable_lm_head_vram()
+        assert flagged.lm_head_cpu_released is False
+        tokens = torch.tensor([[1, 2, 3, 4, 5, 6]])
+        left = lm_step(plain, make_optimizer(plain, 1e-3), tokens)
+        right = lm_step(flagged, make_optimizer(flagged, 1e-3), tokens)
+        assert left["loss"] == right["loss"]
+        for (name, base), (other_name, changed) in zip(plain.named_parameters(), flagged.named_parameters(), strict=True):
+            assert name == other_name
+            assert torch.equal(base, changed)
+            if base.grad is not None:
+                assert torch.equal(base.grad, changed.grad)
+    finally:
+        store_plain.close()
+        store_flagged.close()
+
+    shared = torch.randn(4, 3)
+    tied = type("Weights", (), {"embed": shared, "lm_head": shared})()
+    assert release_cpu_lm_head(tied, torch.randn(4, 3), "cuda") is False
+    assert tied.lm_head.data_ptr() == shared.data_ptr()
+    loose = type("Weights", (), {"embed": torch.randn(4, 3), "lm_head": torch.randn(4, 3)})()
+    stored = torch.randn(4, 3)
+    assert release_cpu_lm_head(loose, stored, "cuda") is True
+    assert loose.lm_head is stored
+    assert release_cpu_lm_head(loose, stored, "cpu") is False
+
+
+def test_recommended_vram_budget_fits_in_5gib():
+    from moe_memory.offload.lm_gpu import assert_vram_fits
+
+    budget = 5 * 1024**3
+    head = 151_936 * 2048 * 2
+    estimate = estimate_bytes(
+        resident_bytes=3_082_214_946,
+        vocab=151_936,
+        hidden=2048,
+        intermediate=768,
+        n_layers=48,
+        n_experts=128,
+        rank=4,
+        seq_len=32,
+        k1=4,
+        lstm_embed=64,
+        lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=9_663_676_416,
+        read_cgroup=False,
+        expert_cache_slots=0,
+        expert_prefetch_layers=1,
+        k2=6,
+        compute_cuda=True,
+        compute_elem=4,
+        vram_expert_cache_bytes=3 * 1024**3,
+        lm_head_vram=True,
+        vram_cache_elem=2,
+    )
+    assert estimate["vram_lm_head_bytes"] == head
+    assert estimate["vram_cache_capacity_experts"] == 341
+    assert estimate["vram_expert_cache_bytes"] == 3 * 1024**3
+    assert estimate["vram_bytes"] <= budget
+    assert_vram_fits(int(estimate["vram_bytes"]), budget)
+    base = estimate_bytes(
+        resident_bytes=3_082_214_946,
+        vocab=151_936,
+        hidden=2048,
+        intermediate=768,
+        n_layers=48,
+        n_experts=128,
+        rank=4,
+        seq_len=32,
+        k1=4,
+        lstm_embed=64,
+        lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=9_663_676_416,
+        read_cgroup=False,
+        expert_cache_slots=0,
+        expert_prefetch_layers=1,
+        k2=6,
+        compute_cuda=True,
+        compute_elem=4,
+        vram_expert_cache_bytes=3 * 1024**3,
+    )
+    assert estimate["total_bytes"] == base["total_bytes"] - head
 
 
 def test_gpu_path_on_cpu_counts_the_ram_cache_and_reuses_vram(tmp_path: Path):

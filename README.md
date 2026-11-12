@@ -112,7 +112,7 @@ python3 -m pytest
 | `notebooks/` | Exploração |
 | `results/` | Resumos em Markdown (loss, hold-out, dose de `B`, proxy×emulador, comparação) e as figuras SVG do proxy. O índice está em [`results/README.md`](results/README.md). |
 
-Documentação em português do Brasil. Não versionar checkpoint, dataset baixado nem resultado grande (veja `.gitignore`). Medição do smoke Qwen (`scripts/train_qwen_lm.py`) e corrida de teste que não precisa retomar usam `--no-checkpoint`, para não gravar `checkpoint/` nem `checkpoint.pt`.
+Documentação em português do Brasil. Não versionar checkpoint, dataset baixado nem resultado grande (veja `.gitignore`). Medição do smoke Qwen (`scripts/train_qwen_lm.py`) e corrida de teste que não precisa retomar usam `--no-checkpoint`, para não gravar `checkpoint/` nem `checkpoint.pt`. No compute CUDA, a medição que cabe em 5 GiB de VRAM é `--vram-budget-gb 5 --vram-expert-cache-gb 3.0 --vram-cache-dtype bf16 --lm-head-vram --prefetch-vram-aware --expert-cache 0 --expert-prefetch-layers 1 --no-checkpoint`. As três flags de VRAM nascem desligadas.
 
 ## Integrantes
 
