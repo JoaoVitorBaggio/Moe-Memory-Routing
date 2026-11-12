@@ -21,6 +21,7 @@ from moe_memory.offload.lm_train import (
     load_checkpoint,
     make_optimizer,
     pascal_bf16_cuda_ok,
+    persist_checkpoint,
     save_checkpoint,
 )
 from moe_memory.offload.qwen import KvCache, _attention, load_resident, load_spec
@@ -532,6 +533,69 @@ def test_windows_keep_train_text_apart_from_validation(tmp_path: Path):
     assert len(windows) == 2
     skipped = list(iter_token_windows(iter_arrow_text(train), tokenizer, seq_len=4, limit=1, skip=1))
     assert skipped == windows[1:]
+
+
+def test_no_checkpoint_skips_files_and_marks_the_summary(tmp_path: Path):
+    model, store, _directory = _model(tmp_path / "model")
+    try:
+        optimizer = make_optimizer(model, 1e-3)
+        loss_before = lm_step(model, optimizer, torch.tensor([[1, 2, 3, 4, 5, 6]]))["loss"]
+        def refuse_state(*_args, **_kwargs):
+            raise AssertionError("não montar state_dict com --no-checkpoint")
+        model.state_dict = refuse_state
+        model.named_parameters = refuse_state
+        model.lora.state_dict = refuse_state
+        model.router.state_dict = refuse_state
+        optimizer.state = refuse_state
+        out = tmp_path / "out"
+        saved = persist_checkpoint(
+            False,
+            out / "checkpoint",
+            step=1,
+            model=model,
+            optimizer=optimizer,
+            extra={"seq_len": 6},
+        )
+        assert saved is False
+        out.mkdir()
+        summary = {"checkpoint_saved": saved, "checkpoint": None, "steps": [{"loss": loss_before}]}
+        (out / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        loaded = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+        assert loaded["checkpoint_saved"] is False
+        assert loaded["checkpoint"] is None
+        assert loaded["steps"][0]["loss"] == loss_before
+        assert not (out / "checkpoint").exists()
+        assert not (out / "checkpoint.pt").exists()
+        assert list(out.rglob("*.bin")) == []
+    finally:
+        store.close()
+
+
+def test_default_checkpoint_still_saves(tmp_path: Path):
+    model, store, _directory = _model(tmp_path / "model")
+    try:
+        optimizer = make_optimizer(model, 1e-3)
+        stats = lm_step(model, optimizer, torch.tensor([[1, 2, 3, 4, 5, 6]]))
+        out = tmp_path / "out"
+        checkpoint = out / "checkpoint"
+        saved = persist_checkpoint(
+            True,
+            checkpoint,
+            step=1,
+            model=model,
+            optimizer=optimizer,
+            extra={"seq_len": 6},
+        )
+        assert saved is True
+        assert (checkpoint / "meta.json").is_file()
+        assert list((checkpoint / "weights").glob("*.bin"))
+        summary = {"checkpoint_saved": saved, "checkpoint": str(checkpoint), "steps": [{"loss": stats["loss"]}]}
+        (out / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+        loaded = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+        assert loaded["checkpoint_saved"] is True
+        assert loaded["steps"][0]["loss"] == stats["loss"]
+    finally:
+        store.close()
 
 
 def _write_arrow(path: Path, rows: list[str]) -> None:

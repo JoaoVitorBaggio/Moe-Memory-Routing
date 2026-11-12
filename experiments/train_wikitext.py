@@ -125,6 +125,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--work-dir", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--checkpoint-every", type=int, default=DEFAULT_CHECKPOINT_EVERY)
+    parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="Não grava checkpoint.pt, nem no --checkpoint-every. O log e o done.json continuam.",
+    )
     args = parser.parse_args(argv)
     if args.steps is None and args.epochs is None:
         args.epochs = 1
@@ -280,6 +285,8 @@ def train(args: argparse.Namespace) -> None:
     }
 
     def save() -> None:
+        if args.no_checkpoint:
+            return
         _write_checkpoint(state)
 
     if _target_met(cursor, args):
@@ -290,7 +297,12 @@ def train(args: argparse.Namespace) -> None:
     while not _target_met(cursor, args):
         if _STOP["now"]:
             save()
-            die(EXIT_INTERRUPT, "interrompido; checkpoint no último passo completo")
+            die(
+                EXIT_INTERRUPT,
+                "interrompido; checkpoint não foi gravado"
+                if args.no_checkpoint
+                else "interrompido; checkpoint no último passo completo",
+            )
         if cursor["sequence_cursor"] >= n_sequences:
             cursor["epochs_completed"] += 1
             cursor["epoch"] += 1
@@ -351,7 +363,12 @@ def train(args: argparse.Namespace) -> None:
         )
         if _STOP["now"]:
             save()
-            die(EXIT_INTERRUPT, "interrompido; checkpoint no último passo completo")
+            die(
+                EXIT_INTERRUPT,
+                "interrompido; checkpoint não foi gravado"
+                if args.no_checkpoint
+                else "interrompido; checkpoint no último passo completo",
+            )
     save()
     _finish(state, args, log_path)
 
@@ -629,6 +646,7 @@ def _finish(state: dict[str, Any], args: argparse.Namespace, log_path: Path) -> 
         "target_steps": args.steps,
         "target_epochs": args.epochs,
         "finite": True,
+        "checkpoint_saved": not args.no_checkpoint,
         "last_total": None if last is None else last.get("total"),
         "last_task": None if last is None else last.get("task"),
         "last_grad_norm": None if last is None else last.get("grad_norm"),

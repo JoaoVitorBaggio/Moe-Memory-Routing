@@ -36,10 +36,10 @@ from moe_memory.offload.lm_train import (
     rss_bytes,
     ru_maxrss_bytes,
     make_optimizer,
+    persist_checkpoint,
     profile_lm_step,
     refuse_cuda_bf16,
     release_step_memory,
-    save_checkpoint,
 )
 from moe_memory.offload.qwen import load_resident, load_spec
 from moe_memory.offload.store import ExpertStore
@@ -83,6 +83,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--expert-prefetch-bytes", type=int, default=0)
     parser.add_argument("--expert-cache-sim", default="32,64,128")
     parser.add_argument("--valid-forward", action="store_true")
+    parser.add_argument(
+        "--no-checkpoint",
+        action="store_true",
+        help="Não grava weights/, optim/ nem checkpoint.pt. O summary.json continua.",
+    )
     args = parser.parse_args(argv)
     if args.steps < 1 or args.seq_len < 2:
         parser.error("steps >= 1 e seq-len >= 2")
@@ -319,27 +324,30 @@ def main(argv: list[str] | None = None) -> int:
         model.release_expert_cache()
         args.out.mkdir(parents=True, exist_ok=True)
         checkpoint = args.out / "checkpoint"
-        checkpoint_started = time.perf_counter()
-        save_checkpoint(
-            checkpoint,
-            step=args.steps,
-            model=model,
-            optimizer=optimizer,
-            extra={"windows": windows, "seed": args.seed, "seq_len": args.seq_len},
-        )
-        checkpoint_s = time.perf_counter() - checkpoint_started
-        if args.memory_log or args.time_log:
-            print(
-                json.dumps(
-                    {
-                        "phase": "checkpoint",
-                        "checkpoint_save_s": checkpoint_s,
-                        "rss_bytes": rss_bytes(),
-                        "ru_maxrss_bytes": ru_maxrss_bytes(),
-                    }
-                ),
-                flush=True,
+        checkpoint_saved = False
+        if not args.no_checkpoint:
+            checkpoint_started = time.perf_counter()
+            checkpoint_saved = persist_checkpoint(
+                True,
+                checkpoint,
+                step=args.steps,
+                model=model,
+                optimizer=optimizer,
+                extra={"windows": windows, "seed": args.seed, "seq_len": args.seq_len},
             )
+            checkpoint_s = time.perf_counter() - checkpoint_started
+            if args.memory_log or args.time_log:
+                print(
+                    json.dumps(
+                        {
+                            "phase": "checkpoint",
+                            "checkpoint_save_s": checkpoint_s,
+                            "rss_bytes": rss_bytes(),
+                            "ru_maxrss_bytes": ru_maxrss_bytes(),
+                        }
+                    ),
+                    flush=True,
+                )
         after = {
             "store": fingerprint(store_path),
             "resident": fingerprint(resident_path),
@@ -352,7 +360,8 @@ def main(argv: list[str] | None = None) -> int:
             "valid_loss": valid_loss,
             "tokenizer_probe_hello": probe,
             "eos_id": tokenizer.eos_id,
-            "checkpoint": str(checkpoint),
+            "checkpoint_saved": checkpoint_saved,
+            "checkpoint": str(checkpoint) if checkpoint_saved else None,
             "store_fingerprint": after["store"],
             "resident_fingerprint": after["resident"],
             "note": (
@@ -361,7 +370,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }
         (args.out / "summary.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(json.dumps({"checkpoint": str(checkpoint), "valid_loss": valid_loss, "store_unchanged": True}))
+        print(json.dumps({"checkpoint_saved": checkpoint_saved, "checkpoint": str(checkpoint) if checkpoint_saved else None, "valid_loss": valid_loss, "store_unchanged": True}))
         return 0
     finally:
         if model is not None:
