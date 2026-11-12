@@ -30,7 +30,9 @@ import ctypes
 import gc
 import hashlib
 import json
+import math
 import resource
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -233,6 +235,8 @@ def estimate_bytes(
     lm_head_vram: bool = False,
     vram_cache_elem: int = 4,
     sparse_adam_steps: int = 0,
+    trainable_lora: bool = True,
+    trainable_lstm: bool = True,
 ) -> dict[str, int | None]:
     """Teto do anon com a cabeça e o expert em pedaços. Não inclui o store inteiro.
 
@@ -248,8 +252,8 @@ def estimate_bytes(
         raise ValueError("o elemento do cache de VRAM precisa ser >= 1")
     if sparse_adam_steps < 0:
         raise ValueError("os passos do Adam esparso precisam ser >= 0")
-    lora = n_layers * n_experts * 3 * rank * (hidden + intermediate) * 4
-    lstm_params = (
+    lora = n_layers * n_experts * 3 * rank * (hidden + intermediate) * 4 if trainable_lora else 0
+    lstm_params = 0 if not trainable_lstm else (
         vocab * lstm_embed
         + 4 * lstm_hidden * lstm_embed
         + 4 * lstm_hidden * lstm_hidden
@@ -432,6 +436,7 @@ class OffloadLanguageModel(nn.Module):
         *,
         rank: int = 4,
         alpha: float = 8.0,
+        use_lora: bool = True,
     ) -> None:
         super().__init__()
         spec = weights.spec
@@ -444,7 +449,15 @@ class OffloadLanguageModel(nn.Module):
         self.weights = weights
         self.store = store
         self.router = router
-        self.lora = ExpertLoRA(spec.n_layers, spec.n_experts, spec.hidden_size, spec.moe_intermediate, rank, alpha)
+        self.router_kind = getattr(router, "kind", "lstm")
+        self.use_lora = use_lora
+        if use_lora:
+            self.lora = ExpertLoRA(spec.n_layers, spec.n_experts, spec.hidden_size, spec.moe_intermediate, rank, alpha)
+            self._lora_scale = self.lora.scale
+        else:
+            self.lora = None
+            self._lora_scale = 0.0
+            self._lora_zero = _zero_lora_bank(spec.hidden_size, spec.moe_intermediate)
         self.store_dtype = torch_dtype(store.header.dtype_code)
         self.memory_log = False
         self.time_log = False
@@ -480,22 +493,34 @@ class OffloadLanguageModel(nn.Module):
         if token_ids.shape[1] < 2:
             raise ValueError("a janela precisa de ao menos 2 tokens")
         _EXPERT_STATE["model"] = self
-        started = time.perf_counter()
-        with _region("router_plan"):
-            plan, _state = self.router.plan(token_ids)
-        self._add_time("router_plan_s", time.perf_counter() - started)
-        if self.prefetch.enabled or self.gpu is not None:
-            self._expert_plan = experts_by_layer(plan)
-            if self.prefetch.enabled:
-                self.prefetch.set_plan(self._expert_plan)
+        qwen = self.router_kind == "qwen"
+        self._qwen_routes = []
+        if qwen:
+            plan = None
+            self._expert_plan = []
+        else:
+            started = time.perf_counter()
+            with _region("router_plan"):
+                plan, _state = self.router.plan(token_ids)
+            self._add_time("router_plan_s", time.perf_counter() - started)
+            if self.prefetch.enabled or self.gpu is not None:
+                self._expert_plan = experts_by_layer(plan)
+                if self.prefetch.enabled:
+                    self.prefetch.set_plan(self._expert_plan)
         hidden = self._embed(token_ids)
         self._phase("embed")
         spec = self.weights.spec
+        seq = token_ids.shape[1]
         for layer_index in range(spec.n_layers):
             self._phase(f"layer-{layer_index}")
-            coeffs = plan.soft_weights[:, :, layer_index, :]
-            index = plan.hot_index[:, :, layer_index, :]
-            valid = plan.hot_valid[:, :, layer_index, :]
+            if qwen:
+                coeffs = torch.zeros(1, seq, 1)
+                index = torch.zeros(1, seq, 1, dtype=torch.long)
+                valid = torch.zeros(1, seq, 1, dtype=torch.bool)
+            else:
+                coeffs = plan.soft_weights[:, :, layer_index, :]
+                index = plan.hot_index[:, :, layer_index, :]
+                valid = plan.hot_valid[:, :, layer_index, :]
             hidden = checkpoint(
                 self._layer,
                 hidden,
@@ -524,6 +549,8 @@ class OffloadLanguageModel(nn.Module):
             )
         self._add_time("cross_entropy_forward_s", time.perf_counter() - started)
         self._phase("loss")
+        if qwen:
+            plan = _stack_qwen_routes(self._qwen_routes)
         return loss, plan
 
     def _embed(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -620,6 +647,8 @@ class OffloadLanguageModel(nn.Module):
         started = time.perf_counter()
         moe_in = rms_norm(hidden, _as(layer.post_norm, hidden), spec.rms_eps)
         self._add_time(self._phase_key("resident_s"), time.perf_counter() - started)
+        if self.router_kind == "qwen":
+            index, valid, coeffs = self._route_qwen(moe_in, layer, layer_index)
         hidden = hidden + self._moe(moe_in, layer_index, index, valid, coeffs)
         return hidden
 
@@ -643,6 +672,8 @@ class OffloadLanguageModel(nn.Module):
         with _region(f"attention_layer_{layer_index}"):
             hidden_g = hidden_g + _attention_seq(pack.layer, normed, spec)
         moe_in = rms_norm(hidden_g, _as(pack.layer.post_norm, hidden_g), spec.rms_eps)
+        if self.router_kind == "qwen":
+            index, valid, coeffs_g = self._route_qwen(moe_in, layer, layer_index)
         hidden_g = hidden_g + self._moe(moe_in, layer_index, index, valid, coeffs_g)
         if compute_start is not None:
             compute_end = torch.cuda.Event(enable_timing=True)
@@ -686,6 +717,20 @@ class OffloadLanguageModel(nn.Module):
     def _count_ram_hit(self, key: tuple[int, int]) -> None:
         if self.expert_cache.enabled:
             self.expert_cache.touch(key)
+
+    def _route_qwen(self, moe_in: torch.Tensor, layer, layer_index: int):
+        from moe_memory.offload.qwen_gate import route_qwen
+
+        if layer.gate is None:
+            raise RuntimeError("o modo qwen precisa do gate residente")
+        index, valid, coeffs = route_qwen(moe_in, layer.gate, self.router.k2)
+        keys = {(layer_index, int(expert)) for expert in index.detach().reshape(-1).tolist()}
+        self.expert_cache.set_pinned(keys)
+        if self.gpu is not None:
+            self.gpu.vram_cache.set_pinned(keys)
+        if self._io_phase == "forward":
+            self._qwen_routes.append((index.detach().cpu(), valid.detach().cpu(), coeffs.detach().to(device="cpu", dtype=torch.float32)))
+        return index, valid, coeffs
 
     def _moe(self, hidden, layer_index, index, valid, coeffs):
         flat = hidden[0]
@@ -920,7 +965,8 @@ class OffloadLanguageModel(nn.Module):
 
 def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token_ids: torch.Tensor) -> dict[str, float | int | bool]:
     model.router.train()
-    model.lora.train()
+    if model.lora is not None:
+        model.lora.train()
     optimizer.zero_grad(set_to_none=True)
     model.begin_step_timing()
     wall = time.perf_counter()
@@ -952,7 +998,7 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     report["loss"] = float(loss.detach())
     report["distinct_experts"] = distinct_experts(plan)
     report["hot_entropy"] = _hot_entropy(plan)
-    report["router_entropy"] = _router_entropy(model, token_ids)
+    report["router_entropy"] = None if model.router_kind == "qwen" else _router_entropy(model, token_ids)
     del loss, plan
     started = time.perf_counter()
     release_step_memory(optimizer)
@@ -978,6 +1024,106 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
         report["time"] = model.timing_report(time.perf_counter() - wall)
     model._phase("after-step")
     return report
+
+
+def scheduled_lr(
+    step: int,
+    total: int,
+    base: float,
+    *,
+    warmup: int = 0,
+    schedule: str = "constant",
+    lr_min: float = 0.0,
+) -> float:
+    """Constante, ou warmup linear e cosseno até ``lr_min``. O passo 1 é o primeiro update."""
+
+    if step < 1 or total < 1:
+        raise ValueError("o schedule pede passo e total >= 1")
+    if schedule not in {"constant", "cosine"}:
+        raise ValueError("schedule é constant ou cosine")
+    if warmup < 0 or base < 0 or lr_min < 0:
+        raise ValueError("warmup, lr e piso precisam ser >= 0")
+    if warmup and step <= warmup:
+        return base * step / warmup
+    if schedule == "constant":
+        return base
+    span = max(total - warmup, 1)
+    progress = min(max((step - warmup) / span, 0.0), 1.0)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return lr_min + (base - lr_min) * cosine
+
+
+def set_learning_rate(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def evaluate_windows(model: OffloadLanguageModel, windows: list[list[int]]) -> dict[str, float | int]:
+    """Loss média por token, sem gradiente. A perplexidade é exp dessa média."""
+
+    if not windows:
+        raise ValueError("avaliação sem janela")
+    training = model.training
+    model.eval()
+    loss_sum = 0.0
+    tokens = 0
+    try:
+        with torch.no_grad():
+            for window in windows:
+                ids = torch.tensor(window, dtype=torch.long).view(1, -1)
+                loss, _plan = model.forward_window(ids)
+                count = int(ids.shape[1] - 1)
+                loss_sum += float(loss.detach()) * count
+                tokens += count
+    finally:
+        model.train(training)
+    mean = loss_sum / tokens
+    return {
+        "eval_loss": mean,
+        "eval_perplexity": math.exp(mean),
+        "eval_tokens": tokens,
+        "eval_batches": len(windows),
+    }
+
+
+def replace_checkpoint(path: str | Path, **kwargs) -> None:
+    """Grava o checkpoint treinável e fica só com o último diretório."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.parent / f".{target.name}.tmp"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    save_checkpoint(temporary, **kwargs)
+    if target.exists():
+        shutil.rmtree(target)
+    temporary.rename(target)
+
+
+def _zero_lora_bank(hidden: int, intermediate: int) -> dict[str, torch.Tensor]:
+    return {
+        "gate_a": torch.zeros(1, hidden),
+        "gate_b": torch.zeros(intermediate, 1),
+        "up_a": torch.zeros(1, hidden),
+        "up_b": torch.zeros(intermediate, 1),
+        "down_a": torch.zeros(1, intermediate),
+        "down_b": torch.zeros(hidden, 1),
+    }
+
+
+def _stack_qwen_routes(routes: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
+    if not routes:
+        raise RuntimeError("o gate do Qwen não rodou")
+    index = torch.stack([item[0] for item in routes], dim=2)
+    valid = torch.stack([item[1] for item in routes], dim=2)
+    coeffs = torch.stack([item[2] for item in routes], dim=2)
+
+    class _Plan:
+        hot_index = index
+        hot_valid = valid
+        soft_weights = coeffs
+
+    return _Plan()
 
 
 def make_optimizer(model: OffloadLanguageModel, lr: float, *, sparse: bool = False) -> torch.optim.Optimizer:
@@ -1069,7 +1215,7 @@ def grad_report(model: OffloadLanguageModel) -> dict[str, float | bool]:
         lora_norm = torch.stack([item.float().pow(2).sum() for item in lora_b]).sum().sqrt()
     lstm_norm = 0.0 if lstm is None else float(lstm.detach().float().norm())
     return {
-        "grads_finite": finite and lstm is not None and bool(torch.isfinite(lstm).all().item()),
+        "grads_finite": finite and (not hasattr(model.router, "lstm") or (lstm is not None and bool(torch.isfinite(lstm).all().item()))),
         "lstm_grad_norm": lstm_norm,
         "lora_b_grad_norm": float(lora_norm),
         "lstm_grad_nonzero": lstm is not None and bool(lstm.detach().abs().sum() > 0),
@@ -1318,7 +1464,7 @@ def _resident_tensors(weights: QwenWeights):
     for layer in weights.layers:
         for name in ("input_norm", "post_norm", "q", "k", "v", "o", "q_norm", "k_norm"):
             yield getattr(layer, name)
-        for name in ("q_bias", "k_bias", "v_bias", "o_bias"):
+        for name in ("q_bias", "k_bias", "v_bias", "o_bias", "gate"):
             bias = getattr(layer, name)
             if bias is not None:
                 yield bias
@@ -1337,21 +1483,21 @@ def _apply_expert(model: OffloadLanguageModel, hidden, coeff, layer: int, expert
     _EXPERT_STATE["model"] = model
     _EXPERT_STATE["layer"] = layer
     _EXPERT_STATE["expert"] = expert
-    lora = model.lora
     from moe_memory.offload.sparse_adamw import catch_up_lora_slice
 
-    for param in (lora.gate_A, lora.gate_B, lora.up_A, lora.up_B, lora.down_A, lora.down_B):
-        catch_up_lora_slice(param, layer, expert)
-    return _ExpertFn.apply(
-        hidden,
-        coeff,
-        lora.gate_A[layer, expert],
-        lora.gate_B[layer, expert],
-        lora.up_A[layer, expert],
-        lora.up_B[layer, expert],
-        lora.down_A[layer, expert],
-        lora.down_B[layer, expert],
-    )
+    if model.lora is None:
+        zero = model._lora_zero
+        gate_a, gate_b, up_a, up_b, down_a, down_b = (
+            zero["gate_a"], zero["gate_b"], zero["up_a"], zero["up_b"], zero["down_a"], zero["down_b"]
+        )
+    else:
+        lora = model.lora
+        for param in (lora.gate_A, lora.gate_B, lora.up_A, lora.up_B, lora.down_A, lora.down_B):
+            catch_up_lora_slice(param, layer, expert)
+        gate_a, gate_b = lora.gate_A[layer, expert], lora.gate_B[layer, expert]
+        up_a, up_b = lora.up_A[layer, expert], lora.up_B[layer, expert]
+        down_a, down_b = lora.down_A[layer, expert], lora.down_B[layer, expert]
+    return _ExpertFn.apply(hidden, coeff, gate_a, gate_b, up_a, up_b, down_a, down_b)
 
 
 class _ExpertFn(torch.autograd.Function):
@@ -1365,7 +1511,7 @@ class _ExpertFn(torch.autograd.Function):
         ctx.model = model
         ctx.layer = layer
         ctx.expert = expert
-        ctx.scale = model.lora.scale
+        ctx.scale = model._lora_scale
         kind = "forward" if model._io_phase == "forward" else "recompute"
         gate, up, down = model._read(layer, expert, kind)
         model._note_expert(1)

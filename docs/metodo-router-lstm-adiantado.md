@@ -225,6 +225,8 @@ systemd-run --user --scope \
 
 `--sparse-adamw` nasce desligado. Ligado, o AdamW da LoRA guarda momento só da fatia do expert tocado e repete os passos pulados com a mesma conta do AdamW denso. O LSTM continua denso. O estado fica na CPU. A VRAM não muda.
 
+O treino longo continua opt-in. `--eval-every N` mede o split `validation` do WikiText-2, sem gradiente, inclusive no passo 0; o `test` não entra e o loader não repete o `train`. `--router qwen` usa o gate original congelado, top-k do config, sem criar o LSTM. `--steps 0 --router qwen` avalia o Qwen sem LoRA. `--lr-schedule cosine` e `--warmup-steps` mudam o lr. `--checkpoint-every N` grava só LoRA, LSTM e o Adam, e fica com o último diretório. `--compact-log` imprime loss, lr, tempo e leituras.
+
 `--profile-step N` liga o `torch.profiler` só nesse passo, com atividade de CPU, formas gravadas e sem `profile_memory`. `--profile-stack` e `--profile-trace` ficam desligados: o trace chrome pode ficar grande. O buffer esperado, sem stack e sem trace, é de dezenas a poucas centenas de MB em cima do RSS já estável. Não foi medido na 1060.
 
 O gradiente da LoRA não passa mais por `SelectBackward` da fatia. Cada expert soma em `.grad[camada, expert]`. O zero do tensor inteiro, de até 201 MB, deixa de nascer a cada expert.

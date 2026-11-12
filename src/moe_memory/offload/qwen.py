@@ -1,7 +1,8 @@
 """Forward do Qwen3-MoE com experts vindos de fora.
 
 Atenção, normas, embedding e ``lm_head`` ficam residentes. O gate
-original não roda. Cada camada recebe só os experts quentes daquele
+original não roda no router LSTM. No modo ``--router qwen`` ele fica
+residente, congelado, e escolhe o top-k. Cada camada recebe só os experts quentes daquele
 token; se a máscara não escolheu nenhum, o MoE soma zero e o residual
 segue. É a máscara, não um fallback.
 
@@ -57,6 +58,7 @@ class LayerWeights:
     k_bias: torch.Tensor | None = None
     v_bias: torch.Tensor | None = None
     o_bias: torch.Tensor | None = None
+    gate: torch.Tensor | None = None
 
 
 @dataclass
@@ -72,7 +74,7 @@ class QwenWeights:
         for layer in self.layers:
             for name in ("input_norm", "post_norm", "q", "k", "v", "o", "q_norm", "k_norm"):
                 total += getattr(layer, name).nbytes
-            for name in ("q_bias", "k_bias", "v_bias", "o_bias"):
+            for name in ("q_bias", "k_bias", "v_bias", "o_bias", "gate"):
                 bias = getattr(layer, name)
                 if bias is not None:
                     total += bias.nbytes
@@ -110,7 +112,7 @@ def load_spec(config_path: Path, dtype_code: int) -> QwenSpec:
     )
 
 
-def load_resident(path: Path, spec: QwenSpec, device: torch.device) -> QwenWeights:
+def load_resident(path: Path, spec: QwenSpec, device: torch.device, *, with_gate: bool = False) -> QwenWeights:
     blobs: dict[str, torch.Tensor] = {}
     with ResidentReader(path) as reader:
         for name, dtype_code, shape, raw in reader:
@@ -121,6 +123,8 @@ def load_resident(path: Path, spec: QwenSpec, device: torch.device) -> QwenWeigh
         required.append("lm_head.weight")
     for layer in range(spec.n_layers):
         prefix = f"model.layers.{layer}"
+        if with_gate:
+            required.append(f"{prefix}.mlp.gate.weight")
         required.extend(
             [
                 f"{prefix}.input_layernorm.weight",
@@ -156,7 +160,10 @@ def load_resident(path: Path, spec: QwenSpec, device: torch.device) -> QwenWeigh
             k_bias=blobs.get(f"{prefix}.self_attn.k_proj.bias"),
             v_bias=blobs.get(f"{prefix}.self_attn.v_proj.bias"),
             o_bias=blobs.get(f"{prefix}.self_attn.o_proj.bias"),
+            gate=_shaped(blobs, f"{prefix}.mlp.gate.weight", (spec.n_experts, spec.hidden_size)) if with_gate else None,
         )
+        if built.gate is not None:
+            built.gate.requires_grad_(False)
         layers.append(built)
     _shaped_embed = _shaped(blobs, "model.embed_tokens.weight", (spec.vocab_size, spec.hidden_size))
     return QwenWeights(
