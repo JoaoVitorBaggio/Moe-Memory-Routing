@@ -70,6 +70,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device-compute", default="cpu")
     parser.add_argument("--vram-budget-gb", type=float, default=5.0)
     parser.add_argument("--vram-expert-cache-gb", type=float, default=0.0)
+    parser.add_argument("--vram-cache-dtype", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument(
+        "--lm-head-vram",
+        action="store_true",
+        help="Sobe a lm_head uma vez em bf16 e reaproveita max/log Z no backward.",
+    )
+    parser.add_argument(
+        "--prefetch-vram-aware",
+        action="store_true",
+        help="Não relê do store um expert que já está no cache de VRAM. Lê num anel pinned.",
+    )
+    parser.add_argument(
+        "--vram-cache-sim",
+        default="",
+        help="Capacidades, em experts, do LRU que prevê o hit da VRAM. Vazio desliga.",
+    )
     parser.add_argument("--estimate-only", action="store_true")
     parser.add_argument("--check-tokenizer", action="store_true")
     parser.add_argument("--memory-log", action="store_true")
@@ -107,6 +123,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--vram-budget-gb precisa ser > 0")
     if args.vram_expert_cache_gb < 0:
         parser.error("--vram-expert-cache-gb precisa ser >= 0")
+    if any(item.strip() and not item.strip().isdigit() for item in args.vram_cache_sim.split(",")):
+        parser.error("--vram-cache-sim é uma lista de capacidades inteiras")
     return args
 
 
@@ -183,6 +201,8 @@ def main(argv: list[str] | None = None) -> int:
             compute_cuda=args.device_compute == "cuda",
             compute_elem=2 if _cuda_compute_is_bf16() else 4,
             vram_expert_cache_bytes=int(args.vram_expert_cache_gb * 1024**3),
+            lm_head_vram=args.lm_head_vram,
+            vram_cache_elem=2 if args.vram_cache_dtype == "bf16" else 4,
         )
         cgroup = estimate["cgroup_bytes"]
         fits_cgroup = cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
@@ -200,6 +220,10 @@ def main(argv: list[str] | None = None) -> int:
             "fits_vram": fits_vram,
             "vram_budget_bytes": vram_budget,
             "vram_expert_cache_gb": args.vram_expert_cache_gb,
+            "vram_cache_dtype": args.vram_cache_dtype,
+            "lm_head_vram": args.lm_head_vram,
+            "prefetch_vram_aware": args.prefetch_vram_aware,
+            "vram_cache_sim": args.vram_cache_sim,
             "expert_cache_slots": args.expert_cache,
             "expert_cache_max_bytes": args.expert_cache_bytes,
             "expert_prefetch_layers": args.expert_prefetch_layers,
@@ -247,15 +271,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         model = OffloadLanguageModel(weights, router, store, rank=args.lora_rank, alpha=args.lora_alpha)
         model.set_expert_cache(args.expert_cache, args.expert_cache_bytes)
+        model.set_prefetch_vram_aware(args.prefetch_vram_aware)
         model.set_expert_prefetch(args.expert_prefetch_layers, args.expert_prefetch_bytes)
-        model.set_vram_expert_cache(int(args.vram_expert_cache_gb * 1024**3))
+        model.set_vram_expert_cache(int(args.vram_expert_cache_gb * 1024**3), args.vram_cache_dtype)
         if args.device_compute == "cuda":
             torch.set_num_threads(host_compute_threads(os.cpu_count() or 1, True))
             model.set_compute_device(torch.device("cuda"), vram_budget)
+        if args.lm_head_vram:
+            model.enable_lm_head_vram()
         model.memory_log = args.memory_log
         model.time_log = args.time_log
         if args.time_log:
             model.cache_sim_sizes = tuple(int(item) for item in args.expert_cache_sim.split(",") if item)
+            model.vram_cache_sim_sizes = tuple(int(item) for item in args.vram_cache_sim.split(",") if item)
             print(
                 json.dumps(
                     {
@@ -360,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
             "valid_loss": valid_loss,
             "tokenizer_probe_hello": probe,
             "eos_id": tokenizer.eos_id,
+            "lm_head_h2d_bytes": model.lm_head_h2d_bytes,
+            "lm_head_cpu_released": model.lm_head_cpu_released,
             "checkpoint_saved": checkpoint_saved,
             "checkpoint": str(checkpoint) if checkpoint_saved else None,
             "store_fingerprint": after["store"],

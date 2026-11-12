@@ -30,6 +30,27 @@ def test_chunked_cross_entropy_matches_the_full_head():
     assert torch.allclose(got, hidden.grad, atol=1e-4)
 
 
+def test_lm_head_vram_matches_the_three_pass_backward_bit_for_bit():
+    from moe_memory.offload.lm_train import _ce_block, _chunked_cross_entropy
+
+    torch.manual_seed(0)
+    hidden = torch.randn(5, 8)
+    weight = torch.randn(23, 8, dtype=torch.bfloat16)
+    targets = torch.randint(0, 23, (5,))
+    left = hidden.detach().clone().requires_grad_()
+    right = hidden.detach().clone().requires_grad_()
+    loss_left = _chunked_cross_entropy(left, weight, targets)
+    loss_right = _chunked_cross_entropy(right, weight, targets, reuse_stats=True)
+    assert torch.equal(loss_left, loss_right)
+    loss_left.backward()
+    loss_right.backward()
+    assert torch.equal(left.grad, right.grad)
+    seen: list[int] = []
+    block = _ce_block(weight, 0, 4, hidden, seen.append)
+    assert seen == []
+    assert torch.equal(block, weight[:4].float())
+
+
 def test_bf16_head_chunk_matches_without_a_full_fp32_copy():
     torch.manual_seed(1)
     hidden = torch.randn(4, 6, requires_grad=True)
@@ -353,6 +374,96 @@ def test_pinned_experts_stay_in_the_lru():
     assert cache.contains((0, 0))
     assert cache.contains((0, 2))
     assert not cache.contains((0, 3))
+
+
+def test_prefetch_skips_vram_keys_and_rereads_after_eviction():
+    import time
+
+    from moe_memory.offload.lm_train import ExpertPrefetcher, ExpertWeightCache
+
+    class Store:
+        def __init__(self):
+            self.payload_calls: list[tuple[int, int]] = []
+            self.into_calls: list[tuple[int, int]] = []
+
+        def payload(self, layer: int, expert: int):
+            self.payload_calls.append((layer, expert))
+            return (b"g", b"u", b"d")
+
+        def read_into(self, layer: int, expert: int, dest: torch.Tensor):
+            self.into_calls.append((layer, expert))
+            dest.zero_()
+            dest[0] = layer + 1
+            dest[1] = expert + 1
+
+    class Cache:
+        def __init__(self):
+            self.items = {(1, 0)}
+            self.enabled = True
+
+        def contains(self, key):
+            return key in self.items
+
+    class Model:
+        def __init__(self):
+            self.expert_cache = ExpertWeightCache(0, 0)
+            self.store = Store()
+            self.gpu = type("Gpu", (), {"vram_cache": Cache()})()
+            self.time_log = False
+            self._times: dict[str, float] = {}
+            self._io_phase = "forward"
+            self.store_reads = 0
+            self.prefetch_vram_aware = True
+
+        def _add_time(self, key: str, value: float) -> None:
+            self._times[key] = self._times.get(key, 0.0) + value
+
+    model = Model()
+    prefetch = ExpertPrefetcher(model)
+    prefetch.start(1, max_bytes=8, block=8, block_nbytes=8)
+    try:
+        prefetch.set_plan([[(0, 0)], [(1, 0)], [(2, 0)]])
+        prefetch.arm(0, 1)
+        assert prefetch.prefetch_skipped_vram >= 1
+        assert model.store.into_calls == []
+        assert model.store.payload_calls == []
+        model.gpu.vram_cache.items.clear()
+        blobs, sync_s = prefetch.obtain(1, 0, "forward")
+        assert sync_s is not None
+        assert model.store.into_calls == [(1, 0)]
+        assert model.store.payload_calls == []
+        assert isinstance(blobs, torch.Tensor)
+        assert int(blobs[0]) == 2 and int(blobs[1]) == 1
+        prefetch.release_block(blobs)
+        prefetch.arm(1, 1)
+        deadline = time.perf_counter() + 1.0
+        while (2, 0) not in model.store.into_calls and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        blobs, sync_s = prefetch.obtain(2, 0, "forward")
+        assert model.store.payload_calls == []
+        assert (2, 0) in model.store.into_calls
+        assert sync_s is None
+        assert int(blobs[0]) == 3 and int(blobs[1]) == 1
+    finally:
+        prefetch.stop()
+
+    plain = Model()
+    plain.prefetch_vram_aware = False
+    plain.gpu.vram_cache.items.add((1, 0))
+    other = ExpertPrefetcher(plain)
+    other.start(1, max_bytes=9, block=3)
+    try:
+        other.set_plan([[(0, 0)], [(1, 0)], [(2, 0)]])
+        other.arm(0, 1)
+        deadline = time.perf_counter() + 1.0
+        while plain.store.payload_calls.count((1, 0)) < 1 and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        assert other.prefetch_skipped_vram >= 1
+        assert plain.store.payload_calls.count((1, 0)) == 1
+        other.arm(2, 1)
+        assert other.prefetch_wasted >= 1
+    finally:
+        other.stop()
 
 
 def test_prefetch_hits_once_and_the_thread_joins():
