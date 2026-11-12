@@ -253,6 +253,79 @@ def test_cuda_layer_budget_fits_under_5gb_and_9gib_host():
         assert_vram_fits(int(estimate["vram_bytes"]), 1024)
     assert host_compute_threads(4, False) == 4
     assert host_compute_threads(4, True) == 3
+    cached = estimate_bytes(
+        resident_bytes=3_082_214_946,
+        vocab=151_936,
+        hidden=2048,
+        intermediate=768,
+        n_layers=48,
+        n_experts=128,
+        rank=4,
+        seq_len=32,
+        k1=4,
+        lstm_embed=64,
+        lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=nine,
+        read_cgroup=False,
+        expert_cache_slots=8,
+        expert_prefetch_layers=1,
+        k2=6,
+        compute_cuda=True,
+        compute_elem=4,
+        vram_expert_cache_bytes=2 * 1024**3,
+    )
+    assert cached["vram_expert_cache_bytes"] == 2 * 1024**3
+    assert cached["vram_bytes"] < budget
+    assert cached["cgroup_total_bytes"] < nine
+    assert launch_allowed(cached) is True
+
+
+def test_vram_expert_cache_does_not_evict_the_pinned_layer():
+    from moe_memory.offload.lm_gpu import VramExpertCache
+
+    cache = VramExpertCache(24)
+    blob = (torch.zeros(1), torch.zeros(1), torch.zeros(1))
+    cache.put((0, 0), blob)
+    cache.put((0, 1), blob)
+    cache.set_pinned({(0, 0)})
+    cache.put((0, 2), blob)
+    assert cache.take((0, 0)) is not None
+    assert cache.take((0, 1)) is None
+    assert cache.hits == 1
+    assert cache.avoided_bytes == 12
+
+
+def test_gpu_path_on_cpu_counts_the_ram_cache_and_reuses_vram(tmp_path: Path):
+    from moe_memory.offload.lm_gpu import LayerTransport
+    from moe_memory.offload.lm_train import flush_lora_slice_grads
+
+    model, store, _directory = _model(tmp_path)
+    try:
+        assert model.gpu is None
+        model.compute_device = torch.device("cpu")
+        model.compute_dtype = torch.float32
+        model.vram_budget = 10**12
+        model.gpu = LayerTransport(model)
+        model.set_expert_cache(8)
+        model.set_vram_expert_cache(10**7)
+        model.set_expert_prefetch(1)
+        tokens = torch.tensor([[1, 2, 3, 4, 5, 6, 1, 2, 3, 4]])
+        loss, _plan = model.forward_window(tokens)
+        vram_misses = model.gpu.vram_cache.misses
+        loss.backward()
+        flush_lora_slice_grads()
+        ram = model.expert_cache.stats()
+        assert ram["hits"] > 0
+        assert ram["misses"] > 0
+        assert model.gpu.vram_cache.hits > 0
+        assert model.gpu.vram_cache.misses == vram_misses
+        assert model.gpu.vram_cache.avoided_bytes > 0
+    finally:
+        model.release_expert_cache()
+        store.close()
 
 
 def test_layer_transport_copies_a_layer_on_cpu(tmp_path: Path):

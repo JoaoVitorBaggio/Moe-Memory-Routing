@@ -225,6 +225,7 @@ def estimate_bytes(
     k2: int = 6,
     compute_cuda: bool = False,
     compute_elem: int = 4,
+    vram_expert_cache_bytes: int = 0,
 ) -> dict[str, int | None]:
     """Teto do anon com a cabeça e o expert em pedaços. Não inclui o store inteiro.
 
@@ -302,6 +303,8 @@ def estimate_bytes(
         "vram_overhead_bytes": 0,
         "vram_layers_on_device": 0,
         "vram_bytes": 0,
+        "vram_expert_cache_bytes": 0,
+        "vram_lm_head_bytes": 0,
     }
     if compute_cuda:
         if n_heads is None or n_kv_heads is None or head_dim is None:
@@ -326,10 +329,22 @@ def estimate_bytes(
             k2=max(k2, 1),
             rank=rank,
             compute_elem=compute_elem,
+            vram_expert_cache_bytes=max(0, vram_expert_cache_bytes),
+            ce_bytes=min(vocab, LM_HEAD_CHUNK) * hidden * compute_elem,
         )
     pieces["pinned_bytes"] = pinned
     pieces.update(vram)
-    skipped.update({"vram_attention_bytes", "vram_experts_bytes", "vram_lora_bytes", "vram_activation_bytes", "vram_overhead_bytes", "vram_layers_on_device", "vram_bytes"})
+    skipped.update({
+        "vram_attention_bytes",
+        "vram_experts_bytes",
+        "vram_expert_cache_bytes",
+        "vram_lm_head_bytes",
+        "vram_lora_bytes",
+        "vram_activation_bytes",
+        "vram_overhead_bytes",
+        "vram_layers_on_device",
+        "vram_bytes",
+    })
     pieces["total_bytes"] = sum(value for key, value in pieces.items() if key not in skipped and value is not None)
     pieces["cgroup_total_bytes"] = pieces["total_bytes"] + pieces["file_cache_bytes"]
     pieces["launch_ceiling_bytes"] = LAUNCH_CEILING_BYTES
@@ -410,6 +425,7 @@ class OffloadLanguageModel(nn.Module):
         self.compute_device = torch.device("cpu")
         self.compute_dtype = torch.float32
         self.vram_budget = 0
+        self.vram_expert_cache_bytes = 0
         self.gpu = None
         self._expert_plan: list[list[tuple[int, int]]] = []
         self.expert_live = 0
@@ -455,8 +471,13 @@ class OffloadLanguageModel(nn.Module):
         started = time.perf_counter()
         with _region("cross_entropy"):
             normed = rms_norm(hidden, _as(self.weights.final_norm, hidden), spec.rms_eps)
+            ce_hidden = normed[:, :-1].reshape(-1, normed.shape[-1])
+            if self.gpu is not None:
+                started_h2d = time.perf_counter()
+                ce_hidden = ce_hidden.to(device=self.gpu.device, dtype=self.gpu.dtype)
+                self._add_time("h2d_activation_s", time.perf_counter() - started_h2d)
             loss = _chunked_cross_entropy(
-                normed[:, :-1].reshape(-1, normed.shape[-1]),
+                ce_hidden,
                 self.weights.lm_head,
                 token_ids[:, 1:].reshape(-1),
             )
@@ -479,6 +500,13 @@ class OffloadLanguageModel(nn.Module):
             with _region(f"checkpoint_recompute_layer_{layer_index}"):
                 return self._layer_body(hidden, coeffs, index, valid, spec, layer, layer_index)
         return self._layer_body(hidden, coeffs, index, valid, spec, layer, layer_index)
+
+    def set_vram_expert_cache(self, max_bytes: int) -> None:
+        if max_bytes < 0:
+            raise ValueError("cache de VRAM precisa ser >= 0")
+        self.vram_expert_cache_bytes = int(max_bytes)
+        if self.gpu is not None:
+            self.gpu.set_vram_cache(self.vram_expert_cache_bytes)
 
     def set_compute_device(self, device: torch.device, vram_budget: int) -> None:
         """``cpu`` é o caminho de hoje. ``cuda`` calcula uma camada por vez."""
@@ -503,6 +531,7 @@ class OffloadLanguageModel(nn.Module):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.gpu = LayerTransport(self)
+        self.gpu.set_vram_cache(self.vram_expert_cache_bytes)
         torch.cuda.reset_peak_memory_stats(self.compute_device)
 
     def _layer_body(self, hidden, coeffs, index, valid, spec, layer, layer_index):
@@ -523,12 +552,18 @@ class OffloadLanguageModel(nn.Module):
 
     def _layer_body_gpu(self, hidden, coeffs, index, valid, spec, layer, layer_index, direction):
         gpu = self.gpu
+        if self._expert_plan and 0 <= layer_index < len(self._expert_plan):
+            gpu.vram_cache.set_pinned(set(self._expert_plan[layer_index]))
         blobs = self._cached_expert_blobs(layer_index)
+        started = time.perf_counter()
         pack = gpu.ensure(layer_index, layer, blobs)
+        self._add_h2d_time("h2d_prepare_s", time.perf_counter() - started)
+        started = time.perf_counter()
         hidden_g = hidden.to(device=gpu.device, dtype=gpu.dtype)
         coeffs_g = coeffs.to(device=gpu.device, dtype=gpu.dtype)
+        self._add_h2d_time("h2d_activation_s", time.perf_counter() - started)
         compute_start = compute_end = None
-        if self.time_log:
+        if self.time_log and gpu.device.type == "cuda":
             compute_start = torch.cuda.Event(enable_timing=True)
             compute_start.record()
         normed = rms_norm(hidden_g, _as(pack.layer.input_norm, hidden_g), spec.rms_eps)
@@ -545,10 +580,12 @@ class OffloadLanguageModel(nn.Module):
             gpu.stage_ahead(nxt, self.weights.layers[nxt], self._cached_expert_blobs(nxt))
         nbytes = hidden_g.numel() * hidden_g.element_size()
         d2h_start = d2h_end = None
-        if self.time_log:
+        if self.time_log and gpu.device.type == "cuda":
             d2h_start = torch.cuda.Event(enable_timing=True)
             d2h_start.record()
+        started = time.perf_counter()
         out = hidden_g.to(device="cpu", dtype=torch.float32)
+        self._add_h2d_time("d2h_wait_s", time.perf_counter() - started)
         if d2h_start is not None:
             d2h_end = torch.cuda.Event(enable_timing=True)
             d2h_end.record()
@@ -566,10 +603,22 @@ class OffloadLanguageModel(nn.Module):
                 found[key] = blob
         return found
 
+    def _add_h2d_time(self, name: str, value: float) -> None:
+        if self._io_phase == "forward":
+            self._add_time(name, value)
+        else:
+            stem, suffix = name.rsplit("_s", 1)
+            self._add_time(f"{stem}_backward_s{suffix}", value)
+
+    def _count_ram_hit(self, key: tuple[int, int]) -> None:
+        if self.expert_cache.enabled:
+            self.expert_cache.touch(key)
+
     def _moe(self, hidden, layer_index, index, valid, coeffs):
         flat = hidden[0]
         out = flat.new_zeros(flat.shape)
         groups: dict[int, list[tuple[int, int]]] = {}
+        started = time.perf_counter()
         seq, slots = index.shape[1], index.shape[2]
         for token in range(seq):
             for slot in range(slots):
@@ -577,6 +626,7 @@ class OffloadLanguageModel(nn.Module):
                     continue
                 expert = int(index[0, token, slot].item())
                 groups.setdefault(expert, []).append((token, slot))
+        self._add_time(self._phase_key("moe_group_s"), time.perf_counter() - started)
         for expert, members in groups.items():
             rows = torch.tensor([token for token, _slot in members], device=flat.device)
             current = flat.index_select(0, rows)
@@ -619,8 +669,16 @@ class OffloadLanguageModel(nn.Module):
     def _read(self, layer: int, expert: int, kind: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         key = (layer, expert)
         if self.gpu is not None:
+            cached_gpu = self.gpu.take_cached_expert(layer, expert)
+            if cached_gpu is not None:
+                self._count_ram_hit(key)
+                if self.time_log:
+                    self._read_seq.append((key, int(self.store.header.raw_nbytes)))
+                return cached_gpu
             ready = self.gpu.take_expert(layer, expert)
             if ready is not None:
+                self._count_ram_hit(key)
+                self.gpu.remember_expert(layer, expert, ready, miss=False)
                 if self.time_log:
                     self._read_seq.append((key, int(self.store.header.raw_nbytes)))
                 return ready
@@ -648,7 +706,9 @@ class OffloadLanguageModel(nn.Module):
         if self.time_log:
             self._read_seq.append((key, nbytes))
         if self.gpu is not None:
-            return self.gpu.h2d_now(layer, expert, (gate_b, up_b, down_b))
+            tensors = self.gpu.h2d_now(layer, expert, (gate_b, up_b, down_b))
+            self.gpu.remember_expert(layer, expert, tensors, miss=True)
+            return tensors
         started = time.perf_counter()
         with _region(f"bf16_fp32_{kind}"):
             layout = self.store.layout
@@ -691,6 +751,10 @@ class OffloadLanguageModel(nn.Module):
             "expert_convert_forward_s",
             "expert_compute_forward_s",
             "cross_entropy_forward_s",
+            "h2d_prepare_s",
+            "h2d_activation_s",
+            "d2h_wait_s",
+            "moe_group_s",
             "backward_s",
             "optimizer_s",
             "release_s",
@@ -708,6 +772,10 @@ class OffloadLanguageModel(nn.Module):
         report["attention_recompute_s"] = float(self._times.get("attention_recompute_s", 0.0))
         report["resident_recompute_s"] = float(self._times.get("resident_recompute_s", 0.0))
         report["cross_entropy_backward_s"] = float(self._times.get("cross_entropy_backward_s", 0.0))
+        report["h2d_prepare_backward_s"] = float(self._times.get("h2d_prepare_backward_s", 0.0))
+        report["h2d_activation_backward_s"] = float(self._times.get("h2d_activation_backward_s", 0.0))
+        report["d2h_wait_backward_s"] = float(self._times.get("d2h_wait_backward_s", 0.0))
+        report["moe_group_recompute_s"] = float(self._times.get("moe_group_recompute_s", 0.0))
         report["accounted_s"] = accounted
         report["outros_s"] = wall_s - accounted
         report["wall_s"] = wall_s
@@ -721,6 +789,13 @@ class OffloadLanguageModel(nn.Module):
         }
         report["expert_cache"] = self.expert_cache.stats()
         report["expert_prefetch"] = self.prefetch.stats()
+        report["vram_expert_cache"] = self.gpu.vram_cache.stats() if self.gpu is not None else {
+            "max_bytes": 0,
+            "hits": 0,
+            "misses": 0,
+            "avoided_bytes": 0,
+            "bytes": 0,
+        }
         report["store_reads"] = self.store_reads
         gpu_times = {
             "h2d_s": 0.0,
@@ -782,6 +857,13 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     report["store_reads"] = model.store_reads
     report["expert_cache"] = model.expert_cache.stats()
     report["expert_prefetch"] = model.prefetch.stats()
+    report["vram_expert_cache"] = model.gpu.vram_cache.stats() if model.gpu is not None else {
+        "max_bytes": 0,
+        "hits": 0,
+        "misses": 0,
+        "avoided_bytes": 0,
+        "bytes": 0,
+    }
     if model.time_log:
         report["time"] = model.timing_report(time.perf_counter() - wall)
     model._phase("after-step")
@@ -1210,17 +1292,19 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
 
 
 def _ce_value(hidden, weight, targets, chunk: int) -> torch.Tensor:
+    if targets.device != hidden.device:
+        targets = targets.to(hidden.device)
     rows = hidden.shape[0]
     running_max = hidden.new_full((rows,), float("-inf"))
     vocab = weight.shape[0]
     for start in range(0, vocab, chunk):
-        logits = F.linear(hidden, weight[start : start + chunk].to(dtype=hidden.dtype))
+        logits = F.linear(hidden, _ce_block(weight, start, chunk, hidden))
         running_max = torch.maximum(running_max, logits.detach().max(dim=-1).values)
     sum_exp = hidden.new_zeros(rows)
     target_logit = hidden.new_zeros(rows)
     index = torch.arange(rows, device=hidden.device)
     for start in range(0, vocab, chunk):
-        block = weight[start : start + chunk].to(dtype=hidden.dtype)
+        block = _ce_block(weight, start, chunk, hidden)
         logits = F.linear(hidden, block)
         sum_exp = sum_exp + (logits - running_max.unsqueeze(-1)).exp().sum(dim=-1)
         chosen = (targets >= start) & (targets < start + block.shape[0])
@@ -1233,26 +1317,28 @@ def _ce_value(hidden, weight, targets, chunk: int) -> torch.Tensor:
 
 def _ce_grad_hidden(hidden, weight, targets, chunk: int, grad_loss) -> torch.Tensor:
     hidden = hidden.detach()
+    if targets.device != hidden.device:
+        targets = targets.to(hidden.device)
     rows = hidden.shape[0]
     with torch.no_grad():
         running_max = hidden.new_full((rows,), float("-inf"))
         vocab = weight.shape[0]
         for start in range(0, vocab, chunk):
-            block = weight[start : start + chunk].to(dtype=hidden.dtype)
+            block = _ce_block(weight, start, chunk, hidden)
             logits = F.linear(hidden, block)
             running_max = torch.maximum(running_max, logits.max(dim=-1).values)
             del block, logits
         sum_exp = hidden.new_zeros(rows)
         for start in range(0, vocab, chunk):
-            block = weight[start : start + chunk].to(dtype=hidden.dtype)
+            block = _ce_block(weight, start, chunk, hidden)
             logits = F.linear(hidden, block)
             sum_exp = sum_exp + (logits - running_max.unsqueeze(-1)).exp().sum(dim=-1)
             del block, logits
         log_z = running_max + sum_exp.log()
         grad = hidden.new_zeros(hidden.shape)
-        scale = grad_loss.to(dtype=hidden.dtype) / rows
+        scale = grad_loss.to(device=hidden.device, dtype=hidden.dtype) / rows
         for start in range(0, vocab, chunk):
-            block = weight[start : start + chunk].to(dtype=hidden.dtype)
+            block = _ce_block(weight, start, chunk, hidden)
             logits = F.linear(hidden, block)
             probs = (logits - log_z.unsqueeze(-1)).exp()
             chosen = (targets >= start) & (targets < start + block.shape[0])
@@ -1262,6 +1348,13 @@ def _ce_grad_hidden(hidden, weight, targets, chunk: int, grad_loss) -> torch.Ten
             grad = grad + probs.matmul(block) * scale
             del block, logits, probs
     return grad
+
+
+def _ce_block(weight: torch.Tensor, start: int, chunk: int, hidden: torch.Tensor) -> torch.Tensor:
+    block = weight[start : start + chunk]
+    if block.device == hidden.device and block.dtype == hidden.dtype:
+        return block
+    return block.to(device=hidden.device, dtype=hidden.dtype)
 
 
 def _matrix(raw: bytes, dtype: torch.dtype, shape: tuple[int, int]) -> torch.Tensor:
@@ -1322,6 +1415,10 @@ class ExpertWeightCache:
         self.avoided_bytes += self._sizes[key]
         self._items.move_to_end(key)
         return found
+
+    def note_miss(self) -> None:
+        if self.enabled:
+            self.misses += 1
 
     def lookup(self, key: tuple[int, int]) -> tuple[bytes, bytes, bytes] | None:
         if not self.enabled:
@@ -1535,6 +1632,7 @@ class ExpertPrefetcher:
                 if buffered is not None:
                     self._take_buffer(key)
                     self.hits += 1
+                    self.model.expert_cache.note_miss()
                     self.model.expert_cache.store(key, buffered, self._nbytes(buffered))
                     return buffered, None
                 if key in self._inflight:
@@ -1555,6 +1653,7 @@ class ExpertPrefetcher:
             sync_s = time.perf_counter() - started
             with self._cv:
                 self.model.store_reads += 1
+                self.model.expert_cache.note_miss()
                 self.model.expert_cache.store(key, blobs, self._nbytes(blobs))
             return blobs, sync_s
 
