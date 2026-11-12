@@ -1,8 +1,10 @@
 """WikiText-2 cru já em cache, tokenizado com o vocabulário do Qwen.
 
-Não chama o Hub e não usa o GPT-2. O split de teste não entra no treino.
-Linha em branco fecha o artigo, como no loader antigo, e cada artigo
-termina no eos do Qwen para não colar dois textos.
+Não chama o Hub e não usa o GPT-2. O split de teste não entra no treino
+nem na avaliação. A avaliação usa o split ``validation``, em janelas
+contíguas e sem embaralhar. Ele é outro arquivo, então não reparte uma
+janela com o ``train``. O loader não repete época: se acabam as janelas,
+o treino para.
 """
 
 from __future__ import annotations
@@ -12,6 +14,19 @@ from pathlib import Path
 
 from moe_memory.corpus import documents_from_texts
 from moe_memory.qwen_tokenizer import QwenTokenizer
+
+
+HOLDOUT_SPLIT = "validation"
+
+
+def holdout_note() -> str:
+    """Qual arquivo entra na avaliação e por que não mistura com o treino."""
+
+    return (
+        "Treino: WikiText-2 raw, split train, janelas contíguas sem repetir. "
+        "Avaliação: split validation, o mesmo tokenizador e o mesmo tamanho de janela. "
+        "O split test não entra. Train e validation são arquivos diferentes."
+    )
 
 
 def wikitext_arrow_files(cache_dir: str | Path, split: str) -> list[Path]:

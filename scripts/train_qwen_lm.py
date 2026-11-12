@@ -32,18 +32,24 @@ from moe_memory.offload.lm_train import (
     estimate_bytes,
     fingerprint,
     launch_allowed,
+    load_checkpoint,
     lm_step,
     rss_bytes,
     ru_maxrss_bytes,
     make_optimizer,
+    evaluate_windows,
     persist_checkpoint,
+    replace_checkpoint,
+    scheduled_lr,
+    set_learning_rate,
     profile_lm_step,
     refuse_cuda_bf16,
     release_step_memory,
 )
 from moe_memory.offload.qwen import load_resident, load_spec
+from moe_memory.offload.qwen_gate import QwenGateRouter
 from moe_memory.offload.store import ExpertStore
-from moe_memory.qwen_corpus import iter_arrow_text, iter_token_windows, wikitext_arrow_files
+from moe_memory.qwen_corpus import HOLDOUT_SPLIT, holdout_note, iter_arrow_text, iter_token_windows, wikitext_arrow_files
 from moe_memory.qwen_tokenizer import load_qwen_tokenizer
 
 
@@ -54,6 +60,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cache-dir", type=Path, default=Path("data/cache"))
     parser.add_argument("--out", type=Path, default=Path("outputs/qwen-lm-smoke"))
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--router", choices=("lstm", "qwen"), default="lstm")
+    parser.add_argument("--eval-every", type=int, default=0)
+    parser.add_argument("--eval-batches", type=int, default=1)
+    parser.add_argument("--lr-schedule", choices=("constant", "cosine"), default="constant")
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--lr-min", type=float, default=0.0)
+    parser.add_argument("--checkpoint-every", type=int, default=0)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--compact-log", action="store_true")
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--k1", type=int, default=4)
     parser.add_argument("--k2", type=int, default=6)
@@ -110,8 +125,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="AdamW só nas fatias LoRA tocadas. O padrão continua o AdamW denso.",
     )
     args = parser.parse_args(argv)
-    if args.steps < 1 or args.seq_len < 2:
-        parser.error("steps >= 1 e seq-len >= 2")
+    if args.seq_len < 2:
+        parser.error("seq-len >= 2")
+    if args.steps < 0:
+        parser.error("steps precisa ser >= 0")
+    if args.steps == 0 and (args.router != "qwen" or args.eval_batches < 1):
+        parser.error("steps 0 é a avaliação do Qwen original: --router qwen e --eval-batches >= 1")
+    if args.eval_every < 0 or args.eval_batches < 1:
+        parser.error("--eval-every >= 0 e --eval-batches >= 1")
+    if args.warmup_steps < 0 or args.lr_min < 0 or args.checkpoint_every < 0:
+        parser.error("warmup, lr-min e checkpoint-every precisam ser >= 0")
     if not args.check_tokenizer and args.device != "cpu":
         parser.error("este smoke é CPU. A 1060 não executa o residente bf16.")
     if args.profile_step is None and (args.profile_stack or args.profile_trace):
@@ -208,8 +231,11 @@ def main(argv: list[str] | None = None) -> int:
             vram_expert_cache_bytes=int(args.vram_expert_cache_gb * 1024**3),
             lm_head_vram=args.lm_head_vram,
             vram_cache_elem=2 if args.vram_cache_dtype == "bf16" else 4,
-            sparse_adam_steps=args.steps if args.sparse_adamw else 0,
+            sparse_adam_steps=args.steps if args.sparse_adamw and args.steps > 0 else 0,
+            trainable_lora=args.steps > 0,
+            trainable_lstm=args.router == "lstm" and args.steps > 0,
         )
+        checkpoint_bytes = int(estimate["lora_fp32_bytes"] + estimate["adam_lora_bytes"] + estimate["lstm_with_adam_bytes"] - estimate["lstm_grad_bytes"])
         cgroup = estimate["cgroup_bytes"]
         fits_cgroup = cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
         fits = launch_allowed(estimate)
@@ -230,6 +256,15 @@ def main(argv: list[str] | None = None) -> int:
             "lm_head_vram": args.lm_head_vram,
             "prefetch_vram_aware": args.prefetch_vram_aware,
             "sparse_adamw": args.sparse_adamw,
+            "router": args.router,
+            "checkpoint_bytes": checkpoint_bytes,
+            "eval_every": args.eval_every,
+            "eval_batches": args.eval_batches,
+            "holdout": holdout_note(),
+            "lr_schedule": args.lr_schedule,
+            "warmup_steps": args.warmup_steps,
+            "checkpoint_every": args.checkpoint_every,
+            "epochs": "uma passagem do split train; o loader não repete",
             "vram_cache_sim": args.vram_cache_sim,
             "expert_cache_slots": args.expert_cache,
             "expert_cache_max_bytes": args.expert_cache_bytes,
@@ -262,21 +297,36 @@ def main(argv: list[str] | None = None) -> int:
         refuse_cuda_bf16(torch.device(args.device), spec.dtype)
         tokenizer, _config_vocab_size = _load_tokenizer(args.model_dir, spec.vocab_size)
         resident_started = time.perf_counter()
-        weights = load_resident(resident_path, spec, torch.device("cpu"))
+        weights = load_resident(resident_path, spec, torch.device("cpu"), with_gate=args.router == "qwen")
         resident_load_s = time.perf_counter() - resident_started
-        router = TwoHorizonLstmRouter(
-            vocab_size=spec.vocab_size,
-            n_layers=spec.n_layers,
-            n_experts=spec.n_experts,
-            l1=args.l1,
-            l2=args.l2,
-            k1=args.k1,
-            k2=args.k2,
-            b2=args.b2,
-            embed_dim=args.lstm_embed,
-            hidden_size=args.lstm_hidden,
+        if args.router == "qwen":
+            router = QwenGateRouter(
+                vocab_size=spec.vocab_size,
+                n_layers=spec.n_layers,
+                n_experts=spec.n_experts,
+                experts_per_tok=spec.experts_per_tok,
+            )
+        else:
+            router = TwoHorizonLstmRouter(
+                vocab_size=spec.vocab_size,
+                n_layers=spec.n_layers,
+                n_experts=spec.n_experts,
+                l1=args.l1,
+                l2=args.l2,
+                k1=args.k1,
+                k2=args.k2,
+                b2=args.b2,
+                embed_dim=args.lstm_embed,
+                hidden_size=args.lstm_hidden,
+            )
+        model = OffloadLanguageModel(
+            weights,
+            router,
+            store,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            use_lora=args.steps > 0,
         )
-        model = OffloadLanguageModel(weights, router, store, rank=args.lora_rank, alpha=args.lora_alpha)
         model.set_expert_cache(args.expert_cache, args.expert_cache_bytes)
         model.set_prefetch_vram_aware(args.prefetch_vram_aware)
         model.set_expert_prefetch(args.expert_prefetch_layers, args.expert_prefetch_bytes)
@@ -306,22 +356,77 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps({"phase": "resident-loaded", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
                 flush=True,
             )
-        optimizer = make_optimizer(model, args.lr, sparse=args.sparse_adamw)
-        train_files = wikitext_arrow_files(args.cache_dir, "train")
-        windows = list(
-            iter_token_windows(
-                iter_arrow_text(train_files),
-                tokenizer,
-                seq_len=args.seq_len,
-                limit=args.steps,
+        optimizer = None if args.steps == 0 else make_optimizer(model, args.lr, sparse=args.sparse_adamw)
+        checkpoint = args.out / "checkpoint"
+        start_step = 0
+        if args.resume:
+            if optimizer is None or not checkpoint.is_dir():
+                raise SystemExit("retomar pede um checkpoint e steps > 0")
+            resumed = load_checkpoint(checkpoint, model, optimizer)
+            start_step = int(resumed["step"])
+            if start_step >= args.steps:
+                raise SystemExit(f"o checkpoint já está no passo {start_step}")
+        holdout = []
+        if args.steps == 0 or args.eval_every > 0:
+            holdout = list(
+                iter_token_windows(
+                    iter_arrow_text(wikitext_arrow_files(args.cache_dir, HOLDOUT_SPLIT)),
+                    tokenizer,
+                    seq_len=args.seq_len,
+                    limit=args.eval_batches,
+                )
             )
-        )
-        if len(windows) < args.steps:
-            raise SystemExit(f"o treino só rendeu {len(windows)} janelas")
+            if len(holdout) < args.eval_batches:
+                raise SystemExit(f"a validação só rendeu {len(holdout)} janelas")
+        windows = []
+        if args.steps > 0:
+            train_files = wikitext_arrow_files(args.cache_dir, "train")
+            windows = list(
+                iter_token_windows(
+                    iter_arrow_text(train_files),
+                    tokenizer,
+                    seq_len=args.seq_len,
+                    skip=start_step,
+                    limit=args.steps - start_step,
+                )
+            )
+            if len(windows) < args.steps - start_step:
+                raise SystemExit(
+                    f"o treino só rendeu {len(windows)} janelas novas. "
+                    "O loader não repete o split train."
+                )
         probe = tokenizer.encode("Hello")
         rows = []
-        for step, window in enumerate(windows, start=1):
+        evals = []
+
+        def _eval(step: int) -> None:
+            if not holdout:
+                return
+            started_eval = time.perf_counter()
+            metrics = evaluate_windows(model, holdout)
+            metrics["step"] = step
+            metrics["eval_s"] = time.perf_counter() - started_eval
+            evals.append(metrics)
+            print(json.dumps({"phase": "eval", **metrics}), flush=True)
+
+        if args.eval_every > 0 or args.steps == 0:
+            _eval(start_step)
+        for offset, window in enumerate(windows, start=1):
+            step = start_step + offset
             tokens = torch.tensor(window, dtype=torch.long).view(1, -1)
+            if args.lr_schedule != "constant" or args.warmup_steps:
+                set_learning_rate(
+                    optimizer,
+                    scheduled_lr(
+                        step,
+                        args.steps,
+                        args.lr,
+                        warmup=args.warmup_steps,
+                        schedule=args.lr_schedule,
+                        lr_min=args.lr_min,
+                    ),
+                )
+            step_started = time.perf_counter()
             if args.profile_step == step:
                 with profile_lm_step(
                     args.out / f"profile-step-{step}",
@@ -332,9 +437,30 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 row = lm_step(model, optimizer, tokens)
             row["step"] = step
+            row["lr"] = float(optimizer.param_groups[0]["lr"])
+            row["step_s"] = time.perf_counter() - step_started
             rows.append(row)
-            print(json.dumps(row), flush=True)
-        release_step_memory(optimizer)
+            if args.compact_log:
+                print(
+                    f"passo {step}: loss={row['loss']:.4f} lr={row['lr']:.3e} "
+                    f"s={row['step_s']:.2f} leituras={row['store_reads']}",
+                    flush=True,
+                )
+            else:
+                print(json.dumps(row), flush=True)
+            if args.checkpoint_every and step % args.checkpoint_every == 0:
+                args.out.mkdir(parents=True, exist_ok=True)
+                replace_checkpoint(
+                    checkpoint,
+                    step=step,
+                    model=model,
+                    optimizer=optimizer,
+                    extra={"seed": args.seed, "seq_len": args.seq_len, "router": args.router},
+                )
+            if args.eval_every and step % args.eval_every == 0:
+                _eval(step)
+        if optimizer is not None:
+            release_step_memory(optimizer)
         valid_loss = None
         if args.valid_forward:
             valid_files = wikitext_arrow_files(args.cache_dir, "validation")
@@ -350,7 +476,8 @@ def main(argv: list[str] | None = None) -> int:
                 valid_loss_t, valid_plan = model.forward_window(torch.tensor(valid, dtype=torch.long).view(1, -1))
                 valid_loss = float(valid_loss_t)
                 del valid_loss_t, valid_plan
-            release_step_memory(optimizer)
+            if optimizer is not None:
+                release_step_memory(optimizer)
             if args.memory_log:
                 print(
                     json.dumps({"phase": "valid-forward", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
@@ -358,18 +485,22 @@ def main(argv: list[str] | None = None) -> int:
                 )
         model.release_expert_cache()
         args.out.mkdir(parents=True, exist_ok=True)
-        checkpoint = args.out / "checkpoint"
         checkpoint_saved = False
-        if not args.no_checkpoint:
+        if optimizer is not None and not args.no_checkpoint:
             checkpoint_started = time.perf_counter()
-            checkpoint_saved = persist_checkpoint(
-                True,
-                checkpoint,
-                step=args.steps,
-                model=model,
-                optimizer=optimizer,
-                extra={"windows": windows, "seed": args.seed, "seq_len": args.seq_len},
-            )
+            extra = {"windows": windows, "seed": args.seed, "seq_len": args.seq_len, "router": args.router}
+            if args.checkpoint_every:
+                replace_checkpoint(checkpoint, step=args.steps, model=model, optimizer=optimizer, extra=extra)
+                checkpoint_saved = True
+            else:
+                checkpoint_saved = persist_checkpoint(
+                    True,
+                    checkpoint,
+                    step=args.steps,
+                    model=model,
+                    optimizer=optimizer,
+                    extra=extra,
+                )
             checkpoint_s = time.perf_counter() - checkpoint_started
             if args.memory_log or args.time_log:
                 print(
@@ -392,6 +523,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             **summary,
             "steps": rows,
+            "evals": evals,
+            "holdout_split": HOLDOUT_SPLIT if evals else None,
             "valid_loss": valid_loss,
             "tokenizer_probe_hello": probe,
             "eos_id": tokenizer.eos_id,
