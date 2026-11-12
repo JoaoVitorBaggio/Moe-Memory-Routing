@@ -218,9 +218,12 @@ systemd-run --user --scope \
   --vram-budget-gb 5 --vram-expert-cache-gb 3.0 \
   --vram-cache-dtype bf16 --lm-head-vram --prefetch-vram-aware \
   --expert-cache 0 --expert-prefetch-layers 1 \
+  --sparse-adamw \
   --no-checkpoint --memory-log --time-log \
   --out outputs/qwen-lm-vram-bf16
 ```
+
+`--sparse-adamw` nasce desligado. Ligado, o AdamW da LoRA guarda momento só da fatia do expert tocado e repete os passos pulados com a mesma conta do AdamW denso. O LSTM continua denso. O estado fica na CPU. A VRAM não muda.
 
 `--profile-step N` liga o `torch.profiler` só nesse passo, com atividade de CPU, formas gravadas e sem `profile_memory`. `--profile-stack` e `--profile-trace` ficam desligados: o trace chrome pode ficar grande. O buffer esperado, sem stack e sem trace, é de dezenas a poucas centenas de MB em cima do RSS já estável. Não foi medido na 1060.
 

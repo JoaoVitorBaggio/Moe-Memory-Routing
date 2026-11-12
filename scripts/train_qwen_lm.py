@@ -104,6 +104,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Não grava weights/, optim/ nem checkpoint.pt. O summary.json continua.",
     )
+    parser.add_argument(
+        "--sparse-adamw",
+        action="store_true",
+        help="AdamW só nas fatias LoRA tocadas. O padrão continua o AdamW denso.",
+    )
     args = parser.parse_args(argv)
     if args.steps < 1 or args.seq_len < 2:
         parser.error("steps >= 1 e seq-len >= 2")
@@ -203,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
             vram_expert_cache_bytes=int(args.vram_expert_cache_gb * 1024**3),
             lm_head_vram=args.lm_head_vram,
             vram_cache_elem=2 if args.vram_cache_dtype == "bf16" else 4,
+            sparse_adam_steps=args.steps if args.sparse_adamw else 0,
         )
         cgroup = estimate["cgroup_bytes"]
         fits_cgroup = cgroup is None or estimate["cgroup_total_bytes"] <= cgroup
@@ -223,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
             "vram_cache_dtype": args.vram_cache_dtype,
             "lm_head_vram": args.lm_head_vram,
             "prefetch_vram_aware": args.prefetch_vram_aware,
+            "sparse_adamw": args.sparse_adamw,
             "vram_cache_sim": args.vram_cache_sim,
             "expert_cache_slots": args.expert_cache,
             "expert_cache_max_bytes": args.expert_cache_bytes,
@@ -299,7 +306,7 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps({"phase": "resident-loaded", "rss_bytes": rss_bytes(), "ru_maxrss_bytes": ru_maxrss_bytes()}),
                 flush=True,
             )
-        optimizer = make_optimizer(model, args.lr)
+        optimizer = make_optimizer(model, args.lr, sparse=args.sparse_adamw)
         train_files = wikitext_arrow_files(args.cache_dir, "train")
         windows = list(
             iter_token_windows(

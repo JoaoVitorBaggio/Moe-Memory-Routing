@@ -20,6 +20,7 @@ enquanto a CPU computa a corrente. Zero desliga.
 ``--device-compute cuda`` calcula uma camada na GPU. O padrão é a CPU.
 ``--lm-head-vram``, ``--prefetch-vram-aware`` e ``--vram-cache-dtype bf16``
 também nascem desligados. Sem eles o passo é o de hoje.
+``--sparse-adamw`` também nasce desligado. O AdamW denso continua o padrão.
 """
 
 from __future__ import annotations
@@ -231,6 +232,7 @@ def estimate_bytes(
     vram_expert_cache_bytes: int = 0,
     lm_head_vram: bool = False,
     vram_cache_elem: int = 4,
+    sparse_adam_steps: int = 0,
 ) -> dict[str, int | None]:
     """Teto do anon com a cabeça e o expert em pedaços. Não inclui o store inteiro.
 
@@ -244,6 +246,8 @@ def estimate_bytes(
         raise ValueError("estimativa com dimensão < 1")
     if vram_cache_elem < 1:
         raise ValueError("o elemento do cache de VRAM precisa ser >= 1")
+    if sparse_adam_steps < 0:
+        raise ValueError("os passos do Adam esparso precisam ser >= 0")
     lora = n_layers * n_experts * 3 * rank * (hidden + intermediate) * 4
     lstm_params = (
         vocab * lstm_embed
@@ -266,12 +270,20 @@ def estimate_bytes(
     head = min(vocab, LM_HEAD_CHUNK) * hidden * 4
     if cgroup_bytes is None and read_cgroup:
         cgroup_bytes = read_cgroup_memory_max()
+    per_expert = 3 * rank * (hidden + intermediate)
+    dense_adam = lora * 2
+    dense_grad = lora
+    if sparse_adam_steps:
+        cap_experts = min(n_layers * n_experts, sparse_adam_steps * n_layers * max(k2, 1))
+        dense_adam = cap_experts * per_expert * 8
+        dense_grad = n_layers * max(k2, 1) * per_expert * 4
     pieces: dict[str, int | None] = {
         "resident_bytes": resident_bytes,
         "lora_fp32_bytes": lora,
-        "lora_grad_bytes": lora,
+        "lora_grad_bytes": dense_grad,
         "lora_select_backward_bytes": 0,
-        "adam_lora_bytes": lora * 2,
+        "adam_lora_bytes": dense_adam,
+        "adam_lora_bytes_if_dense": lora * 2,
         "lstm_with_adam_bytes": lstm_params * 12,
         "lstm_grad_bytes": lstm_params * 4,
         "expert_fp32_bytes": one_expert,
@@ -300,6 +312,7 @@ def estimate_bytes(
         "k1",
         "checkpoint_file_bytes",
         "file_cache_bytes",
+        "adam_lora_bytes_if_dense",
     }
     pinned = 0
     vram = {
@@ -920,7 +933,8 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     started = time.perf_counter()
     try:
         loss.backward()
-        flush_lora_slice_grads()
+        if not _uses_sparse_adam(optimizer):
+            flush_lora_slice_grads()
     except Exception:
         _SLICE_GRADS.clear()
         raise
@@ -934,6 +948,7 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     with _region("optimizer_step"):
         optimizer.step()
     model._add_time("optimizer_s", time.perf_counter() - started)
+    report.update(optimizer_account(optimizer))
     report["loss"] = float(loss.detach())
     report["distinct_experts"] = distinct_experts(plan)
     report["hot_entropy"] = _hot_entropy(plan)
@@ -965,15 +980,18 @@ def lm_step(model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, token
     return report
 
 
-def make_optimizer(model: OffloadLanguageModel, lr: float) -> torch.optim.Optimizer:
-    """AdamW sem ``foreach``. O caminho agrupado monta temporários do tamanho da LoRA inteira."""
+def make_optimizer(model: OffloadLanguageModel, lr: float, *, sparse: bool = False) -> torch.optim.Optimizer:
+    """AdamW sem ``foreach``. O caminho agrupado monta temporários do tamanho da LoRA inteira.
 
-    return torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=lr,
-        weight_decay=0.0,
-        foreach=False,
-    )
+    ``sparse=True`` guarda momento só da fatia tocada. O padrão continua o AdamW denso.
+    """
+
+    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not sparse:
+        return torch.optim.AdamW(params, lr=lr, weight_decay=0.0, foreach=False)
+    from moe_memory.offload.sparse_adamw import SparseAdamW
+
+    return SparseAdamW(params, lr=lr, weight_decay=0.0)
 
 
 def malloc_trim() -> None:
@@ -991,10 +1009,54 @@ def release_step_memory(optimizer: torch.optim.Optimizer) -> None:
     malloc_trim()
 
 
+def _uses_sparse_adam(optimizer: torch.optim.Optimizer) -> bool:
+    from moe_memory.offload.sparse_adamw import SparseAdamW
+
+    return isinstance(optimizer, SparseAdamW)
+
+
+def optimizer_account(optimizer: torch.optim.Optimizer) -> dict[str, int]:
+    """Tensores e parâmetros que o passo realmente atualizou, e o estado vivo."""
+
+    if _uses_sparse_adam(optimizer):
+        stats = optimizer.last_stats
+        return {
+            "optimizer_updated_tensors": int(stats["updated_tensors"]),
+            "optimizer_updated_params": int(stats["updated_params"]),
+            "optimizer_state_bytes": int(stats["state_bytes"]),
+            "optimizer_moment_slices": int(stats["moment_slices"]),
+        }
+    tensors = 0
+    params = 0
+    state_bytes = 0
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.grad is not None:
+                tensors += 1
+                params += param.numel()
+            state = optimizer.state.get(param, {})
+            for key in ("exp_avg", "exp_avg_sq"):
+                value = state.get(key)
+                if torch.is_tensor(value):
+                    state_bytes += value.numel() * value.element_size()
+    return {
+        "optimizer_updated_tensors": tensors,
+        "optimizer_updated_params": params,
+        "optimizer_state_bytes": state_bytes,
+        "optimizer_moment_slices": tensors,
+    }
+
+
 def grad_report(model: OffloadLanguageModel) -> dict[str, float | bool]:
     lstm = model.router.lstm.weight_ih_l0.grad
     lora_b = []
     finite = True
+    b_ids = {id(model.lora.gate_B), id(model.lora.up_B), id(model.lora.down_B)}
+    for _param, _layer, _expert, grad in _SLICE_GRADS:
+        if not bool(torch.isfinite(grad).all().item()):
+            finite = False
+        if id(_param) in b_ids:
+            lora_b.append(grad.detach())
     for name, parameter in model.named_parameters():
         if parameter.grad is None:
             continue
@@ -1054,6 +1116,8 @@ def save_checkpoint(path: str | Path, *, step: int, model: OffloadLanguageModel,
 
     directory = Path(path)
     directory.mkdir(parents=True, exist_ok=True)
+    if _uses_sparse_adam(optimizer):
+        optimizer.catch_up_all()
     entries: list[dict] = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -1086,6 +1150,23 @@ def save_checkpoint(path: str | Path, *, step: int, model: OffloadLanguageModel,
                     "file": rel,
                 }
             )
+        if _uses_sparse_adam(optimizer) and parameter.ndim >= 3:
+            for (layer, expert), (exp_avg, exp_avg_sq) in optimizer.slice_entries(parameter):
+                for key, value in (("exp_avg", exp_avg), ("exp_avg_sq", exp_avg_sq)):
+                    rel = f"optim/{len(entries):04d}-{key}.bin"
+                    _write_tensor(directory / rel, value)
+                    entries.append(
+                        {
+                            "kind": "optim-slice",
+                            "name": name,
+                            "layer": layer,
+                            "expert": expert,
+                            "key": key,
+                            "dtype": _dtype_name(value.dtype),
+                            "shape": list(value.shape),
+                            "file": rel,
+                        }
+                    )
     meta = {
         "version": 2,
         "kind": "qwen-lm-lora-lstm",
@@ -1154,6 +1235,7 @@ def load_checkpoint(path: str | Path, model: OffloadLanguageModel, optimizer: to
     if meta.get("version") != 2 or meta.get("kind") != "qwen-lm-lora-lstm":
         raise ValueError("checkpoint não é o formato em streaming da LM")
     named = dict(model.named_parameters())
+    pending: dict = {}
     for group, saved in zip(optimizer.param_groups, meta["param_groups"], strict=True):
         for key, value in saved.items():
             if key in group and key != "params":
@@ -1162,6 +1244,11 @@ def load_checkpoint(path: str | Path, model: OffloadLanguageModel, optimizer: to
         parameter = named[entry["name"]]
         if entry["kind"] == "param":
             _read_tensor_into(directory / entry["file"], parameter, entry)
+            continue
+        if entry["kind"] == "optim-slice":
+            if not _uses_sparse_adam(optimizer):
+                raise ValueError("checkpoint esparso pede SparseAdamW")
+            pending.setdefault(parameter, []).append(entry)
             continue
         slot = optimizer.state[parameter]
         if entry["kind"] == "optim-scalar":
@@ -1172,7 +1259,37 @@ def load_checkpoint(path: str | Path, model: OffloadLanguageModel, optimizer: to
         tensor = torch.empty(entry["shape"], dtype=_dtype_of(entry["dtype"]))
         _read_tensor_into(directory / entry["file"], tensor, entry)
         slot[entry["key"]] = tensor
+    if _uses_sparse_adam(optimizer):
+        _load_sparse_slices(directory, optimizer, pending)
     return meta
+
+
+def _load_sparse_slices(directory: Path, optimizer, pending: dict) -> None:
+    for parameter, entries in pending.items():
+        paired: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+        for entry in entries:
+            key = (int(entry["layer"]), int(entry["expert"]))
+            tensor = torch.empty(entry["shape"], dtype=_dtype_of(entry["dtype"]))
+            _read_tensor_into(directory / entry["file"], tensor, entry)
+            paired.setdefault(key, {})[entry["key"]] = tensor
+        step = int(optimizer.state[parameter]["step"].item())
+        for (layer, expert), moments in paired.items():
+            optimizer.load_slice(
+                parameter,
+                layer,
+                expert,
+                exp_avg=moments["exp_avg"],
+                exp_avg_sq=moments["exp_avg_sq"],
+                through=step,
+            )
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter.ndim < 3:
+                continue
+            state = optimizer.state.get(parameter)
+            if not state or "step" not in state:
+                continue
+            optimizer.mark_through(parameter, int(state["step"].item()))
 
 
 def _hot_entropy(plan) -> float:
@@ -1221,6 +1338,10 @@ def _apply_expert(model: OffloadLanguageModel, hidden, coeff, layer: int, expert
     _EXPERT_STATE["layer"] = layer
     _EXPERT_STATE["expert"] = expert
     lora = model.lora
+    from moe_memory.offload.sparse_adamw import catch_up_lora_slice
+
+    for param in (lora.gate_A, lora.gate_B, lora.up_A, lora.up_B, lora.down_A, lora.down_B):
+        catch_up_lora_slice(param, layer, expert)
     return _ExpertFn.apply(
         hidden,
         coeff,
