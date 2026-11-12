@@ -160,6 +160,20 @@ def test_lambda_outside_the_grid_exits_before_a_step(tmp_path: Path):
     assert not (tmp_path / "run" / "checkpoint.pt").exists()
 
 
+def test_no_checkpoint_keeps_the_log_and_skips_the_pt_file(tmp_path: Path):
+    config = _local_config(tmp_path)
+    work = tmp_path / "measure"
+    completed = _run_train(config, work, steps=1, no_checkpoint=True)
+    assert completed.returncode == 0, completed.stderr
+    assert (work / "train.jsonl").is_file()
+    assert not (work / "checkpoint.pt").exists()
+    assert not (work / "checkpoint.pt.tmp").exists()
+    done = json.loads((work / "done.json").read_text(encoding="utf-8"))
+    assert done["checkpoint_saved"] is False
+    assert done["steps"] == 1
+    assert _steps(work / "train.jsonl")[0]["finite"] is True
+
+
 def test_one_lambda_trains_and_resumes_on_cpu(tmp_path: Path):
     config = _local_config(tmp_path)
     work = tmp_path / "lambda-0"
@@ -172,6 +186,7 @@ def test_one_lambda_trains_and_resumes_on_cpu(tmp_path: Path):
     assert done["steps"] == 1
     assert done["lambda"] == 0.0
     assert done["finite"] is True
+    assert done["checkpoint_saved"] is True
     assert done["seq_len"] == 8
     lines = _steps(work / "train.jsonl")
     assert [row["step"] for row in lines] == [1]
@@ -316,28 +331,32 @@ def _run_train(
     *,
     steps: int,
     batch_size: int = 2,
+    no_checkpoint: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        str(ROOT / "experiments" / "train_wikitext.py"),
+        "--config",
+        str(config),
+        "--lambda",
+        "0",
+        "--steps",
+        str(steps),
+        "--seq-len",
+        "8",
+        "--batch-size",
+        str(batch_size),
+        "--checkpoint-every",
+        "1",
+        "--device",
+        "cpu",
+        "--work-dir",
+        str(work),
+    ]
+    if no_checkpoint:
+        command.append("--no-checkpoint")
     return subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "experiments" / "train_wikitext.py"),
-            "--config",
-            str(config),
-            "--lambda",
-            "0",
-            "--steps",
-            str(steps),
-            "--seq-len",
-            "8",
-            "--batch-size",
-            str(batch_size),
-            "--checkpoint-every",
-            "1",
-            "--device",
-            "cpu",
-            "--work-dir",
-            str(work),
-        ],
+        command,
         cwd=ROOT,
         check=False,
         capture_output=True,

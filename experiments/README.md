@@ -34,7 +34,7 @@ python3 experiments/train_wikitext.py --lambda 0.5 --device cuda
 python3 experiments/train_wikitext.py --lambda 0 --steps 2 --device cpu --seq-len 32 --batch-size 2
 ```
 
-`--epochs` (padrão 1) e `--steps` são exclusivos. A semente mexe no peso e na ordem dos blocos; o loader em si não embaralha. Cada semente repete a grade inteira antes da próxima. Retomar é repetir o mesmo comando: o cursor de sequências está no `checkpoint.pt` daquela semente e daquele λ. A grade escreve `outputs/wikitext/summary.json` (status e caminho de cada semente) e, por job, `train.log` mais `train.jsonl`. Trocar `--seq-len` no meio pede outro `--work-dir`.
+`--epochs` (padrão 1) e `--steps` são exclusivos. A semente mexe no peso e na ordem dos blocos; o loader em si não embaralha. Cada semente repete a grade inteira antes da próxima. Retomar é repetir o mesmo comando: o cursor de sequências está no `checkpoint.pt` daquela semente e daquele λ. Corrida de medição que não precisa retomar passa `--no-checkpoint`: não grava `checkpoint.pt`, nem no `--checkpoint-every`. O `train.jsonl` e o `done.json` continuam, com `checkpoint_saved: false`. A grade escreve `outputs/wikitext/summary.json` (status e caminho de cada semente) e, por job, `train.log` mais `train.jsonl`. Trocar `--seq-len` no meio pede outro `--work-dir`.
 
 ```text
 outputs/wikitext/summary.json

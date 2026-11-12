@@ -177,8 +177,11 @@ python3 scripts/train_qwen_lm.py \
     --lora-rank 4 --lora-alpha 8 \
     --lstm-embed 64 --lstm-hidden 64 \
     --lr 1e-4 --device cpu \
+    --no-checkpoint \
     --out outputs/qwen-lm-smoke
 ```
+
+O comando acima é o de medição: não grava o checkpoint de ~2,5 GB. Sem `--no-checkpoint` a mesma invocação grava `checkpoint/` para retomar.
 
 `--estimate-only` imprime a conta e não aloca o residente. Para `--seq-len 8`, rank 4 e LSTM 64, com o residente de 3082214946 bytes, a conta fecha em cerca de 7,5 GiB. Não é RSS medido. Isso não é corrida longa nem medida de qualidade. A entropia que o JSON guarda é diagnóstico, não termo de loss.
 
@@ -195,6 +198,8 @@ O teto de 7,53 GiB deixava de fora o gradiente da LoRA, a cabeça inteira em flo
 Na corrida da PR32 os dois passos terminaram e o processo morreu na passagem extra de validação e no `checkpoint.pt` de 2,6 GB. O checkpoint agora é um arquivo por tensor, com o Adam incluído, gravado depois de `zero_grad` e `malloc_trim`. O Adam usa `foreach=False`. A loss de validação só roda com `--valid-forward`, também depois de soltar o passo. `DONTNEED` continua sendo conselho: a página residual medida foi 1,0–1,6 GiB e entra na conta do cgroup.
 
 `--time-log` parte o tempo do passo sem mudar a loss. A leitura do expert aparece três vezes no código: o forward, a recomputação do checkpoint e o backward. O JSON também simula um LRU (`--expert-cache-sim`) e não guarda esses experts. `--expert-cache N` liga o LRU de verdade: guarda o bf16 do store, antes do float32, e solta os blocos antes do checkpoint. O padrão é 0. O backward relê a camada na hora, então um LRU de 64 vagas segura a camada corrente; a ordem entre camadas continua a do simulador.
+
+Run de medição, perfil ou smoke que não precisa retomar usa `--no-checkpoint`. Sem isso cada saída grava cerca de 2,5 GB em `checkpoint/weights` e `checkpoint/optim`. O `summary.json`, o `--time-log` e o `--memory-log` continuam. O JSON marca `checkpoint_saved`. O padrão segue gravando.
 
 `--expert-prefetch-layers D` (padrão 0) lê os experts numa thread enquanto a CPU computa a camada. No forward a fila é a das camadas `l+1..l+D`; no backward, que recomputa de trás para a frente, é `l-1..l-D`. O `pread` solta o GIL. A thread não chama o torch e não mexe no ioprio. O buffer tem teto (`--expert-prefetch-bytes`, ou `D * k2` blocos bf16) e entra na estimativa junto com o LRU. Com o cache de 64 o pico medido encostou em 9 GiB; a combinação que a conta ainda coloca sob 9 GiB é cache 32 mais uma camada de prefetch. Os dois são soltos antes do checkpoint. No Fedora o pytest usa `--basetemp` num diretório de disco, porque `/tmp` é tmpfs.
 

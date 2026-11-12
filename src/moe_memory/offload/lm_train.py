@@ -937,6 +937,23 @@ def load_trainable(model: OffloadLanguageModel, payload: dict) -> None:
     model.lora.load_state_dict(payload["lora"])
 
 
+def persist_checkpoint(
+    enabled: bool,
+    path: str | Path,
+    *,
+    step: int,
+    model: OffloadLanguageModel,
+    optimizer: torch.optim.Optimizer,
+    extra: dict,
+) -> bool:
+    """False não grava e não percorre parâmetros nem o estado do Adam."""
+
+    if not enabled:
+        return False
+    save_checkpoint(path, step=step, model=model, optimizer=optimizer, extra=extra)
+    return True
+
+
 def save_checkpoint(path: str | Path, *, step: int, model: OffloadLanguageModel, optimizer: torch.optim.Optimizer, extra: dict) -> None:
     """Grava um tensor por arquivo. Não monta o estado inteiro numa cópia só."""
 
