@@ -17,6 +17,7 @@ materializar um zero do tensor compartilhado inteiro a cada expert.
 float32. Não entra no grafo. Zero é o caminho de hoje.
 ``--expert-prefetch-layers D`` lê, numa thread, as próximas camadas
 enquanto a CPU computa a corrente. Zero desliga.
+``--device-compute cuda`` calcula uma camada na GPU. O padrão é a CPU.
 """
 
 from __future__ import annotations
@@ -222,6 +223,8 @@ def estimate_bytes(
     expert_prefetch_layers: int = 0,
     expert_prefetch_bytes: int = 0,
     k2: int = 6,
+    compute_cuda: bool = False,
+    compute_elem: int = 4,
 ) -> dict[str, int | None]:
     """Teto do anon com a cabeça e o expert em pedaços. Não inclui o store inteiro.
 
@@ -290,6 +293,43 @@ def estimate_bytes(
         "checkpoint_file_bytes",
         "file_cache_bytes",
     }
+    pinned = 0
+    vram = {
+        "vram_attention_bytes": 0,
+        "vram_experts_bytes": 0,
+        "vram_lora_bytes": 0,
+        "vram_activation_bytes": 0,
+        "vram_overhead_bytes": 0,
+        "vram_layers_on_device": 0,
+        "vram_bytes": 0,
+    }
+    if compute_cuda:
+        if n_heads is None or n_kv_heads is None or head_dim is None:
+            raise ValueError("a estimativa da GPU precisa das dimensões da atenção")
+        from moe_memory.offload.lm_gpu import estimate_pinned_bytes, estimate_vram_bytes
+
+        pinned = estimate_pinned_bytes(
+            hidden=hidden,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            intermediate=intermediate,
+            k2=max(k2, 1),
+        )
+        vram = estimate_vram_bytes(
+            hidden=hidden,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            intermediate=intermediate,
+            seq_len=seq_len,
+            k2=max(k2, 1),
+            rank=rank,
+            compute_elem=compute_elem,
+        )
+    pieces["pinned_bytes"] = pinned
+    pieces.update(vram)
+    skipped.update({"vram_attention_bytes", "vram_experts_bytes", "vram_lora_bytes", "vram_activation_bytes", "vram_overhead_bytes", "vram_layers_on_device", "vram_bytes"})
     pieces["total_bytes"] = sum(value for key, value in pieces.items() if key not in skipped and value is not None)
     pieces["cgroup_total_bytes"] = pieces["total_bytes"] + pieces["file_cache_bytes"]
     pieces["launch_ceiling_bytes"] = LAUNCH_CEILING_BYTES
@@ -367,6 +407,11 @@ class OffloadLanguageModel(nn.Module):
         self.expert_cache = ExpertWeightCache(0, 0)
         self.prefetch = ExpertPrefetcher(self)
         self.store_reads = 0
+        self.compute_device = torch.device("cpu")
+        self.compute_dtype = torch.float32
+        self.vram_budget = 0
+        self.gpu = None
+        self._expert_plan: list[list[tuple[int, int]]] = []
         self.expert_live = 0
         self.expert_live_max = 0
         self._io_phase = "forward"
@@ -385,8 +430,10 @@ class OffloadLanguageModel(nn.Module):
         with _region("router_plan"):
             plan, _state = self.router.plan(token_ids)
         self._add_time("router_plan_s", time.perf_counter() - started)
-        if self.prefetch.enabled:
-            self.prefetch.set_plan(experts_by_layer(plan))
+        if self.prefetch.enabled or self.gpu is not None:
+            self._expert_plan = experts_by_layer(plan)
+            if self.prefetch.enabled:
+                self.prefetch.set_plan(self._expert_plan)
         hidden = self._embed(token_ids)
         self._phase("embed")
         spec = self.weights.spec
@@ -433,9 +480,36 @@ class OffloadLanguageModel(nn.Module):
                 return self._layer_body(hidden, coeffs, index, valid, spec, layer, layer_index)
         return self._layer_body(hidden, coeffs, index, valid, spec, layer, layer_index)
 
+    def set_compute_device(self, device: torch.device, vram_budget: int) -> None:
+        """``cpu`` é o caminho de hoje. ``cuda`` calcula uma camada por vez."""
+
+        if vram_budget < 1:
+            raise ValueError("orçamento de VRAM precisa ser >= 1 byte")
+        if device.type == "cpu":
+            self.compute_device = torch.device("cpu")
+            self.compute_dtype = torch.float32
+            self.vram_budget = 0
+            if self.gpu is not None:
+                self.gpu.close()
+            self.gpu = None
+            return
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA não está disponível. O compute misto não sobe.")
+        from moe_memory.offload.lm_gpu import LayerTransport, compute_dtype_for
+
+        self.compute_device = torch.device(device)
+        self.compute_dtype = compute_dtype_for(self.compute_device)
+        self.vram_budget = int(vram_budget)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        self.gpu = LayerTransport(self)
+        torch.cuda.reset_peak_memory_stats(self.compute_device)
+
     def _layer_body(self, hidden, coeffs, index, valid, spec, layer, layer_index):
         direction = 1 if self._io_phase == "forward" else -1
         self.prefetch.arm(layer_index, direction)
+        if self.gpu is not None:
+            return self._layer_body_gpu(hidden, coeffs, index, valid, spec, layer, layer_index, direction)
         started = time.perf_counter()
         normed = rms_norm(hidden, _as(layer.input_norm, hidden), spec.rms_eps)
         self._add_time(self._phase_key("resident_s"), time.perf_counter() - started)
@@ -446,6 +520,51 @@ class OffloadLanguageModel(nn.Module):
         self._add_time(self._phase_key("resident_s"), time.perf_counter() - started)
         hidden = hidden + self._moe(moe_in, layer_index, index, valid, coeffs)
         return hidden
+
+    def _layer_body_gpu(self, hidden, coeffs, index, valid, spec, layer, layer_index, direction):
+        gpu = self.gpu
+        blobs = self._cached_expert_blobs(layer_index)
+        pack = gpu.ensure(layer_index, layer, blobs)
+        hidden_g = hidden.to(device=gpu.device, dtype=gpu.dtype)
+        coeffs_g = coeffs.to(device=gpu.device, dtype=gpu.dtype)
+        compute_start = compute_end = None
+        if self.time_log:
+            compute_start = torch.cuda.Event(enable_timing=True)
+            compute_start.record()
+        normed = rms_norm(hidden_g, _as(pack.layer.input_norm, hidden_g), spec.rms_eps)
+        with _region(f"attention_layer_{layer_index}"):
+            hidden_g = hidden_g + _attention_seq(pack.layer, normed, spec)
+        moe_in = rms_norm(hidden_g, _as(pack.layer.post_norm, hidden_g), spec.rms_eps)
+        hidden_g = hidden_g + self._moe(moe_in, layer_index, index, valid, coeffs_g)
+        if compute_start is not None:
+            compute_end = torch.cuda.Event(enable_timing=True)
+            compute_end.record()
+            gpu.note_compute(compute_start, compute_end)
+        nxt = layer_index + direction
+        if self._expert_plan and 0 <= nxt < len(self._expert_plan):
+            gpu.stage_ahead(nxt, self.weights.layers[nxt], self._cached_expert_blobs(nxt))
+        nbytes = hidden_g.numel() * hidden_g.element_size()
+        d2h_start = d2h_end = None
+        if self.time_log:
+            d2h_start = torch.cuda.Event(enable_timing=True)
+            d2h_start.record()
+        out = hidden_g.to(device="cpu", dtype=torch.float32)
+        if d2h_start is not None:
+            d2h_end = torch.cuda.Event(enable_timing=True)
+            d2h_end.record()
+            gpu.note_d2h(d2h_start, d2h_end, nbytes)
+        gpu.check_budget()
+        return out
+
+    def _cached_expert_blobs(self, layer_index: int) -> dict[tuple[int, int], tuple[bytes, bytes, bytes]]:
+        found: dict[tuple[int, int], tuple[bytes, bytes, bytes]] = {}
+        if not self._expert_plan or not 0 <= layer_index < len(self._expert_plan):
+            return found
+        for key in self._expert_plan[layer_index]:
+            blob = self.expert_cache.peek(key)
+            if blob is not None:
+                found[key] = blob
+        return found
 
     def _moe(self, hidden, layer_index, index, valid, coeffs):
         flat = hidden[0]
@@ -494,9 +613,17 @@ class OffloadLanguageModel(nn.Module):
 
         self.prefetch.stop()
         self.expert_cache.clear()
+        if self.gpu is not None:
+            self.gpu.close()
 
     def _read(self, layer: int, expert: int, kind: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         key = (layer, expert)
+        if self.gpu is not None:
+            ready = self.gpu.take_expert(layer, expert)
+            if ready is not None:
+                if self.time_log:
+                    self._read_seq.append((key, int(self.store.header.raw_nbytes)))
+                return ready
         if self.prefetch.enabled:
             blobs, sync_s = self.prefetch.obtain(layer, expert, kind)
             nbytes = len(blobs[0]) + len(blobs[1]) + len(blobs[2])
@@ -520,6 +647,8 @@ class OffloadLanguageModel(nn.Module):
                 nbytes = len(gate_b) + len(up_b) + len(down_b)
         if self.time_log:
             self._read_seq.append((key, nbytes))
+        if self.gpu is not None:
+            return self.gpu.h2d_now(layer, expert, (gate_b, up_b, down_b))
         started = time.perf_counter()
         with _region(f"bf16_fp32_{kind}"):
             layout = self.store.layout
@@ -546,6 +675,9 @@ class OffloadLanguageModel(nn.Module):
         self._io_phase = "forward"
         self.expert_cache.reset_counters()
         self.prefetch.reset_counters()
+        if self.gpu is not None:
+            self.gpu.reset()
+            torch.cuda.reset_peak_memory_stats(self.compute_device)
 
     def timing_report(self, wall_s: float) -> dict[str, float | int | dict | None]:
         exclusive = (
@@ -555,6 +687,7 @@ class OffloadLanguageModel(nn.Module):
             "attention_s",
             "expert_read_forward_s",
             "prefetch_wait_s",
+            "h2d_wait_s",
             "expert_convert_forward_s",
             "expert_compute_forward_s",
             "cross_entropy_forward_s",
@@ -589,6 +722,21 @@ class OffloadLanguageModel(nn.Module):
         report["expert_cache"] = self.expert_cache.stats()
         report["expert_prefetch"] = self.prefetch.stats()
         report["store_reads"] = self.store_reads
+        gpu_times = {
+            "h2d_s": 0.0,
+            "d2h_s": 0.0,
+            "h2d_wait_s": float(self._times.get("h2d_wait_s", 0.0)),
+            "h2d_wait_backward_s": float(self._times.get("h2d_wait_backward_s", 0.0)),
+            "gpu_compute_s": 0.0,
+            "h2d_bytes": 0,
+            "d2h_bytes": 0,
+        }
+        if self.gpu is not None:
+            gpu_times = self.gpu.resolve()
+        report.update(gpu_times)
+        report["optimizer_cpu_s"] = float(self._times.get("optimizer_s", 0.0))
+        report["compute_device"] = self.compute_device.type
+        report["compute_dtype"] = str(self.compute_dtype).removeprefix("torch.")
         return report
 
 
@@ -910,7 +1058,19 @@ class _ExpertFn(torch.autograd.Function):
         try:
             with _region(f"expert_compute_{kind}"):
                 with torch.no_grad():
-                    projected = _swiglu(hidden, gate, up, down, gate_a, gate_b, up_a, up_b, down_a, down_b, ctx.scale)
+                    projected = _swiglu(
+                        hidden,
+                        gate,
+                        up,
+                        down,
+                        _align(gate_a, hidden),
+                        _align(gate_b, hidden),
+                        _align(up_a, hidden),
+                        _align(up_b, hidden),
+                        _align(down_a, hidden),
+                        _align(down_b, hidden),
+                        ctx.scale,
+                    )
                     out = projected * coeff.unsqueeze(-1)
         finally:
             model._add_time(f"expert_compute_{kind}_s", time.perf_counter() - started)
@@ -924,16 +1084,8 @@ class _ExpertFn(torch.autograd.Function):
         hidden, coeff, gate_a, gate_b, up_a, up_b, down_a, down_b = ctx.saved_tensors
         model = ctx.model
         with torch.enable_grad():
-            inputs = [
-                hidden.detach().requires_grad_(True),
-                coeff.detach().requires_grad_(True),
-                gate_a.detach().requires_grad_(True),
-                gate_b.detach().requires_grad_(True),
-                up_a.detach().requires_grad_(True),
-                up_b.detach().requires_grad_(True),
-                down_a.detach().requires_grad_(True),
-                down_b.detach().requires_grad_(True),
-            ]
+            inputs = [_as_grad_input(hidden, hidden), _as_grad_input(coeff, hidden)]
+            inputs.extend(_as_grad_input(tensor, hidden) for tensor in (gate_a, gate_b, up_a, up_b, down_a, down_b))
             gate, up, down = model._read(ctx.layer, ctx.expert, "backward")
             model._note_expert(1)
             started = time.perf_counter()
@@ -947,7 +1099,12 @@ class _ExpertFn(torch.autograd.Function):
                 model._note_expert(-1)
                 del gate, up, down
         if _RETURN_SLICE_GRADS:
-            return grads
+            fixed = list(grads)
+            for index in range(2, len(fixed)):
+                grad = fixed[index]
+                if grad is not None and grad.device.type != "cpu":
+                    fixed[index] = grad.detach().to("cpu")
+            return tuple(fixed)
         lora = model.lora
         for param, grad in (
             (lora.gate_A, grads[2]),
@@ -967,10 +1124,26 @@ _SLICE_GRADS: list[tuple[torch.nn.Parameter, int, int, torch.Tensor]] = []
 _RETURN_SLICE_GRADS = False
 
 
+def _align(tensor: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    if tensor.device == ref.device and tensor.dtype == ref.dtype:
+        return tensor
+    return tensor.detach().to(device=ref.device, dtype=ref.dtype)
+
+
+def _as_grad_input(tensor: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    out = tensor.detach()
+    if out.device != ref.device or out.dtype != ref.dtype:
+        out = out.to(device=ref.device, dtype=ref.dtype)
+    return out.requires_grad_(True)
+
+
 def _queue_slice_grad(param: torch.nn.Parameter, layer: int, expert: int, grad: torch.Tensor | None) -> None:
     if grad is None:
         return
-    _SLICE_GRADS.append((param, int(layer), int(expert), grad.detach()))
+    grad = grad.detach()
+    if grad.device.type != "cpu":
+        grad = grad.to("cpu")
+    _SLICE_GRADS.append((param, int(layer), int(expert), grad))
 
 
 def flush_lora_slice_grads() -> None:
@@ -1137,6 +1310,9 @@ class ExpertWeightCache:
 
     def contains(self, key: tuple[int, int]) -> bool:
         return key in self._items
+
+    def peek(self, key: tuple[int, int]) -> tuple[bytes, bytes, bytes] | None:
+        return self._items.get(key)
 
     def touch(self, key: tuple[int, int]) -> tuple[bytes, bytes, bytes] | None:
         found = self._items.get(key)

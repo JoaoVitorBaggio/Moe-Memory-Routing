@@ -214,6 +214,125 @@ def test_cache_32_and_one_prefetch_layer_fit_under_9gib():
     assert launch_allowed(estimate) is True
 
 
+def test_cuda_layer_budget_fits_under_5gb_and_9gib_host():
+    from moe_memory.offload.lm_gpu import assert_vram_fits, host_compute_threads
+
+    nine = 9_663_676_416
+    budget = int(5 * 1024**3)
+    estimate = estimate_bytes(
+        resident_bytes=3_082_214_946,
+        vocab=151_936,
+        hidden=2048,
+        intermediate=768,
+        n_layers=48,
+        n_experts=128,
+        rank=4,
+        seq_len=32,
+        k1=4,
+        lstm_embed=64,
+        lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=nine,
+        read_cgroup=False,
+        expert_cache_slots=32,
+        expert_prefetch_layers=1,
+        k2=6,
+        compute_cuda=True,
+        compute_elem=4,
+    )
+    assert estimate["vram_layers_on_device"] == 2
+    assert estimate["pinned_bytes"] > 0
+    assert estimate["vram_bytes"] < budget
+    assert estimate["total_bytes"] < LAUNCH_CEILING_BYTES
+    assert estimate["cgroup_total_bytes"] < nine
+    assert launch_allowed(estimate) is True
+    assert_vram_fits(int(estimate["vram_bytes"]), budget)
+    with pytest.raises(ValueError, match="VRAM"):
+        assert_vram_fits(int(estimate["vram_bytes"]), 1024)
+    assert host_compute_threads(4, False) == 4
+    assert host_compute_threads(4, True) == 3
+
+
+def test_layer_transport_copies_a_layer_on_cpu(tmp_path: Path):
+    from moe_memory.offload.lm_gpu import LayerTransport
+
+    model, store, _directory = _model(tmp_path)
+    try:
+        assert model.gpu is None
+        model.compute_device = torch.device("cpu")
+        model.compute_dtype = torch.float32
+        model.vram_budget = 10**12
+        model.time_log = True
+        model._times = {}
+        model._io_phase = "forward"
+        transport = LayerTransport(model)
+        assert callable(transport._h2d)
+        layer = model.weights.layers[0]
+        raw = model.store.payload(0, 0)
+        pack = transport.ensure(0, layer, {(0, 0): raw})
+        assert torch.allclose(pack.layer.input_norm, layer.input_norm.to(dtype=torch.float32))
+        assert torch.allclose(pack.layer.q, layer.q.to(dtype=torch.float32))
+        gate, _up, _down = transport.take_expert(0, 0)
+        assert gate.shape[0] == model.store.layout.intermediate
+        copied = transport.h2d_now(0, 1, model.store.payload(0, 1))
+        assert copied[0].shape == gate.shape
+        assert transport.take_expert(0, 1)[0] is copied[0]
+        transport.stage_ahead(1, model.weights.layers[1], {})
+        nxt = transport.ensure(1, model.weights.layers[1], {})
+        assert nxt.layer.o.shape == model.weights.layers[1].o.shape
+        report = transport.resolve()
+        assert report["h2d_bytes"] > 0
+        assert report["h2d_s"] == 0.0
+        transport.check_budget()
+        transport.close()
+        assert transport._ready is None
+    finally:
+        store.close()
+
+
+def test_default_compute_stays_on_cpu(tmp_path: Path):
+    model, store, _directory = _model(tmp_path)
+    try:
+        assert model.compute_device.type == "cpu"
+        assert model.gpu is None
+        tokens = torch.tensor([[1, 2, 3, 4, 5, 6]])
+        loss, _plan = model.forward_window(tokens)
+        assert loss.device.type == "cpu"
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sem CUDA neste host")
+def test_gpu_step_loss_matches_cpu_within_bf16_tolerance(tmp_path: Path):
+    from moe_memory.offload.lm_train import flush_lora_slice_grads
+
+    tokens = torch.tensor([[1, 2, 3, 4, 5, 6, 1, 2, 3, 4]])
+    cpu, cpu_store, _cpu_dir = _model(tmp_path / "cpu")
+    gpu, gpu_store, _gpu_dir = _model(tmp_path / "gpu")
+    try:
+        gpu.set_compute_device(torch.device("cuda"), vram_budget=int(5 * 1024**3))
+        loss_cpu, _plan = cpu.forward_window(tokens)
+        loss_gpu, _plan = gpu.forward_window(tokens)
+        tol = 1e-2 if gpu.compute_dtype == torch.bfloat16 else 1e-4
+        assert torch.allclose(loss_gpu.cpu(), loss_cpu, atol=tol, rtol=tol)
+        loss_cpu.backward()
+        flush_lora_slice_grads()
+        loss_gpu.backward()
+        flush_lora_slice_grads()
+        assert gpu.lora.gate_B.grad is not None
+        assert gpu.lora.gate_B.grad.device.type == "cpu"
+        assert gpu.router.lstm.weight_ih_l0.grad.device.type == "cpu"
+        assert torch.allclose(gpu.lora.gate_B.grad, cpu.lora.gate_B.grad, atol=tol * 2, rtol=tol * 2)
+        assert int(torch.cuda.max_memory_allocated()) < int(5 * 1024**3)
+    finally:
+        gpu.release_expert_cache()
+        cpu.release_expert_cache()
+        cpu_store.close()
+        gpu_store.close()
+
+
 def test_one_token_attention_matches_decode_and_is_causal(tmp_path: Path):
     model, store, _directory = _model(tmp_path)
     try:

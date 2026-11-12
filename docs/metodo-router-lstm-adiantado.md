@@ -198,7 +198,7 @@ Na corrida da PR32 os dois passos terminaram e o processo morreu na passagem ext
 
 `--expert-prefetch-layers D` (padrão 0) lê os experts numa thread enquanto a CPU computa a camada. No forward a fila é a das camadas `l+1..l+D`; no backward, que recomputa de trás para a frente, é `l-1..l-D`. O `pread` solta o GIL. A thread não chama o torch e não mexe no ioprio. O buffer tem teto (`--expert-prefetch-bytes`, ou `D * k2` blocos bf16) e entra na estimativa junto com o LRU. Com o cache de 64 o pico medido encostou em 9 GiB; a combinação que a conta ainda coloca sob 9 GiB é cache 32 mais uma camada de prefetch. Os dois são soltos antes do checkpoint. No Fedora o pytest usa `--basetemp` num diretório de disco, porque `/tmp` é tmpfs.
 
-O passo seguinte, ainda não feito, é o treino misto: Adam e gradiente na RAM, o compute de cada camada na GPU de cerca de 6 GB, com offload SSD, RAM e VRAM.
+`--device-compute cuda` calcula uma camada por vez na GPU. O padrão continua a CPU. O Adam, o gradiente da LoRA e o LSTM ficam na RAM. A cópia usa pinned e um stream separado; o pinned entra na conta da RAM do host. A 1060 não executa bf16, então o compute nela é fp32. Ampere ou mais novo pode usar bf16. O orçamento `--vram-budget-gb` (padrão 5) recusa o passo se a estimativa de duas camadas não cabe. Não sobe o modelo inteiro.
 
 `--profile-step N` liga o `torch.profiler` só nesse passo, com atividade de CPU, formas gravadas e sem `profile_memory`. `--profile-stack` e `--profile-trace` ficam desligados: o trace chrome pode ficar grande. O buffer esperado, sem stack e sem trace, é de dezenas a poucas centenas de MB em cima do RSS já estável. Não foi medido na 1060.
 
