@@ -125,11 +125,13 @@ def test_loaded_checkpoint_matches_the_in_memory_eval(tmp_path: Path):
 def test_night_batch_dry_run_lists_every_stage_without_touching_the_store():
     night = _load("night_batch_under_test", "night_batch.py")
     dense = _load("eval_dense_under_test", "eval_dense.py")
-    steps = night.build_steps()
-    text = night.render(steps)
-    joined = "\n".join(" ".join(night.launch(step["cmd"])) for step in steps)
+    out_dir = ROOT / "outputs/night-paper-dry-run"
+    steps = night.build_steps(out_dir, ROOT)
+    text = night.render(steps, ROOT)
+    joined = "\n".join(" ".join(night.launch(step["cmd"], ROOT)) for step in steps)
     assert "a-val-32" in text and "c-train-topk4" in text and "e-4b" in text
     assert "systemd-run" in joined
+    assert f"--working-directory={ROOT.resolve()}" in joined
     assert "MemoryMax=9663676416" in joined
     assert "MemorySwapMax=0" in joined
     assert "OOMPolicy=stop" in joined
