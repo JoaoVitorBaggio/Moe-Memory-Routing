@@ -22,6 +22,20 @@ DENSE_MODELS = {
 }
 EXPECTED_VOCAB = 151_936
 
+DENSE_INSTALL_HINT = (
+    "Pacote transformers ausente. Instale com: "
+    "pip install 'moe-memory-routing[dense]' "
+    "(ou: uv pip install 'moe-memory-routing[dense]')."
+)
+
+
+def _import_transformers():
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ModuleNotFoundError as exc:
+        raise SystemExit(DENSE_INSTALL_HINT) from exc
+    return AutoModelForCausalLM, AutoTokenizer
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Perplexidade e tok/s de um Qwen3 denso pequeno.")
@@ -78,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
 
     local = load_qwen_tokenizer(args.tokenizer_dir)
     probes = {text: local.encode(text) for text in ("Hello", " ", "\n\n")}
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    AutoModelForCausalLM, AutoTokenizer = _import_transformers()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, cache_dir=None)
     args.dest.mkdir(parents=True, exist_ok=True)

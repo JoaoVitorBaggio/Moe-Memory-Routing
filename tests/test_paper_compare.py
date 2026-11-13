@@ -7,7 +7,14 @@ from pathlib import Path
 
 import torch
 
-from moe_memory.offload.lm_gpu import QWEN_VRAM_FIT_SLACK, QWEN_VRAM_MEASURED_PEAK, fit_vram_cache
+from moe_memory.offload.lm_gpu import (
+    QWEN_VRAM_FIT_SLACK,
+    QWEN_VRAM_MIN_MARGIN_BYTES,
+    QWEN_VRAM_MEASURED_PEAK,
+    fit_qwen_vram_cache,
+    fit_vram_cache,
+    predict_qwen_vram_peak,
+)
 from moe_memory.offload.lm_train import (
     estimate_bytes,
     evaluate_windows,
@@ -81,13 +88,105 @@ def test_qwen_cache_shrinks_to_the_measured_budget_and_lstm_does_not():
         vram_cache_elem=2,
     )
     qwen = estimate_bytes(**common, vram_k=8, trainable_lstm=False)
-    used = fit_vram_cache(int(qwen["vram_bytes"]), requested, budget, QWEN_VRAM_FIT_SLACK)
+    used = fit_qwen_vram_cache(
+        int(qwen["vram_bytes"]),
+        requested,
+        budget,
+        QWEN_VRAM_FIT_SLACK,
+        seq_len=32,
+        vram_k=8,
+        hidden=2048,
+        intermediate=768,
+        n_heads=32,
+        compute_elem=4,
+        vram_cache_elem=2,
+    )
     assert used < requested
     assert int(qwen["vram_bytes"]) + QWEN_VRAM_FIT_SLACK - (requested - used) <= budget
-    predicted = QWEN_VRAM_MEASURED_PEAK - (requested - used)
-    assert predicted <= budget
+    predicted = predict_qwen_vram_peak(
+        requested,
+        used,
+        seq_len=32,
+        vram_k=8,
+        hidden=2048,
+        intermediate=768,
+        n_heads=32,
+        compute_elem=4,
+    )
+    assert predicted <= budget - QWEN_VRAM_MIN_MARGIN_BYTES
+    assert predicted == QWEN_VRAM_MEASURED_PEAK - (requested - used)
     lstm = estimate_bytes(**common)
     assert fit_vram_cache(int(lstm["vram_bytes"]), requested, budget, 0) == requested
+
+
+def test_qwen_fit_shrinks_more_at_context_128_than_at_32():
+    requested = 3 * 1024**3
+    budget = 5 * 1024**3
+    common = dict(
+        resident_bytes=3_082_214_946,
+        vocab=151_936,
+        hidden=2048,
+        intermediate=768,
+        n_layers=48,
+        n_experts=128,
+        rank=4,
+        k1=4,
+        lstm_embed=64,
+        lstm_hidden=64,
+        n_heads=32,
+        n_kv_heads=4,
+        head_dim=128,
+        cgroup_bytes=9_663_676_416,
+        read_cgroup=False,
+        k2=6,
+        compute_cuda=True,
+        compute_elem=4,
+        vram_expert_cache_bytes=requested,
+        lm_head_vram=True,
+        vram_cache_elem=2,
+        trainable_lstm=False,
+        vram_k=8,
+    )
+    short = estimate_bytes(**common, seq_len=32)
+    long = estimate_bytes(**common, seq_len=128)
+    used_short = fit_qwen_vram_cache(
+        int(short["vram_bytes"]),
+        requested,
+        budget,
+        QWEN_VRAM_FIT_SLACK,
+        seq_len=32,
+        vram_k=8,
+        hidden=2048,
+        intermediate=768,
+        n_heads=32,
+        compute_elem=4,
+        vram_cache_elem=2,
+    )
+    used_long = fit_qwen_vram_cache(
+        int(long["vram_bytes"]),
+        requested,
+        budget,
+        QWEN_VRAM_FIT_SLACK,
+        seq_len=128,
+        vram_k=8,
+        hidden=2048,
+        intermediate=768,
+        n_heads=32,
+        compute_elem=4,
+        vram_cache_elem=2,
+    )
+    assert used_long <= used_short
+    peak_long = predict_qwen_vram_peak(
+        requested,
+        used_long,
+        seq_len=128,
+        vram_k=8,
+        hidden=2048,
+        intermediate=768,
+        n_heads=32,
+        compute_elem=4,
+    )
+    assert peak_long <= budget - QWEN_VRAM_MIN_MARGIN_BYTES
 
 
 def test_paper_windows_are_stable_and_cover_the_token_budget():

@@ -1196,7 +1196,8 @@ def optimizer_account(optimizer: torch.optim.Optimizer) -> dict[str, int]:
 
 
 def grad_report(model: OffloadLanguageModel) -> dict[str, float | bool]:
-    lstm = model.router.lstm.weight_ih_l0.grad
+    lstm_module = getattr(model.router, "lstm", None)
+    lstm = None if lstm_module is None else lstm_module.weight_ih_l0.grad
     lora_b = []
     finite = True
     b_ids = {id(model.lora.gate_B), id(model.lora.up_B), id(model.lora.down_B)}

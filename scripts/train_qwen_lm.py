@@ -25,7 +25,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import torch
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
-from moe_memory.offload.lm_gpu import QWEN_VRAM_FIT_SLACK, fit_vram_cache, host_compute_threads
+from moe_memory.offload.lm_gpu import QWEN_VRAM_FIT_SLACK, fit_qwen_vram_cache, host_compute_threads
 from moe_memory.offload.lm_train import (
     LAUNCH_CEILING_BYTES,
     OffloadLanguageModel,
@@ -253,7 +253,26 @@ def main(argv: list[str] | None = None) -> int:
         vram_slack = 0
         if args.router == "qwen" and args.device_compute == "cuda":
             vram_slack = QWEN_VRAM_FIT_SLACK
-            cache_bytes = fit_vram_cache(int(estimate["vram_bytes"]), requested_cache, int(args.vram_budget_gb * 1024**3), vram_slack)
+            vram_budget_bytes = int(args.vram_budget_gb * 1024**3)
+            compute_elem = 2 if _cuda_compute_is_bf16() else 4
+            cache_bytes = fit_qwen_vram_cache(
+                int(estimate["vram_bytes"]),
+                requested_cache,
+                vram_budget_bytes,
+                vram_slack,
+                seq_len=args.seq_len,
+                vram_k=qwen_topk,
+                hidden=spec.hidden_size,
+                intermediate=spec.moe_intermediate,
+                n_heads=spec.n_heads,
+                compute_elem=compute_elem,
+                vram_cache_elem=2 if args.vram_cache_dtype == "bf16" else 4,
+            )
+            if cache_bytes != requested_cache:
+                print(
+                    f"cache VRAM qwen: pedido {requested_cache} bytes, efetivo {cache_bytes} bytes",
+                    flush=True,
+                )
             if cache_bytes != requested_cache:
                 estimate = estimate_bytes(
                     resident_bytes=resident_bytes,
