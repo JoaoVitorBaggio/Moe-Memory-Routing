@@ -2,7 +2,7 @@
 
 Documento de portfólio para o trabalho **Aprendizado Profundo (AGL11157)**, UFRGS, 2026/2. Integrantes: João Vítor Baggio, Eric D Arriaga, Taylor Souza Frutuoso da Costa.
 
-O repositório guarda duas linhas de trabalho: **fase 1** (MoE pequeno com emulação de níveis) e **fase 2** (Qwen3-30B-A3B com offload real e roteador LSTM). Números da fase 1 vêm dos arquivos em [`results/`](../results/README.md); números da fase 2 citados aqui vêm das medições descritas em [`metodo-router-lstm-adiantado.md`](metodo-router-lstm-adiantado.md) e [`medicoes-hw-fedora-qwen3.md`](medicoes-hw-fedora-qwen3.md), salvo quando indicado abaixo.
+O repositório guarda duas linhas de trabalho: **fase 1** (MoE pequeno com emulação de níveis) e **fase 2** (Qwen3-30B-A3B com offload real e roteador LSTM). Números da fase 1 vêm dos arquivos em [`results/`](../results/README.md). Na fase 2, [`metodo-router-lstm-adiantado.md`](metodo-router-lstm-adiantado.md) e [`medicoes-hw-fedora-qwen3.md`](medicoes-hw-fedora-qwen3.md) cobrem **arquitetura** e **bandas de hardware**; a **perplexidade do checkpoint L1**, a **curva de eval do treino de 1.000 passos** e os **tempos por passo** vêm de **logs em `outputs/` no Fedora** (não versionados), salvo quando indicado abaixo.
 
 ---
 
@@ -58,7 +58,7 @@ Desenho detalhado: [`metodo-router-lstm-adiantado.md`](metodo-router-lstm-adiant
 
 | Configuração | Tempo por passo | Leituras SSD/passo (ordem) |
 | --- | ---: | ---: |
-| LoRA + LSTM (antecipação) | **~3,3 s** | não inventado além do ganho relativo abaixo |
+| LoRA + LSTM (antecipação) | **~3,3 s** | não medido |
 | Gate Qwen original, top-4 | **~320 s** | **~3.300** |
 
 Razão direta: o **gate original só conhece os experts no instante** em que a camada executa; cada passo puxa do SSD sob demanda. O **LSTM decide com antecedência** a partir dos tokens, alinhado aos horizontes `L₁`/`L₂` e ao orçamento **`b₂` ~ 5–6** experts novos do SSD por token ([`medicoes-hw-fedora-qwen3.md`](medicoes-hw-fedora-qwen3.md)).
@@ -92,7 +92,7 @@ Razão direta: o **gate original só conhece os experts no instante** em que a c
 
 | baseline | status |
 | --- | --- |
-| Qwen3-30B-A3B, **gate original top-8** | **não medido** — não coube no orçamento de **5 GiB** de VRAM (**5.397.186.048 B** alocados na tentativa documentada em [`metodo-router-lstm-adiantado.md`](metodo-router-lstm-adiantado.md)) |
+| Qwen3-30B-A3B, **gate original top-8** | **não medido** — não coube no orçamento de **5 GiB** de VRAM (**5.397.186.048 B** alocados; log do lote de avaliação de **13/11/2026** no Fedora, em `outputs/` não versionado) |
 | Qwen3-30B-A3B, gate top-4 com offload | treino inviável (**~320 s/passo**); PPL **não medida** nas janelas acima |
 | Qwen3-1.7B / 4B denso | **não medido** |
 | llama.cpp quantizado | **não medido** |
