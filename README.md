@@ -1,118 +1,50 @@
 # Roteamento consciente de memória
 
-Mixture of Experts (MoE) pequeno com hierarquia **emulada** VRAM / RAM / SSD e roteador treinado com custo explícito de memória e de troca. Trabalho final de **Aprendizado Profundo (AGL11157)**, UFRGS, 2026/2.
+Trabalho de **Aprendizado Profundo (AGL11157)**, UFRGS, 2026/2. O projeto começou na **fase 1** com um MoE pequeno (`E=32`, `k=2`): hierarquia **emulada** VRAM/RAM/SSD, roteador treinado com custo de memória (`λ`), baselines top-k, **LRU** e denso — números em [`results/`](results/README.md). Na **fase 2**, o alvo passou a ser o **Qwen3-30B-A3B** real: ~6.144 experts repackados num store de ~57 GB no SSD, pesos residentes ~3,1 GB, offload **SSD→RAM→VRAM** numa GTX 1060 6 GB, e um **roteador LSTM** que lê só tokens e antecipa quais experts carregar (em vez do gate original, que só decide na hora). Detalhe completo em [**docs/relatorio.md**](docs/relatorio.md).
 
-**Status:** blueprint revisado (out/2026) após feedback do prof. Joel Luís Carbonera. O esqueleto PyTorch está em `src/moe_memory/`: passo sintético, loaders de TinyStories (dev) e WikiText-2 (entrega), e residência física fora da VRAM quando o device é CUDA. Os números copiados do `outputs/` da GTX 1060 estão em [`results/`](results/README.md) (treino da semente 0 em 2026-10-31; hold-out, dose, parede, sementes 1–2 da grade e proxy em 2026-11-02). `notebooks/` segue vazio.
+## Resultados em destaque
 
-## Resumo
-
-Cada expert fica num nível de memória emulado: quente (VRAM), morno (RAM) ou frio (SSD). A loss junta a entropia cruzada do próximo token, um *proxy* diferenciável do custo de memória/troca, e o balanceamento de carga. A hipótese é que variar esse custo (e o orçamento) melhora a fronteira qualidade × latência / I/O frente a baselines fortes, no mesmo corpus.
-
-## Pergunta de pesquisa
-
-Um roteador treinado com penalidade de memória e de troca melhora a fronteira qualidade × latência (e o volume de I/O) em relação a:
-
-1. MoE top-k sem custo de memória;
-2. o mesmo MoE com **LRU de experts** — o adversário principal, não só “qualquer MoE”;
-3. um modelo denso com parâmetros ativos comparáveis?
-
-Pergunta secundária (dose–resposta): treinado sob orçamento `B` de referência, o roteador reage de forma monótona em **0,5×`B`** e **2×`B`** na avaliação? (`λ` define curvas de treino separadas.)
-
-## Experimento mínimo (entrega principal)
-
-Um único emulador de três níveis (**por batch**), **um** vetor de custo (perfil consumer ~6 GB; partida `c`=(1,10,20|30), `w=Δc`), **`E=32`**, `k=2`, orçamento `B=25%` (8/32), roteador com **`ℓ(e)`**, treino por `λ ∈ {0, 0,5, 1}` (o ponto `λ=0` é o baseline 1) e avaliação em 0,5× e 2×`B`, contra top-k e **LRU** (e denso). Sem catálogo de várias GPUs de mercado no núcleo.
-
-Extensões (não bloqueiam a entrega mínima):
-
-- tabelas de custo “realismo de mercado” (consumer 6–12 GB, mid cloud, high-end);
-- treino com orçamento variável por batch/época (**adiado**);
-- calibrar pesos em preços Spot reais.
-
-## Decisões fechadas neste blueprint
-
-| Tema | Decisão |
-| --- | --- |
-| Corpus | TinyStories só no dev; WikiText-2 no treino/avaliação de entrega (overnight) |
-| Experts / `k` | **`E = 32`**; **`k = 2`**. Preferir **aumentar o tamanho do expert** a encolher o modelo se faltar capacidade |
-| Arquitetura fina | `d_model=256`, 4 camadas (todo FFN é MoE), 4 cabeças (`d_head=64`), `d_ff=512` (768 se faltar capacidade), contexto 256 (até 512), tokenizer GPT-2, fp32, `lm_head` amarrado (~48 M; sem o laço o vocab estoura 50 M) |
-| Orçamento `B` | **25%** dos experts quentes (**8/32**) — teto **artificial** (o modelo inteiro cabe na 1060) |
-| Emulador / roteador | Granularidade **por batch**; roteador recebe **`ℓ(e)`** |
-| Proxy `k=2` | Treino: média ponderada top-2; inferência: soma top-2 |
-| Hardware de referência | VRAM útil **5,5 GB** (6 GB − ~0,5 GB driver/display); RAM de trabalho **10 GB** dos 16 GB; SSD frio **1 GB** (2 GB se checkpoints) |
-| `λ` / `β` | Treino **especializado por `λ`** (não condicionado); grade **`λ ∈ {0, 0,5, 1}`**; `β` fixo pequeno (ordem Switch) |
-| Baseline-2 | **Só LRU de experts** como adversário; declarado no protocolo e não muda no meio |
-| Denso | Ativos comparáveis: tronco + `k`·expert |
-| Hardware no núcleo | Emulação VRAM/RAM/SSD; proxy alinhado a bytes/trocas; monitorar entropia |
-| Hold-out / seeds | ~10% hold-out; **3 seeds** |
-| Latência de parede | **Sim**, na 1060 (`B` fixo) |
-| Orçamento variável no treino | **Adiado** (extensão) |
-| Dose–resposta | Figura 0,5× / 1× / 2× + tabela contra baselines |
-| Colocação | Política dinâmica de cache/residência (não tool-calls) |
-| Custos por nível | Partida: c=(1,10,20|30), w=Δc amarrado a c; calibrar na 1060 |
-
-## Motivação (curta)
-
-MoE só calcula parte dos parâmetros por token, mas o tempo real depende de *onde* o expert está. PowerInfer e *LLM in a flash* exploram offload; o recorte daqui é **treinar o roteador com esse custo**. Detalhe e fichas em [docs/referencias.md](docs/referencias.md).
-
-## Arquitetura em três níveis (emulada)
-
-| Nível | Papel no emulador | Custo relativo (ordem) |
+| O quê | Número | Leitura |
 | --- | --- | --- |
-| Quente | “VRAM” — capacidade cara, acesso barato | baixo `c(ℓ)`, alto preço de residência no orçamento |
-| Morno | “RAM” — meio do caminho | médio |
-| Frio | “SSD” — capacidade barata, troca cara | alto `c(ℓ)` e `w` de promoção |
+| Fase 1 — latência com `λ=1` vs `λ=0` (test, 1×`B`, semente 0) | p50 **45,20** ms vs **82,43** ms | Penalidade de memória no treino reduz parede e troca; PPL de test **330,18** vs **351,88** ([holdout 2026-11-02](results/holdout_wikitext_2026-11-02.md)) |
+| Fase 1 — PPL quase plana em 0,5×–2×`B` | Δ ≤ ~0,37 em 3 sementes | Dose–resposta não mostrou ganho forte de qualidade ao relaxar o teto ([dose 2026-11-03](results/dose_response_wikitext_2026-11-03.md)) |
+| Fase 2 — treino viável na 1060 | **~3,3 s/passo**, VRAM **~4,6 GiB**; gate Qwen top-4 **~320 s/passo** | LSTM antecipa carga; gate original força **~3.300** leituras de SSD/passo |
+| Fase 2 — qualidade após 1000 passos | test ctx32 PPL **586,73**; ctx128 **518,39** | Muito acima do esperado para LM; referência Qwen/densos **não medida** nas mesmas janelas |
 
-Os pesos `c(ℓ)` e `w(a,b)` são variáveis de experimento (`w` amarrado a `c`): mudar a tabela deve forçar o roteador a adaptar. Fórmulas e decisões da call 30/10/2026 em [docs/funcao-de-custo.md](docs/funcao-de-custo.md). Hardware e emulação em [docs/plano-de-hardware.md](docs/plano-de-hardware.md).
-
-## Baselines e métricas
-
-| # | Modelo | Papel |
-| --- | --- | --- |
-| 1 | MoE top-k (`λ = 0`) | qualidade MoE sem cobrar memória |
-| 2 | MoE + **LRU de experts** | único adversário de offload; no código, o mesmo `ResidencyEmulator` e o mesmo `λ=0` do modelo 1 |
-| 3 | Denso (ativos comparáveis) | separar esparsidade de penalidade |
-| 4 | Este projeto (`λ > 0`) | roteador + emulador + política de colocação |
-
-Métricas no hold-out (~10%, 3 seeds): perplexidade; **latência p50/p95 de parede na 1060**; bytes e trocas do emulador; curva qualidade × custo/orçamento. Protocolo em [docs/protocolo-experimental.md](docs/protocolo-experimental.md).
-
-## Corpus (dev vs entrega)
-
-- **Desenvolvimento:** TinyStories — iterar rápido, achar bug, checar conversão e se o treino “anda”.
-- **Treino real / tabelas do relatório:** WikiText-2 — corrida de verdade, tipicamente **de madrugada com o PC ligado**.
-- WikiText-103 só se o 2 ficar curto demais; não é o padrão.
-
-O código e o protocolo devem aceitar os dois via config; a entrega numérica usa WikiText-2.
-
-## Como contribuir e rodar
-
-Python ≥ 3.10 e PyTorch em fp32. Na GTX 1060, o wheel CUDA; o passo abaixo também roda em CPU. Detalhe dos módulos em [`src/README.md`](src/README.md).
+## Como rodar
 
 ```bash
 python3 -m pip install -r requirements.txt
+python3 -m pytest                    # testes da fase 1
+
+# Fase 1 (smoke / overnight na GTX 1060)
 python3 experiments/smoke_train.py
-python3 experiments/smoke_eval.py
-python3 experiments/train_tinystories.py --steps 1
-python3 experiments/smoke_wikitext.py
-python3 experiments/wall_latency.py
 python3 experiments/run_lambda_grid.py --device cuda
-python3 experiments/run_baseline.py --device cuda
-python3 experiments/run_holdout_eval.py --device cuda
-python3 experiments/run_model_comparison.py --manifest-only
-python3 experiments/plot_proxy_emulator.py
-python3 -m pytest
+
+# Fase 2 (store Qwen repackado; ver docs/metodo-router-lstm-adiantado.md)
+python3 scripts/repack_qwen3_experts.py   # uma vez, gera o store no SSD
+python3 scripts/train_qwen_lm.py \
+    --store-dir models/qwen3-30b-a3b-store \
+    --model-dir models/qwen3-30b-a3b \
+    --device cpu --device-compute cuda \
+    --vram-budget-gb 5 --vram-expert-cache-gb 3.0 \
+    --no-checkpoint
 ```
 
-`smoke_train.py` dá **um** passo num batch aleatório. `train_tinystories.py` dá um passo curto no corpus de desenvolvimento. `smoke_wikitext.py` só carrega os splits oficiais. `wall_latency.py` na GTX 1060 (`--device cuda`) cronometra o forward com experts fora de `B` fora da VRAM; sem CUDA ele não inventa ms. A loss impressa desses smokes é de peso inicial ou de um passo curto. A grade overnight (`run_lambda_grid.py`) treina `λ ∈ {0, 0,5, 1}` no WikiText-2, uma semente por vez (`eval.seeds`, partida 3), e grava log em `outputs/wikitext/seed-<n>/`. `run_baseline.py` treina o LM denso (modelo 3) no mesmo WikiText-2 e nas mesmas sementes, sem roteador e sem residência: não é o MoE com `λ=0`. `run_holdout_eval.py` lê os quatro checkpoints da semente 0 e, em `valid` e `test`, calcula a perplexidade de token (mesmo BPE, mesmo bloco, `seq_len` do checkpoint) e grava `swaps`, `bytes_moved` e a parede p50/p95. No MoE, sem retreinar, `prepare_split_budget` repete a medida em `eval.B_mult` e o mesmo forward entra na curva. O denso não tem esse eixo. A parede de relatório é a da GTX 1060; em CPU os ms ficam null. `run_model_comparison.py` nomeia os quatro braços. O modelo 2 é o mesmo MoE `λ=0` e o mesmo LRU (`ResidencyEmulator`), no checkpoint `seed-0`; a tabela é a fatia de relatório contra o denso e contra `λ>0`. Sem esses JSON os números ficam `pending`. Não há segunda política de eviction. `plot_proxy_emulator.py` não treina: lê `outputs/wikitext/seed-*/lambda-*/train.jsonl` e, no layout antigo da semente 0, `outputs/wikitext/lambda-*/train.jsonl`. Correlaciona o proxy `c_mem` com bytes e trocas do emulador e desenha a entropia do roteador. As figuras que o script grava ficam em `outputs/proxy-emulator/` (gitignored). A cópia publicada das três SVG e os resumos que entram no Git estão em [`results/`](results/README.md). Detalhe em [`experiments/README.md`](experiments/README.md).
+Medição longa, avaliação de PPL e bench de offload: ver [docs/relatorio.md](docs/relatorio.md) e [docs/metodo-router-lstm-adiantado.md](docs/metodo-router-lstm-adiantado.md).
 
-| Pasta | Para que serve |
+## Pastas
+
+| Pasta | Conteúdo |
 | --- | --- |
-| `src/` | Modelo, roteador, emulador de níveis e loss |
-| `experiments/` | Fumaça, treino WikiText-2 por λ e por semente, baseline denso, perplexidade de hold-out (semente 0), dose–resposta de `B` (sem retreino), a tabela dos quatro braços e correlação proxy×emulador (pós-processamento do jsonl). |
-| `configs/` | Orçamento, tabela de custos e hiperparâmetros |
-| `notebooks/` | Exploração |
-| `results/` | Resumos em Markdown (loss, hold-out, dose de `B`, proxy×emulador, comparação) e as figuras SVG do proxy. O índice está em [`results/README.md`](results/README.md). |
-
-Documentação em português do Brasil. Não versionar checkpoint, dataset baixado nem resultado grande (veja `.gitignore`). Medição do smoke Qwen (`scripts/train_qwen_lm.py`) e corrida de teste que não precisa retomar usam `--no-checkpoint`, para não gravar `checkpoint/` nem `checkpoint.pt`. No compute CUDA, a medição que cabe em 5 GiB de VRAM é `--vram-budget-gb 5 --vram-expert-cache-gb 3.0 --vram-cache-dtype bf16 --lm-head-vram --prefetch-vram-aware --expert-cache 0 --expert-prefetch-layers 1 --sparse-adamw --no-checkpoint`. As flags de VRAM e o AdamW esparso nascem desligadas. O treino longo acrescenta `--eval-every`, `--router qwen` e `--checkpoint-every`, também desligados por padrão.
+| [`src/`](src/) | MoE da fase 1: modelo, roteador, emulador de níveis, loss com `λ` |
+| [`src/moe_memory/offload/`](src/moe_memory/offload/) | Fase 2: store de experts, pools RAM/VRAM, runtime de decode e treino LoRA+LSTM |
+| [`scripts/`](scripts/) | Repack Qwen, treino `train_qwen_lm.py`, bench offload, avaliação PPL |
+| [`experiments/`](experiments/) | Corridas WikiText-2 da fase 1 (grade `λ`, hold-out, dose, denso) |
+| [`results/`](results/) | Resumos versionados da fase 1 (PPL, parede, proxy×emulador) |
+| [`docs/`](docs/) | Protocolo, método LSTM, medições de hardware, **relatório narrativo** |
+| [`configs/`](configs/) | Orçamento, custos e hiperparâmetros da fase 1 (`default.yaml`) |
+| [`tests/`](tests/) | Testes unitários e smoke |
 
 ## Integrantes
 
@@ -120,10 +52,12 @@ Documentação em português do Brasil. Não versionar checkpoint, dataset baixa
 - Eric D Arriaga
 - Taylor Souza Frutuoso da Costa
 
-## Documentação
+## Documentação (histórico — fase 1)
 
 - [Problema e escopo](docs/definicao.md)
 - [Função de custo](docs/funcao-de-custo.md)
 - [Protocolo experimental](docs/protocolo-experimental.md)
 - [Plano de hardware e emulação](docs/plano-de-hardware.md)
 - [Referências](docs/referencias.md)
+
+Fase 2: [Método LSTM adiantado](docs/metodo-router-lstm-adiantado.md), [Medições Qwen3 no Fedora](docs/medicoes-hw-fedora-qwen3.md), [**Relatório completo**](docs/relatorio.md).
