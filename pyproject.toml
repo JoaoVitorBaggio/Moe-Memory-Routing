@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 data = ["datasets>=2.18"]
+dense = ["transformers>=4.46"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

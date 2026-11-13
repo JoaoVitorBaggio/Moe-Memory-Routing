@@ -24,7 +24,12 @@ sys.path.insert(0, str(ROOT / "src"))
 import torch
 
 from moe_memory.lstm_ahead_router import TwoHorizonLstmRouter
-from moe_memory.offload.lm_gpu import QWEN_VRAM_FIT_SLACK, fit_vram_cache
+from moe_memory.offload.lm_gpu import (
+    QWEN_VRAM_FIT_SLACK,
+    QWEN_VRAM_MIN_MARGIN_BYTES,
+    fit_qwen_vram_cache,
+    predict_qwen_vram_peak,
+)
 from moe_memory.offload.lm_train import (
     OffloadLanguageModel,
     estimate_bytes,
@@ -167,7 +172,25 @@ def main(argv: list[str] | None = None) -> int:
         slack = 0
         if args.router == "qwen" and args.device_compute == "cuda":
             slack = QWEN_VRAM_FIT_SLACK
-            cache_bytes = fit_vram_cache(int(estimate["vram_bytes"]), requested, budget, slack)
+            compute_elem = 4
+            cache_bytes = fit_qwen_vram_cache(
+                int(estimate["vram_bytes"]),
+                requested,
+                budget,
+                slack,
+                seq_len=args.context_len,
+                vram_k=topk,
+                hidden=spec.hidden_size,
+                intermediate=spec.moe_intermediate,
+                n_heads=spec.n_heads,
+                compute_elem=compute_elem,
+                vram_cache_elem=2 if args.vram_cache_dtype == "bf16" else 4,
+            )
+            if cache_bytes != requested:
+                print(
+                    f"cache VRAM qwen: pedido {requested} bytes, efetivo {cache_bytes} bytes",
+                    flush=True,
+                )
             estimate = _estimate(args, spec, resident_path.stat().st_size, cache_bytes, vram_k)
         report = {
             "split": args.split,
@@ -182,8 +205,29 @@ def main(argv: list[str] | None = None) -> int:
             "vram_expert_cache_bytes_used": cache_bytes,
             "vram_bytes": int(estimate["vram_bytes"]),
             "vram_slack_bytes": slack,
+            "qwen_vram_peak_predicted_bytes": (
+                predict_qwen_vram_peak(
+                    requested,
+                    cache_bytes,
+                    seq_len=args.context_len,
+                    vram_k=topk,
+                    hidden=spec.hidden_size,
+                    intermediate=spec.moe_intermediate,
+                    n_heads=spec.n_heads,
+                    compute_elem=4,
+                )
+                if args.router == "qwen" and args.device_compute == "cuda"
+                else None
+            ),
         }
-        if args.device_compute == "cuda" and int(estimate["vram_bytes"]) + slack > budget:
+        over_formula = int(estimate["vram_bytes"]) + slack > budget
+        over_measured = (
+            args.router == "qwen"
+            and args.device_compute == "cuda"
+            and report["qwen_vram_peak_predicted_bytes"] is not None
+            and int(report["qwen_vram_peak_predicted_bytes"]) > budget - QWEN_VRAM_MIN_MARGIN_BYTES
+        )
+        if args.device_compute == "cuda" and (over_formula or over_measured):
             report["skipped"] = True
             report["reason"] = "o contexto não cabe na VRAM com a folga do modo qwen"
             _write(args.out, report)

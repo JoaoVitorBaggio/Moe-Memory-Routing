@@ -22,6 +22,9 @@ VRAM_OVERHEAD_BYTES = 256 * 1024**2
 # só no encaixe do modo qwen, para o cache encolher antes do check_budget.
 QWEN_VRAM_MEASURED_PEAK = 5_478_979_584
 QWEN_VRAM_FIT_SLACK = 1024**3
+QWEN_VRAM_MIN_MARGIN_BYTES = 300 * 1024**2
+QWEN_VRAM_MEASURED_BASELINE_SEQ = 32
+QWEN_VRAM_MEASURED_BASELINE_TOPK = 8
 
 
 def compute_dtype_for(device: torch.device) -> torch.dtype:
@@ -113,6 +116,101 @@ def estimate_vram_bytes(
         "vram_layers_on_device": 2,
         "vram_bytes": total,
     }
+
+
+def _activation_vram_bytes(seq_len: int, hidden: int, n_heads: int, compute_elem: int) -> int:
+    return seq_len * hidden * compute_elem * 16 + seq_len * n_heads * seq_len * compute_elem
+
+
+def qwen_vram_peak_extra_bytes(
+    *,
+    seq_len: int,
+    vram_k: int,
+    hidden: int,
+    intermediate: int,
+    n_heads: int,
+    compute_elem: int,
+    baseline_seq: int = QWEN_VRAM_MEASURED_BASELINE_SEQ,
+    baseline_topk: int = QWEN_VRAM_MEASURED_BASELINE_TOPK,
+) -> int:
+    """Ajuste do pico medido (top-8, ctx 32) para outro K e comprimento de contexto."""
+
+    expert = _expert_bytes(hidden, intermediate, compute_elem)
+    topk_delta = 2 * (vram_k - baseline_topk) * expert
+    act_delta = _activation_vram_bytes(seq_len, hidden, n_heads, compute_elem) - _activation_vram_bytes(
+        baseline_seq, hidden, n_heads, compute_elem
+    )
+    return topk_delta + act_delta
+
+
+def predict_qwen_vram_peak(
+    requested_cache: int,
+    cache_bytes: int,
+    *,
+    seq_len: int,
+    vram_k: int,
+    hidden: int,
+    intermediate: int,
+    n_heads: int,
+    compute_elem: int,
+) -> int:
+    """Pico VRAM esperado no modo qwen, calibrado na 1060 com cache de 3 GiB e top-8."""
+
+    return (
+        QWEN_VRAM_MEASURED_PEAK
+        - (requested_cache - cache_bytes)
+        + qwen_vram_peak_extra_bytes(
+            seq_len=seq_len,
+            vram_k=vram_k,
+            hidden=hidden,
+            intermediate=intermediate,
+            n_heads=n_heads,
+            compute_elem=compute_elem,
+        )
+    )
+
+
+def fit_qwen_vram_cache(
+    formula_bytes: int,
+    requested_cache: int,
+    budget: int,
+    slack: int,
+    *,
+    seq_len: int,
+    vram_k: int,
+    hidden: int,
+    intermediate: int,
+    n_heads: int,
+    compute_elem: int,
+    vram_cache_elem: int = 2,
+) -> int:
+    """Encolhe o cache de experts pelo pior caso entre a fórmula e o pico medido."""
+
+    if min(seq_len, vram_k, hidden, intermediate, n_heads, compute_elem, vram_cache_elem) < 1:
+        raise ValueError("fit qwen com dimensão < 1")
+    margin = QWEN_VRAM_MIN_MARGIN_BYTES
+    expert_slot = 3 * hidden * intermediate * vram_cache_elem
+    peak_kw = {
+        "seq_len": seq_len,
+        "vram_k": vram_k,
+        "hidden": hidden,
+        "intermediate": intermediate,
+        "n_heads": n_heads,
+        "compute_elem": compute_elem,
+    }
+
+    def fits(cache: int) -> bool:
+        if cache < 0:
+            return False
+        shrunk_formula = formula_bytes - (requested_cache - cache)
+        if shrunk_formula + slack > budget:
+            return False
+        return predict_qwen_vram_peak(requested_cache, cache, **peak_kw) <= budget - margin
+
+    cache = fit_vram_cache(formula_bytes, requested_cache, budget, slack)
+    while cache > 0 and not fits(cache):
+        cache -= expert_slot
+    return max(0, cache)
 
 
 def fit_vram_cache(formula_bytes: int, requested_cache: int, budget: int, slack: int) -> int:

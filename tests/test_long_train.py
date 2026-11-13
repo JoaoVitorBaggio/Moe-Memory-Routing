@@ -61,6 +61,31 @@ def test_eval_is_deterministic_and_has_no_gradient(tmp_path: Path):
         store.close()
 
 
+def test_lm_step_grad_report_works_with_qwen_router_without_lstm(tmp_path: Path):
+    directory = _bundle(tmp_path / "bundle")
+    store = ExpertStore.open(directory / "experts.moestore", direct=True)
+    try:
+        spec = load_spec(directory / "config.json", store.header.dtype_code)
+        weights = load_resident(directory / "resident.bin", spec, torch.device("cpu"), with_gate=True)
+        router = QwenGateRouter(
+            vocab_size=spec.vocab_size,
+            n_layers=spec.n_layers,
+            n_experts=spec.n_experts,
+            experts_per_tok=4,
+        )
+        from moe_memory.offload.lm_train import OffloadLanguageModel
+
+        model = OffloadLanguageModel(weights, router, store, rank=2, alpha=4.0, use_lora=True)
+        optimizer = make_optimizer(model, 1e-3)
+        stats = lm_step(model, optimizer, torch.tensor([[1, 2, 3, 4, 5, 6]]))
+        assert stats["grads_finite"] is True
+        assert stats["lstm_grad_norm"] == 0.0
+        assert stats["lstm_grad_nonzero"] is False
+        assert stats["lora_b_grad_nonzero"] is True
+    finally:
+        store.close()
+
+
 def test_qwen_router_does_not_build_an_lstm(tmp_path: Path):
     directory = _bundle(tmp_path / "bundle")
     store = ExpertStore.open(directory / "experts.moestore", direct=True)
