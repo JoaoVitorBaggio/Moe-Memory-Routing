@@ -2,6 +2,8 @@
 
 Trabalho de **Aprendizado Profundo (AGL11157)**, UFRGS, 2026/2. O projeto começou na **fase 1** com um MoE pequeno (`E=32`, `k=2`): hierarquia **emulada** VRAM/RAM/SSD, roteador treinado com custo de memória (`λ`), baselines top-k, **LRU** e denso — números em [`results/`](results/README.md). Na **fase 2**, o alvo passou a ser o **Qwen3-30B-A3B** real: ~6.144 experts repackados num store de ~57 GB no SSD, pesos residentes ~3,1 GB, offload **SSD→RAM→VRAM** numa GTX 1060 6 GB, e um **roteador LSTM** que lê só tokens e antecipa quais experts carregar (em vez do gate original, que só decide na hora). Detalhe completo em [**docs/relatorio.md**](docs/relatorio.md).
 
+Pesos (LoRA + roteador LSTM, checkpoint L1) e model card no Hugging Face: [jvbaggio/qwen3-30b-a3b-lstm-prefetch-router](https://huggingface.co/jvbaggio/qwen3-30b-a3b-lstm-prefetch-router).
+
 ## Resultados em destaque
 
 | O quê | Número | Leitura |
